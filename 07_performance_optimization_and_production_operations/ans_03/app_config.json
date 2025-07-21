@@ -1,0 +1,51 @@
+{
+  "version": "1.0.0",
+  "timestamp": "2025-07-21T13:17:15.718271+09:00",
+  "checksum": "",
+  "server": {
+    "port": 8080,
+    "read_timeout": 30000000000,
+    "write_timeout": 30000000000,
+    "max_connections": 1000,
+    "enable_tls": false,
+    "tls_cert_file": "",
+    "tls_key_file": ""
+  },
+  "database": {
+    "host": "localhost",
+    "port": 5432,
+    "database": "app_db",
+    "username": "app_user",
+    "password": "",
+    "max_connections": 20,
+    "connect_timeout": 10000000000,
+    "query_timeout": 30000000000,
+    "ssl_mode": "disable"
+  },
+  "cache": {
+    "type": "redis",
+    "host": "localhost",
+    "port": 6379,
+    "ttl": 3600000000000,
+    "max_size": 100000,
+    "cleanup_interval": 600000000000
+  },
+  "logging": {
+    "level": "info",
+    "format": "json",
+    "output_file": "app.log",
+    "max_size": 104857600,
+    "max_backups": 5,
+    "compress": true
+  },
+  "features": {
+    "feature_a": true,
+    "feature_b": false,
+    "feature_c": true
+  },
+  "custom_settings": {
+    "batch_size": 1000,
+    "enable_metrics": true,
+    "max_retry_count": 3
+  }
+}

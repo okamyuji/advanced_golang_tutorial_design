@@ -1,0 +1,176 @@
+# ==========================================
+# Go Advanced Tutorial Project .gitignore
+# ==========================================
+
+# Go build artifacts and binaries
+# Goのビルド成果物とバイナリファイル
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/vendor/
+
+# Go test binary, built with `go test -c`
+# go test -c で作成されるテストバイナリ
+*.test
+
+# Go coverage files
+# Goカバレッジファイル
+*.out
+coverage.txt
+coverage.html
+
+# Go workspace file
+# Goワークスペースファイル
+go.work
+go.work.sum
+
+# Compiled binaries (project-specific names)
+# プロジェクト固有のコンパイル済みバイナリ
+advanced_optimizer
+production_monitoring
+zero_downtime_config
+performance_optimizer
+profiling_system
+production_manager
+web_scraper
+worker_pool
+image_processor
+dynamic_worker_pool
+priority_worker_pool
+circuit_breaker_pool
+websocket_handler
+concurrent_http_server
+api_rate_limiter
+memory_monitor
+
+# Log files
+# ログファイル
+*.log
+logs/
+log/
+app.log
+error.log
+access.log
+debug.log
+
+# Temporary files
+# 一時ファイル
+*.tmp
+*.temp
+/tmp/
+/temp/
+*.swp
+*.swo
+*~
+
+# Application-specific data and config files
+# アプリケーション固有のデータ・設定ファイル
+/config_backups/
+app_config.json.backup
+*.backup
+*.bak
+
+# Database files (SQLite, etc.)
+# データベースファイル
+*.db
+*.sqlite
+*.sqlite3
+
+# Profiling and debugging files
+# プロファイリング・デバッグファイル
+*.prof
+*.pprof
+*.trace
+cpu.prof
+mem.prof
+block.prof
+mutex.prof
+goroutine.prof
+
+# IDE and Editor files
+# IDE・エディタファイル
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.vim/
+.emacs.d/
+.atom/
+.sublime-*
+
+# OS generated files
+# OS生成ファイル
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+
+# Environment and secret files
+# 環境設定・機密ファイル
+.env
+.env.local
+.env.*.local
+*.key
+*.pem
+*.crt
+secrets/
+credentials/
+
+# Docker related
+# Docker関連
+Dockerfile.local
+docker-compose.override.yml
+.dockerignore.local
+
+# Dependencies (if using vendor)
+# 依存関係（vendorを使用する場合）
+# Note: go.mod and go.sum should be committed
+# 注意: go.modとgo.sumはコミットすべき
+
+# Test output and artifacts
+# テスト出力・成果物
+testdata/output/
+test_results/
+benchmark_results/
+
+# Documentation build artifacts
+# ドキュメントビルド成果物
+docs/_build/
+docs/build/
+site/
+
+# CI/CD artifacts
+# CI/CD成果物
+.github/workflows/artifacts/
+.gitlab-ci/artifacts/
+
+# Performance monitoring data
+# パフォーマンス監視データ
+monitoring_data/
+metrics/
+alerts/
+
+# ==========================================
+# IMPORTANT: Keep these files in repository
+# 重要: これらのファイルはリポジトリに保持
+# ==========================================
+# ✅ go.mod - Go module definition
+# ✅ go.sum - Go module checksums (when present)
+# ✅ *.go - All Go source files
+# ✅ *_test.go - All Go test files
+# ✅ README.md - Documentation
+# ✅ Makefile - Build automation
+# ✅ *.json (sample configs) - Configuration templates
+# ✅ *.yaml/*.yml (sample configs) - Configuration templates
+
+# Project-specific exceptions
+# プロジェクト固有の例外
+# app_config.json は設定テンプレートとして保持する場合は除外しない
+# ただし、機密情報を含む場合は .gitignore.local で個別対応 
