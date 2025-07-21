@@ -172,5 +172,5 @@ alerts/
 
 # Project-specific exceptions
 # プロジェクト固有の例外
-# app_config.json は設定テンプレートとして保持する場合は除外しない
+# app_config.jsonは設定テンプレートとして保持する場合は除外しない
 # ただし、機密情報を含む場合は .gitignore.local で個別対応 

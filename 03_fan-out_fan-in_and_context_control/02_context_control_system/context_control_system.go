@@ -127,7 +127,7 @@ type TimeoutManager struct {
 	maxTimeout     time.Duration
 }
 
-// TaskConfig はタスク設定です
+// TaskConfig タスク設定です
 type TaskConfig struct {
 	DefaultTimeout  time.Duration
 	MaxTimeout      time.Duration

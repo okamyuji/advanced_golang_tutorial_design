@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-// CircuitBreakerState はサーキットブレーカーの状態を表します
+// CircuitBreakerState サーキットブレーカーの状態を表します
 type CircuitBreakerState int
 
 const (
@@ -33,7 +33,7 @@ func (s CircuitBreakerState) String() string {
 	}
 }
 
-// CircuitBreakerMetrics はサーキットブレーカーのメトリクスです
+// CircuitBreakerMetrics サーキットブレーカーのメトリクスです
 type CircuitBreakerMetrics struct {
 	TotalRequests       uint64        `json:"total_requests"`
 	SuccessfulRequests  uint64        `json:"successful_requests"`
@@ -48,7 +48,7 @@ type CircuitBreakerMetrics struct {
 	LastStateChange     time.Time     `json:"last_state_change"`
 }
 
-// AdvancedCircuitBreakerConfig はサーキットブレーカーの設定です
+// AdvancedCircuitBreakerConfig サーキットブレーカーの設定です
 type AdvancedCircuitBreakerConfig struct {
 	Name                  string
 	FailureThreshold      uint64
@@ -63,7 +63,7 @@ type AdvancedCircuitBreakerConfig struct {
 	OnRequestResult       func(success bool, duration time.Duration)
 }
 
-// AdvancedCircuitBreaker は高度なサーキットブレーカーです
+// AdvancedCircuitBreaker 高度なサーキットブレーカーです
 type AdvancedCircuitBreaker struct {
 	config      AdvancedCircuitBreakerConfig
 	state       CircuitBreakerState
@@ -83,7 +83,7 @@ type AdvancedCircuitBreaker struct {
 	generation uint64
 }
 
-// RequestResult はリクエスト結果を表します
+// RequestResult リクエスト結果を表します
 type RequestResult struct {
 	Success    bool
 	Duration   time.Duration
@@ -97,7 +97,7 @@ var (
 	ErrRequestTimeout  = errors.New("request timeout")
 )
 
-// NewAdvancedCircuitBreaker は新しい高度なサーキットブレーカーを作成します
+// NewAdvancedCircuitBreaker 新しい高度なサーキットブレーカーを作成します
 func NewAdvancedCircuitBreaker(config AdvancedCircuitBreakerConfig) *AdvancedCircuitBreaker {
 	// デフォルト値設定
 	if config.FailureThreshold == 0 {
@@ -135,7 +135,7 @@ func NewAdvancedCircuitBreaker(config AdvancedCircuitBreakerConfig) *AdvancedCir
 	}
 }
 
-// Execute はサーキットブレーカーを通してリクエストを実行します
+// Execute サーキットブレーカーを通してリクエストを実行します
 func (acb *AdvancedCircuitBreaker) Execute(request func() error) error {
 	// 実行前チェック
 	if err := acb.beforeRequest(); err != nil {
@@ -163,7 +163,7 @@ func (acb *AdvancedCircuitBreaker) Execute(request func() error) error {
 	return requestErr
 }
 
-// ExecuteWithTimeout はタイムアウト付きでリクエストを実行します
+// ExecuteWithTimeout タイムアウト付きでリクエストを実行します
 func (acb *AdvancedCircuitBreaker) ExecuteWithTimeout(ctx context.Context, timeout time.Duration, request func() error) error {
 	if err := acb.beforeRequest(); err != nil {
 		return err
@@ -214,7 +214,7 @@ func (acb *AdvancedCircuitBreaker) ExecuteWithTimeout(ctx context.Context, timeo
 	}
 }
 
-// beforeRequest はリクエスト実行前の処理を行います
+// beforeRequest リクエスト実行前の処理を行います
 func (acb *AdvancedCircuitBreaker) beforeRequest() error {
 	acb.mutex.Lock()
 	defer acb.mutex.Unlock()
@@ -246,7 +246,7 @@ func (acb *AdvancedCircuitBreaker) beforeRequest() error {
 	return nil
 }
 
-// afterRequest はリクエスト実行後の処理を行います
+// afterRequest リクエスト実行後の処理を行います
 func (acb *AdvancedCircuitBreaker) afterRequest(success bool, duration time.Duration, err error) {
 	acb.mutex.Lock()
 	defer acb.mutex.Unlock()
@@ -280,7 +280,7 @@ func (acb *AdvancedCircuitBreaker) afterRequest(success bool, duration time.Dura
 	}
 }
 
-// updateMetrics はメトリクスを更新します
+// updateMetrics メトリクスを更新します
 func (acb *AdvancedCircuitBreaker) updateMetrics(success bool, duration time.Duration, timestamp time.Time) {
 	acb.metrics.TotalResponseTime += duration
 
@@ -305,7 +305,7 @@ func (acb *AdvancedCircuitBreaker) updateMetrics(success bool, duration time.Dur
 	}
 }
 
-// addToWindow はリクエスト結果をスライディングウィンドウに追加します
+// addToWindow リクエスト結果をスライディングウィンドウに追加します
 func (acb *AdvancedCircuitBreaker) addToWindow(result RequestResult) {
 	acb.requestWindow[acb.windowIndex] = result
 	acb.windowIndex = (acb.windowIndex + 1) % len(acb.requestWindow)
@@ -315,7 +315,7 @@ func (acb *AdvancedCircuitBreaker) addToWindow(result RequestResult) {
 	}
 }
 
-// evaluateStateTransition は状態遷移を評価します
+// evaluateStateTransition 状態遷移を評価します
 func (acb *AdvancedCircuitBreaker) evaluateStateTransition(success bool) {
 	switch acb.state {
 	case Closed:
@@ -335,7 +335,7 @@ func (acb *AdvancedCircuitBreaker) evaluateStateTransition(success bool) {
 	}
 }
 
-// shouldTripToOpen はオープン状態に遷移すべきかを判定します
+// shouldTripToOpen オープン状態に遷移すべきかを判定します
 func (acb *AdvancedCircuitBreaker) shouldTripToOpen() bool {
 	windowSize := acb.getEffectiveWindowSize()
 	if windowSize < int(acb.config.MinimumRequestCount) {
@@ -358,7 +358,7 @@ func (acb *AdvancedCircuitBreaker) shouldTripToOpen() bool {
 	return slowCallRate >= acb.config.SlowCallRateThreshold
 }
 
-// calculateFailureRate は失敗率を計算します
+// calculateFailureRate 失敗率を計算します
 func (acb *AdvancedCircuitBreaker) calculateFailureRate() float64 {
 	windowSize := acb.getEffectiveWindowSize()
 	if windowSize == 0 {
@@ -375,7 +375,7 @@ func (acb *AdvancedCircuitBreaker) calculateFailureRate() float64 {
 	return float64(failures) / float64(windowSize)
 }
 
-// calculateSlowCallRate はスロー呼び出し率を計算します
+// calculateSlowCallRate スロー呼び出し率を計算します
 func (acb *AdvancedCircuitBreaker) calculateSlowCallRate() float64 {
 	windowSize := acb.getEffectiveWindowSize()
 	if windowSize == 0 {
@@ -392,7 +392,7 @@ func (acb *AdvancedCircuitBreaker) calculateSlowCallRate() float64 {
 	return float64(slowCalls) / float64(windowSize)
 }
 
-// getEffectiveWindowSize は有効なウィンドウサイズを取得します
+// getEffectiveWindowSize 有効なウィンドウサイズを取得します
 func (acb *AdvancedCircuitBreaker) getEffectiveWindowSize() int {
 	if acb.windowFull {
 		return len(acb.requestWindow)
@@ -400,14 +400,14 @@ func (acb *AdvancedCircuitBreaker) getEffectiveWindowSize() int {
 	return acb.windowIndex
 }
 
-// updateState は状態を更新します
+// updateState 状態を更新します
 func (acb *AdvancedCircuitBreaker) updateState() {
 	if acb.state == Open && time.Now().After(acb.stateExpiry) {
 		acb.transitionTo(HalfOpen)
 	}
 }
 
-// transitionTo は指定された状態に遷移します
+// transitionTo 指定された状態に遷移します
 func (acb *AdvancedCircuitBreaker) transitionTo(newState CircuitBreakerState) {
 	if acb.state == newState {
 		return
@@ -439,7 +439,7 @@ func (acb *AdvancedCircuitBreaker) transitionTo(newState CircuitBreakerState) {
 	}
 }
 
-// GetState は現在の状態を取得します
+// GetState 現在の状態を取得します
 func (acb *AdvancedCircuitBreaker) GetState() CircuitBreakerState {
 	acb.mutex.RLock()
 	defer acb.mutex.RUnlock()
@@ -448,7 +448,7 @@ func (acb *AdvancedCircuitBreaker) GetState() CircuitBreakerState {
 	return acb.state
 }
 
-// GetMetrics はメトリクスを取得します
+// GetMetrics メトリクスを取得します
 func (acb *AdvancedCircuitBreaker) GetMetrics() CircuitBreakerMetrics {
 	acb.mutex.RLock()
 	defer acb.mutex.RUnlock()
@@ -457,7 +457,7 @@ func (acb *AdvancedCircuitBreaker) GetMetrics() CircuitBreakerMetrics {
 	return acb.metrics
 }
 
-// Reset はサーキットブレーカーをリセットします
+// Reset サーキットブレーカーをリセットします
 func (acb *AdvancedCircuitBreaker) Reset() {
 	acb.mutex.Lock()
 	defer acb.mutex.Unlock()
@@ -473,13 +473,13 @@ func (acb *AdvancedCircuitBreaker) Reset() {
 	atomic.StoreInt64(&acb.activeRequests, 0)
 }
 
-// HTTPClientWithCircuitBreaker はサーキットブレーカー付きHTTPクライアントです
+// HTTPClientWithCircuitBreaker サーキットブレーカー付きHTTPクライアントです
 type HTTPClientWithCircuitBreaker struct {
 	client         *http.Client
 	circuitBreaker *AdvancedCircuitBreaker
 }
 
-// NewHTTPClientWithCircuitBreaker は新しいHTTPクライアントを作成します
+// NewHTTPClientWithCircuitBreaker 新しいHTTPクライアントを作成します
 func NewHTTPClientWithCircuitBreaker(client *http.Client, cb *AdvancedCircuitBreaker) *HTTPClientWithCircuitBreaker {
 	if client == nil {
 		client = &http.Client{
@@ -493,7 +493,7 @@ func NewHTTPClientWithCircuitBreaker(client *http.Client, cb *AdvancedCircuitBre
 	}
 }
 
-// Get はサーキットブレーカー付きのGETリクエストを実行します
+// Get サーキットブレーカー付きのGETリクエストを実行します
 func (hc *HTTPClientWithCircuitBreaker) Get(url string) (*http.Response, error) {
 	var resp *http.Response
 
@@ -506,7 +506,7 @@ func (hc *HTTPClientWithCircuitBreaker) Get(url string) (*http.Response, error) 
 	return resp, err
 }
 
-// Post はサーキットブレーカー付きのPOSTリクエストを実行します
+// Post サーキットブレーカー付きのPOSTリクエストを実行します
 func (hc *HTTPClientWithCircuitBreaker) Post(url, contentType string, body interface{}) (*http.Response, error) {
 	var resp *http.Response
 
@@ -520,7 +520,7 @@ func (hc *HTTPClientWithCircuitBreaker) Post(url, contentType string, body inter
 	return resp, err
 }
 
-// GetCircuitBreaker はサーキットブレーカーを取得します
+// GetCircuitBreaker サーキットブレーカーを取得します
 func (hc *HTTPClientWithCircuitBreaker) GetCircuitBreaker() *AdvancedCircuitBreaker {
 	return hc.circuitBreaker
 }

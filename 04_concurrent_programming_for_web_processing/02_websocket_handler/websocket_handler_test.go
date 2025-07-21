@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-// TestNewHandlerConfig はハンドラー設定の作成をテストします
+// TestNewHandlerConfig ハンドラー設定の作成をテストします
 func TestNewHandlerConfig(t *testing.T) {
 	config := NewHandlerConfig()
 
@@ -22,7 +22,7 @@ func TestNewHandlerConfig(t *testing.T) {
 	}
 }
 
-// TestNewWebSocketHandler はWebSocketハンドラーの作成をテストします
+// TestNewWebSocketHandler WebSocketハンドラーの作成をテストします
 func TestNewWebSocketHandler(t *testing.T) {
 	config := NewHandlerConfig()
 	handler := NewWebSocketHandler(config)
@@ -38,7 +38,7 @@ func TestNewWebSocketHandler(t *testing.T) {
 	}
 }
 
-// TestConnectionHandling は接続管理の基本機能をテストします（短時間実行用）
+// TestConnectionHandling 接続管理の基本機能をテストします（短時間実行用）
 func TestConnectionHandling(t *testing.T) {
 	config := NewHandlerConfig()
 	config.WorkerCount = 1
@@ -113,7 +113,7 @@ func TestConnectionHandling(t *testing.T) {
 	}
 }
 
-// TestJoinLeaveChannel はチャネル参加/離脱をテストします（簡素化版）
+// TestJoinLeaveChannel チャネル参加/離脱をテストします（簡素化版）
 func TestJoinLeaveChannel(t *testing.T) {
 	config := NewHandlerConfig()
 	handler := NewWebSocketHandler(config)
@@ -159,7 +159,7 @@ func TestJoinLeaveChannel(t *testing.T) {
 	}
 }
 
-// TestMessageCreation はメッセージ作成をテストします
+// TestMessageCreation メッセージ作成をテストします
 func TestMessageCreation(t *testing.T) {
 	testTimestamp := time.Now()
 	message := &WebSocketMessage{
@@ -201,7 +201,7 @@ func TestMessageCreation(t *testing.T) {
 	}
 }
 
-// TestChannelCreation はチャネル作成をテストします
+// TestChannelCreation チャネル作成をテストします
 func TestChannelCreation(t *testing.T) {
 	config := NewHandlerConfig()
 	handler := NewWebSocketHandler(config)
@@ -239,7 +239,7 @@ func TestChannelCreation(t *testing.T) {
 	}
 }
 
-// TestMessageTypes はメッセージタイプをテストします
+// TestMessageTypes メッセージタイプをテストします
 func TestMessageTypes(t *testing.T) {
 	types := []MessageType{
 		MessageTypeJoin,
@@ -268,7 +268,7 @@ func TestMessageTypes(t *testing.T) {
 	}
 }
 
-// TestHandlerStats は統計管理をテストします
+// TestHandlerStats 統計管理をテストします
 func TestHandlerStats(t *testing.T) {
 	config := NewHandlerConfig()
 	handler := NewWebSocketHandler(config)
@@ -300,7 +300,7 @@ func TestHandlerStats(t *testing.T) {
 	}
 }
 
-// TestWorkerInitialization はワーカー初期化をテストします
+// TestWorkerInitialization ワーカー初期化をテストします
 func TestWorkerInitialization(t *testing.T) {
 	config := NewHandlerConfig()
 	config.WorkerCount = 3
@@ -326,7 +326,7 @@ func TestWorkerInitialization(t *testing.T) {
 	}
 }
 
-// TestConcurrentMapAccess は並行マップアクセスをテストします
+// TestConcurrentMapAccess 並行マップアクセスをテストします
 func TestConcurrentMapAccess(t *testing.T) {
 	config := NewHandlerConfig()
 	handler := NewWebSocketHandler(config)
@@ -380,7 +380,7 @@ func TestConcurrentMapAccess(t *testing.T) {
 	}
 }
 
-// TestMockWebSocketConn はモックWebSocket接続をテストします
+// TestMockWebSocketConn モックWebSocket接続をテストします
 func TestMockWebSocketConn(t *testing.T) {
 	mockConn := &MockWebSocketConn{
 		ID:          "mock_123",
@@ -421,7 +421,7 @@ func TestMockWebSocketConn(t *testing.T) {
 	}
 }
 
-// TestConfigValidation は設定値の検証をテストします
+// TestConfigValidation 設定値の検証をテストします
 func TestConfigValidation(t *testing.T) {
 	config := NewHandlerConfig()
 

@@ -9,14 +9,14 @@ import (
 	"time"
 )
 
-// GoroutineManager はGoroutineのライフサイクルを管理します
+// GoroutineManager Goroutineのライフサイクルを管理します
 type GoroutineManager struct {
 	mu      sync.RWMutex
 	workers map[string]*Worker
 	metrics *RuntimeMetrics
 }
 
-// Worker は個別のワーカーを表現します
+// Worker 個別のワーカーを表現します
 type Worker struct {
 	ID      string
 	Started time.Time
@@ -25,7 +25,7 @@ type Worker struct {
 	done    chan struct{}
 }
 
-// RuntimeMetrics はランタイムメトリクスを収集します
+// RuntimeMetrics ランタイムメトリクスを収集します
 type RuntimeMetrics struct {
 	mu              sync.RWMutex
 	goroutineCount  int
@@ -33,7 +33,7 @@ type RuntimeMetrics struct {
 	lastCollectedAt time.Time
 }
 
-// NewGoroutineManager は新しいマネージャを作成します
+// NewGoroutineManager 新しいマネージャを作成します
 func NewGoroutineManager() *GoroutineManager {
 	return &GoroutineManager{
 		workers: make(map[string]*Worker),
@@ -41,7 +41,7 @@ func NewGoroutineManager() *GoroutineManager {
 	}
 }
 
-// StartWorker は新しいワーカーを開始します
+// StartWorker 新しいワーカーを開始します
 func (gm *GoroutineManager) StartWorker(id string, taskFunc func(context.Context)) error {
 	gm.mu.Lock()
 	defer gm.mu.Unlock()
@@ -72,7 +72,7 @@ func (gm *GoroutineManager) StartWorker(id string, taskFunc func(context.Context
 	return nil
 }
 
-// StopWorker は指定されたワーカーを停止します
+// StopWorker 指定されたワーカーを停止します
 func (gm *GoroutineManager) StopWorker(id string) error {
 	gm.mu.Lock()
 	worker, exists := gm.workers[id]
@@ -95,7 +95,7 @@ func (gm *GoroutineManager) StopWorker(id string) error {
 	}
 }
 
-// StopAll はすべてのワーカーを停止します
+// StopAll すべてのワーカーを停止します
 func (gm *GoroutineManager) StopAll() {
 	gm.mu.Lock()
 	workers := make([]*Worker, 0, len(gm.workers))
@@ -120,7 +120,7 @@ func (gm *GoroutineManager) StopAll() {
 	}
 }
 
-// CollectMetrics はランタイムメトリクスを収集します
+// CollectMetrics ランタイムメトリクスを収集します
 func (gm *GoroutineManager) CollectMetrics() {
 	var memStats runtime.MemStats
 	runtime.ReadMemStats(&memStats)
@@ -133,7 +133,7 @@ func (gm *GoroutineManager) CollectMetrics() {
 	gm.metrics.lastCollectedAt = time.Now()
 }
 
-// GetMetrics は現在のメトリクスを取得します
+// GetMetrics 現在のメトリクスを取得します
 func (gm *GoroutineManager) GetMetrics() (int, float64, time.Time) {
 	gm.metrics.mu.RLock()
 	defer gm.metrics.mu.RUnlock()
@@ -143,7 +143,7 @@ func (gm *GoroutineManager) GetMetrics() (int, float64, time.Time) {
 		gm.metrics.lastCollectedAt
 }
 
-// GetWorkerCount は現在のワーカー数を取得します
+// GetWorkerCount 現在のワーカー数を取得します
 func (gm *GoroutineManager) GetWorkerCount() int {
 	gm.mu.RLock()
 	defer gm.mu.RUnlock()

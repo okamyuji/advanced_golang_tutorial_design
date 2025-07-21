@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-// FallbackMode はフォールバックモードを表します
+// FallbackMode フォールバックモードを表します
 type FallbackMode int
 
 const (
@@ -33,7 +33,7 @@ func (fm FallbackMode) String() string {
 	}
 }
 
-// FallbackManagerConfig はフォールバック管理の設定です
+// FallbackManagerConfig フォールバック管理の設定です
 type FallbackManagerConfig struct {
 	Name                 string
 	ErrorRateThreshold   float64       // フォールバックに切り替える閾値
@@ -47,7 +47,7 @@ type FallbackManagerConfig struct {
 	OnRequestResult      func(success bool, mode FallbackMode, duration time.Duration)
 }
 
-// FallbackManagerMetrics はフォールバック管理のメトリクスです
+// FallbackManagerMetrics フォールバック管理のメトリクスです
 type FallbackManagerMetrics struct {
 	TotalRequests        uint64    `json:"total_requests"`
 	NormalModeRequests   uint64    `json:"normal_mode_requests"`
@@ -62,7 +62,7 @@ type FallbackManagerMetrics struct {
 	CacheMisses          uint64    `json:"cache_misses"`
 }
 
-// RequestResult はリクエスト結果を表します
+// RequestResult リクエスト結果を表します
 type RequestResult struct {
 	Success   bool
 	Mode      FallbackMode
@@ -70,26 +70,26 @@ type RequestResult struct {
 	Duration  time.Duration
 }
 
-// CacheEntry はキャッシュエントリを表します
+// CacheEntry キャッシュエントリを表します
 type CacheEntry struct {
 	Data      interface{}
 	Timestamp time.Time
 	TTL       time.Duration
 }
 
-// ExternalService は外部サービスインターフェースです
+// ExternalService 外部サービスインターフェースです
 type ExternalService interface {
 	Call(ctx context.Context, request interface{}) (interface{}, error)
 	Name() string
 }
 
-// FallbackProvider はフォールバック提供インターフェースです
+// FallbackProvider フォールバック提供インターフェースです
 type FallbackProvider interface {
 	GetFallbackData(ctx context.Context, request interface{}) (interface{}, error)
 	CanProvideFallback(request interface{}) bool
 }
 
-// FallbackManager はエラー率ベースの自動フォールバック管理です
+// FallbackManager エラー率ベースの自動フォールバック管理です
 type FallbackManager struct {
 	config           FallbackManagerConfig
 	externalService  ExternalService
@@ -116,7 +116,7 @@ var (
 	ErrCacheMiss          = errors.New("cache miss")
 )
 
-// NewFallbackManager は新しいフォールバック管理を作成します
+// NewFallbackManager 新しいフォールバック管理を作成します
 func NewFallbackManager(config FallbackManagerConfig, service ExternalService, provider FallbackProvider) *FallbackManager {
 	// デフォルト値設定
 	if config.ErrorRateThreshold == 0 {
@@ -157,7 +157,7 @@ func NewFallbackManager(config FallbackManagerConfig, service ExternalService, p
 	}
 }
 
-// Start はフォールバック管理を開始します
+// Start フォールバック管理を開始します
 func (fm *FallbackManager) Start() error {
 	if !atomic.CompareAndSwapInt64(&fm.isRunning, 0, 1) {
 		return fmt.Errorf("fallback manager is already running")
@@ -172,7 +172,7 @@ func (fm *FallbackManager) Start() error {
 	return nil
 }
 
-// Stop はフォールバック管理を停止します
+// Stop フォールバック管理を停止します
 func (fm *FallbackManager) Stop() error {
 	if !atomic.CompareAndSwapInt64(&fm.isRunning, 1, 0) {
 		return fmt.Errorf("fallback manager is not running")
@@ -184,7 +184,7 @@ func (fm *FallbackManager) Stop() error {
 	return nil
 }
 
-// Execute はリクエストを実行します
+// Execute リクエストを実行します
 func (fm *FallbackManager) Execute(ctx context.Context, request interface{}) (interface{}, error) {
 	// 並行数制御
 	if atomic.LoadInt64(&fm.activeWorkers) >= int64(fm.config.MaxConcurrentWorkers) {
@@ -235,7 +235,7 @@ func (fm *FallbackManager) Execute(ctx context.Context, request interface{}) (in
 	return result, err
 }
 
-// executeNormalMode は通常モードでリクエストを実行します
+// executeNormalMode 通常モードでリクエストを実行します
 func (fm *FallbackManager) executeNormalMode(ctx context.Context, request interface{}) (interface{}, error, bool) {
 	// キャッシュチェック
 	if cached, found := fm.getFromCache(request); found {
@@ -262,7 +262,7 @@ func (fm *FallbackManager) executeNormalMode(ctx context.Context, request interf
 	return result, nil, true
 }
 
-// executeFallbackMode はフォールバックモードでリクエストを実行します
+// executeFallbackMode フォールバックモードでリクエストを実行します
 func (fm *FallbackManager) executeFallbackMode(ctx context.Context, request interface{}) (interface{}, error, bool) {
 	// フォールバックデータを取得
 	result, err := fm.fallbackProvider.GetFallbackData(ctx, request)
@@ -278,7 +278,7 @@ func (fm *FallbackManager) executeFallbackMode(ctx context.Context, request inte
 	return result, nil, true
 }
 
-// executeTransitionMode は移行モードでリクエストを実行します
+// executeTransitionMode 移行モードでリクエストを実行します
 func (fm *FallbackManager) executeTransitionMode(ctx context.Context, request interface{}) (interface{}, error, bool) {
 	// 移行期間中は一部のリクエストを外部サービスに送信
 	if rand.Float64() < 0.1 { // 10%のリクエストを外部サービスに
@@ -290,7 +290,7 @@ func (fm *FallbackManager) executeTransitionMode(ctx context.Context, request in
 	}
 }
 
-// recordResult はリクエスト結果を記録します
+// recordResult リクエスト結果を記録します
 func (fm *FallbackManager) recordResult(success bool, mode FallbackMode, duration time.Duration) {
 	fm.mutex.Lock()
 	defer fm.mutex.Unlock()
@@ -318,7 +318,7 @@ func (fm *FallbackManager) recordResult(success bool, mode FallbackMode, duratio
 	}
 }
 
-// evaluationLoop は評価ループを実行します
+// evaluationLoop 評価ループを実行します
 func (fm *FallbackManager) evaluationLoop() {
 	ticker := time.NewTicker(fm.config.EvaluationInterval)
 	defer ticker.Stop()
@@ -333,7 +333,7 @@ func (fm *FallbackManager) evaluationLoop() {
 	}
 }
 
-// evaluateMode はモードを評価します
+// evaluateMode モードを評価します
 func (fm *FallbackManager) evaluateMode() {
 	fm.mutex.Lock()
 	defer fm.mutex.Unlock()
@@ -369,7 +369,7 @@ func (fm *FallbackManager) evaluateMode() {
 	}
 }
 
-// calculateCurrentErrorRate は現在のエラー率を計算します
+// calculateCurrentErrorRate 現在のエラー率を計算します
 func (fm *FallbackManager) calculateCurrentErrorRate() float64 {
 	windowSize := fm.getEffectiveWindowSize()
 	if windowSize == 0 {
@@ -386,7 +386,7 @@ func (fm *FallbackManager) calculateCurrentErrorRate() float64 {
 	return float64(failures) / float64(windowSize)
 }
 
-// getEffectiveWindowSize は有効なウィンドウサイズを取得します
+// getEffectiveWindowSize 有効なウィンドウサイズを取得します
 func (fm *FallbackManager) getEffectiveWindowSize() int {
 	if fm.windowFull {
 		return len(fm.requestWindow)
@@ -394,7 +394,7 @@ func (fm *FallbackManager) getEffectiveWindowSize() int {
 	return fm.windowIndex
 }
 
-// transitionTo は指定されたモードに遷移します
+// transitionTo 指定されたモードに遷移します
 func (fm *FallbackManager) transitionTo(newMode FallbackMode) {
 	if fm.currentMode == newMode {
 		return
@@ -418,7 +418,7 @@ func (fm *FallbackManager) transitionTo(newMode FallbackMode) {
 	}
 }
 
-// getFromCache はキャッシュからデータを取得します
+// getFromCache キャッシュからデータを取得します
 func (fm *FallbackManager) getFromCache(request interface{}) (interface{}, bool) {
 	key := fm.generateCacheKey(request)
 	value, ok := fm.cache.Load(key)
@@ -435,7 +435,7 @@ func (fm *FallbackManager) getFromCache(request interface{}) (interface{}, bool)
 	return entry.Data, true
 }
 
-// getFromCacheIgnoreTTL はTTLを無視してキャッシュからデータを取得します
+// getFromCacheIgnoreTTL TTLを無視してキャッシュからデータを取得します
 func (fm *FallbackManager) getFromCacheIgnoreTTL(request interface{}) (interface{}, bool) {
 	key := fm.generateCacheKey(request)
 	value, ok := fm.cache.Load(key)
@@ -447,7 +447,7 @@ func (fm *FallbackManager) getFromCacheIgnoreTTL(request interface{}) (interface
 	return entry.Data, true
 }
 
-// saveToCache はデータをキャッシュに保存します
+// saveToCache データをキャッシュに保存します
 func (fm *FallbackManager) saveToCache(request interface{}, data interface{}, ttl time.Duration) {
 	key := fm.generateCacheKey(request)
 	entry := &CacheEntry{
@@ -458,20 +458,20 @@ func (fm *FallbackManager) saveToCache(request interface{}, data interface{}, tt
 	fm.cache.Store(key, entry)
 }
 
-// generateCacheKey はキャッシュキーを生成します
+// generateCacheKey キャッシュキーを生成します
 func (fm *FallbackManager) generateCacheKey(request interface{}) string {
 	// 簡易実装：実際にはrequest内容をハッシュ化など
 	return fmt.Sprintf("cache_%v", request)
 }
 
-// GetCurrentMode は現在のモードを取得します
+// GetCurrentMode 現在のモードを取得します
 func (fm *FallbackManager) GetCurrentMode() FallbackMode {
 	fm.mutex.RLock()
 	defer fm.mutex.RUnlock()
 	return fm.currentMode
 }
 
-// GetMetrics はメトリクスを取得します
+// GetMetrics メトリクスを取得します
 func (fm *FallbackManager) GetMetrics() FallbackManagerMetrics {
 	fm.mutex.RLock()
 	defer fm.mutex.RUnlock()
@@ -482,7 +482,7 @@ func (fm *FallbackManager) GetMetrics() FallbackManagerMetrics {
 	return metrics
 }
 
-// ClearCache はキャッシュをクリアします
+// ClearCache キャッシュをクリアします
 func (fm *FallbackManager) ClearCache() {
 	fm.cache.Range(func(key, value interface{}) bool {
 		fm.cache.Delete(key)
@@ -490,7 +490,7 @@ func (fm *FallbackManager) ClearCache() {
 	})
 }
 
-// Reset はフォールバック管理をリセットします
+// Reset フォールバック管理をリセットします
 func (fm *FallbackManager) Reset() {
 	fm.mutex.Lock()
 	defer fm.mutex.Unlock()
@@ -505,7 +505,7 @@ func (fm *FallbackManager) Reset() {
 	fm.ClearCache()
 }
 
-// MockExternalService はテスト用の外部サービスです
+// MockExternalService テスト用の外部サービスです
 type MockExternalService struct {
 	name        string
 	failureRate float64
@@ -540,7 +540,7 @@ func (mes *MockExternalService) SetFailureRate(rate float64) {
 	mes.failureRate = rate
 }
 
-// MockFallbackProvider はテスト用のフォールバック提供者です
+// MockFallbackProvider テスト用のフォールバック提供者です
 type MockFallbackProvider struct {
 	cache map[string]interface{}
 	mutex sync.RWMutex

@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-// WebSocketMessage はWebSocketメッセージです
+// WebSocketMessage WebSocketメッセージです
 type WebSocketMessage struct {
 	ID        string                 `json:"id"`
 	Type      MessageType            `json:"type"`
@@ -22,7 +22,7 @@ type WebSocketMessage struct {
 	Timestamp time.Time              `json:"timestamp"`
 }
 
-// MessageType はメッセージタイプです
+// MessageType メッセージタイプです
 type MessageType string
 
 const (
@@ -36,7 +36,7 @@ const (
 	MessageTypeSystem    MessageType = "system"
 )
 
-// WebSocketConnection はWebSocket接続です
+// WebSocketConnection WebSocket接続です
 type WebSocketConnection struct {
 	ID            string
 	UserID        string
@@ -51,7 +51,7 @@ type WebSocketConnection struct {
 	mu            sync.RWMutex
 }
 
-// MockWebSocketConn はWebSocket接続のモックです
+// MockWebSocketConn WebSocket接続のモックです
 type MockWebSocketConn struct {
 	ID          string
 	IsOpen      bool
@@ -61,7 +61,7 @@ type MockWebSocketConn struct {
 	mu          sync.Mutex
 }
 
-// WebSocketHandler はWebSocket並行処理ハンドラーです
+// WebSocketHandler WebSocket並行処理ハンドラーです
 type WebSocketHandler struct {
 	// 接続管理
 	connections   map[string]*WebSocketConnection
@@ -97,7 +97,7 @@ type WebSocketHandler struct {
 	startTime time.Time
 }
 
-// Channel はチャネル情報です
+// Channel チャネル情報です
 type Channel struct {
 	Name           string
 	Description    string
@@ -107,14 +107,14 @@ type Channel struct {
 	mu             sync.RWMutex
 }
 
-// MessageWorker はメッセージ処理ワーカーです
+// MessageWorker メッセージ処理ワーカーです
 type MessageWorker struct {
 	ID      int
 	handler *WebSocketHandler
 	stats   *WorkerStats
 }
 
-// HandlerStats はハンドラー統計です
+// HandlerStats ハンドラー統計です
 type HandlerStats struct {
 	mu                sync.RWMutex
 	totalConnections  int64
@@ -127,7 +127,7 @@ type HandlerStats struct {
 	startTime         time.Time
 }
 
-// WorkerStats はワーカー統計です
+// WorkerStats ワーカー統計です
 type WorkerStats struct {
 	WorkerID              int
 	ProcessedMessages     int64
@@ -137,7 +137,7 @@ type WorkerStats struct {
 	AverageProcessingTime time.Duration
 }
 
-// HandlerConfig はハンドラー設定です
+// HandlerConfig ハンドラー設定です
 type HandlerConfig struct {
 	WorkerCount       int
 	MessageBufferSize int
@@ -149,7 +149,7 @@ type HandlerConfig struct {
 	MetricsInterval   time.Duration
 }
 
-// NewHandlerConfig はデフォルト設定を作成します
+// NewHandlerConfig デフォルト設定を作成します
 func NewHandlerConfig() *HandlerConfig {
 	return &HandlerConfig{
 		WorkerCount:       4,
@@ -163,7 +163,7 @@ func NewHandlerConfig() *HandlerConfig {
 	}
 }
 
-// NewWebSocketHandler は新しいWebSocketハンドラーを作成します
+// NewWebSocketHandler 新しいWebSocketハンドラーを作成します
 func NewWebSocketHandler(config *HandlerConfig) *WebSocketHandler {
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -200,7 +200,7 @@ func NewWebSocketHandler(config *HandlerConfig) *WebSocketHandler {
 	return handler
 }
 
-// Start はハンドラーを開始します
+// Start ハンドラーを開始します
 func (wh *WebSocketHandler) Start() error {
 	if !atomic.CompareAndSwapInt32(&wh.isRunning, 0, 1) {
 		return fmt.Errorf("handler is already running")
@@ -239,7 +239,7 @@ func (wh *WebSocketHandler) Start() error {
 	return nil
 }
 
-// HandleConnection は新しいWebSocket接続を処理します
+// HandleConnection 新しいWebSocket接続を処理します
 func (wh *WebSocketHandler) HandleConnection(userID, remoteAddr, userAgent string) (*WebSocketConnection, error) {
 	if atomic.LoadInt32(&wh.isRunning) == 0 {
 		return nil, fmt.Errorf("handler is not running")
@@ -303,7 +303,7 @@ func (wh *WebSocketHandler) HandleConnection(userID, remoteAddr, userAgent strin
 	return conn, nil
 }
 
-// handleConnectionSend は接続の送信処理を行います
+// handleConnectionSend 接続の送信処理を行います
 func (wh *WebSocketHandler) handleConnectionSend(conn *WebSocketConnection) {
 	defer wh.wg.Done()
 
@@ -338,7 +338,7 @@ func (wh *WebSocketHandler) handleConnectionSend(conn *WebSocketConnection) {
 	}
 }
 
-// handleConnectionReceive は接続の受信処理を行います
+// handleConnectionReceive 接続の受信処理を行います
 func (wh *WebSocketHandler) handleConnectionReceive(conn *WebSocketConnection) {
 	defer wh.wg.Done()
 	defer wh.closeConnection(conn)
@@ -378,7 +378,7 @@ func (wh *WebSocketHandler) handleConnectionReceive(conn *WebSocketConnection) {
 	}
 }
 
-// closeConnection は接続を閉じます
+// closeConnection 接続を閉じます
 func (wh *WebSocketHandler) closeConnection(conn *WebSocketConnection) {
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
@@ -418,7 +418,7 @@ func (wh *WebSocketHandler) closeConnection(conn *WebSocketConnection) {
 	log.Printf("WebSocket connection closed: %s (user=%s)", conn.ID, conn.UserID)
 }
 
-// run はワーカーのメインループです
+// run ワーカーのメインループです
 func (mw *MessageWorker) run() {
 	defer mw.handler.wg.Done()
 
@@ -441,7 +441,7 @@ func (mw *MessageWorker) run() {
 	}
 }
 
-// processMessage はメッセージを処理します
+// processMessage メッセージを処理します
 func (mw *MessageWorker) processMessage(message *WebSocketMessage) {
 	start := time.Now()
 
@@ -473,7 +473,7 @@ func (mw *MessageWorker) processMessage(message *WebSocketMessage) {
 	}
 }
 
-// handleJoinMessage はチャネル参加メッセージを処理します
+// handleJoinMessage チャネル参加メッセージを処理します
 func (mw *MessageWorker) handleJoinMessage(message *WebSocketMessage) {
 	channelName, ok := message.Data["channel"].(string)
 	if !ok {
@@ -502,7 +502,7 @@ func (mw *MessageWorker) handleJoinMessage(message *WebSocketMessage) {
 	atomic.AddInt64(&mw.stats.SuccessfulMessages, 1)
 }
 
-// handleLeaveMessage はチャネル離脱メッセージを処理します
+// handleLeaveMessage チャネル離脱メッセージを処理します
 func (mw *MessageWorker) handleLeaveMessage(message *WebSocketMessage) {
 	channelName, ok := message.Data["channel"].(string)
 	if !ok {
@@ -531,7 +531,7 @@ func (mw *MessageWorker) handleLeaveMessage(message *WebSocketMessage) {
 	atomic.AddInt64(&mw.stats.SuccessfulMessages, 1)
 }
 
-// handleChatMessage はチャットメッセージを処理します
+// handleChatMessage チャットメッセージを処理します
 func (mw *MessageWorker) handleChatMessage(message *WebSocketMessage) {
 	channelName, ok := message.Data["channel"].(string)
 	if !ok {
@@ -551,7 +551,7 @@ func (mw *MessageWorker) handleChatMessage(message *WebSocketMessage) {
 	atomic.AddInt64(&mw.stats.SuccessfulMessages, 1)
 }
 
-// handleBroadcastMessage はブロードキャストメッセージを処理します
+// handleBroadcastMessage ブロードキャストメッセージを処理します
 func (mw *MessageWorker) handleBroadcastMessage(message *WebSocketMessage) {
 	// ブロードキャストキューに追加
 	select {
@@ -566,7 +566,7 @@ func (mw *MessageWorker) handleBroadcastMessage(message *WebSocketMessage) {
 	}
 }
 
-// handlePrivateMessage はプライベートメッセージを処理します
+// handlePrivateMessage プライベートメッセージを処理します
 func (mw *MessageWorker) handlePrivateMessage(message *WebSocketMessage) {
 	if message.To == "" {
 		mw.sendErrorMessage(message.From, "Target connection ID required for private message")
@@ -583,7 +583,7 @@ func (mw *MessageWorker) handlePrivateMessage(message *WebSocketMessage) {
 	atomic.AddInt64(&mw.stats.SuccessfulMessages, 1)
 }
 
-// handleHeartbeatMessage はハートビートメッセージを処理します
+// handleHeartbeatMessage ハートビートメッセージを処理します
 func (mw *MessageWorker) handleHeartbeatMessage(message *WebSocketMessage) {
 	// 接続のハートビート時刻を更新
 	mw.handler.connectionsMu.RLock()
@@ -610,13 +610,13 @@ func (mw *MessageWorker) handleHeartbeatMessage(message *WebSocketMessage) {
 	atomic.AddInt64(&mw.stats.SuccessfulMessages, 1)
 }
 
-// handleUnknownMessage は不明なメッセージを処理します
+// handleUnknownMessage 不明なメッセージを処理します
 func (mw *MessageWorker) handleUnknownMessage(message *WebSocketMessage) {
 	mw.sendErrorMessage(message.From, fmt.Sprintf("Unknown message type: %s", message.Type))
 	atomic.AddInt64(&mw.stats.ErrorMessages, 1)
 }
 
-// sendMessage はメッセージを送信します
+// sendMessage メッセージを送信します
 func (mw *MessageWorker) sendMessage(message *WebSocketMessage) {
 	select {
 	case mw.handler.messageQueue <- message:
@@ -626,7 +626,7 @@ func (mw *MessageWorker) sendMessage(message *WebSocketMessage) {
 	}
 }
 
-// sendErrorMessage はエラーメッセージを送信します
+// sendErrorMessage エラーメッセージを送信します
 func (mw *MessageWorker) sendErrorMessage(connectionID, errorMsg string) {
 	errorMessage := &WebSocketMessage{
 		ID:   mw.handler.generateMessageID(),
@@ -644,7 +644,7 @@ func (mw *MessageWorker) sendErrorMessage(connectionID, errorMsg string) {
 	atomic.AddInt64(&mw.handler.stats.errorMessages, 1)
 }
 
-// joinChannel はチャネルに参加します
+// joinChannel チャネルに参加します
 func (wh *WebSocketHandler) joinChannel(connectionID, channelName string) error {
 	// 接続を取得
 	wh.connectionsMu.RLock()
@@ -677,7 +677,7 @@ func (wh *WebSocketHandler) joinChannel(connectionID, channelName string) error 
 	return nil
 }
 
-// leaveChannel はチャネルから離脱します
+// leaveChannel チャネルから離脱します
 func (wh *WebSocketHandler) leaveChannel(connectionID, channelName string) error {
 	// 接続を取得
 	wh.connectionsMu.RLock()
@@ -711,7 +711,7 @@ func (wh *WebSocketHandler) leaveChannel(connectionID, channelName string) error
 	return nil
 }
 
-// createChannel はチャネルを作成します
+// createChannel チャネルを作成します
 func (wh *WebSocketHandler) createChannel(name, description string) *Channel {
 	channel := &Channel{
 		Name:           name,
@@ -728,7 +728,7 @@ func (wh *WebSocketHandler) createChannel(name, description string) *Channel {
 	return channel
 }
 
-// sendToChannel はチャネルのメンバーにメッセージを送信します
+// sendToChannel チャネルのメンバーにメッセージを送信します
 func (wh *WebSocketHandler) sendToChannel(channelName string, message *WebSocketMessage) error {
 	wh.channelsMu.RLock()
 	channel, exists := wh.channels[channelName]
@@ -757,7 +757,7 @@ func (wh *WebSocketHandler) sendToChannel(channelName string, message *WebSocket
 	return nil
 }
 
-// sendToConnection は特定の接続にメッセージを送信します
+// sendToConnection 特定の接続にメッセージを送信します
 func (wh *WebSocketHandler) sendToConnection(connectionID string, message *WebSocketMessage) error {
 	wh.connectionsMu.RLock()
 	conn, exists := wh.connections[connectionID]
@@ -777,7 +777,7 @@ func (wh *WebSocketHandler) sendToConnection(connectionID string, message *WebSo
 	}
 }
 
-// addToChannelHistory はチャネル履歴にメッセージを追加します
+// addToChannelHistory チャネル履歴にメッセージを追加します
 func (wh *WebSocketHandler) addToChannelHistory(channelName string, message *WebSocketMessage) {
 	wh.channelsMu.RLock()
 	channel, exists := wh.channels[channelName]
@@ -799,7 +799,7 @@ func (wh *WebSocketHandler) addToChannelHistory(channelName string, message *Web
 	}
 }
 
-// handleBroadcasts はブロードキャストを処理します
+// handleBroadcasts ブロードキャストを処理します
 func (wh *WebSocketHandler) handleBroadcasts() {
 	defer wh.wg.Done()
 
@@ -835,7 +835,7 @@ func (wh *WebSocketHandler) handleBroadcasts() {
 	}
 }
 
-// heartbeatLoop はハートビートループを実行します
+// heartbeatLoop ハートビートループを実行します
 func (wh *WebSocketHandler) heartbeatLoop() {
 	defer wh.wg.Done()
 
@@ -855,7 +855,7 @@ func (wh *WebSocketHandler) heartbeatLoop() {
 	}
 }
 
-// checkHeartbeats はハートビートをチェックします
+// checkHeartbeats ハートビートをチェックします
 func (wh *WebSocketHandler) checkHeartbeats() {
 	now := time.Now()
 	timeout := wh.config.ConnectionTimeout
@@ -881,7 +881,7 @@ func (wh *WebSocketHandler) checkHeartbeats() {
 	}
 }
 
-// monitorConnections は接続を監視します
+// monitorConnections 接続を監視します
 func (wh *WebSocketHandler) monitorConnections() {
 	defer wh.wg.Done()
 
@@ -901,7 +901,7 @@ func (wh *WebSocketHandler) monitorConnections() {
 	}
 }
 
-// reportConnectionStatus は接続状況を報告します
+// reportConnectionStatus 接続状況を報告します
 func (wh *WebSocketHandler) reportConnectionStatus() {
 	activeConnections := atomic.LoadInt64(&wh.stats.activeConnections)
 	totalConnections := atomic.LoadInt64(&wh.stats.totalConnections)
@@ -914,7 +914,7 @@ func (wh *WebSocketHandler) reportConnectionStatus() {
 		activeConnections, totalConnections, channelCount)
 }
 
-// monitorMetrics はメトリクスを監視します
+// monitorMetrics メトリクスを監視します
 func (wh *WebSocketHandler) monitorMetrics() {
 	defer wh.wg.Done()
 
@@ -934,7 +934,7 @@ func (wh *WebSocketHandler) monitorMetrics() {
 	}
 }
 
-// reportMetrics はメトリクスを報告します
+// reportMetrics メトリクスを報告します
 func (wh *WebSocketHandler) reportMetrics() {
 	wh.stats.mu.RLock()
 	defer wh.stats.mu.RUnlock()
@@ -968,7 +968,7 @@ func (wh *WebSocketHandler) reportMetrics() {
 	}
 }
 
-// SendMessage は外部からメッセージを送信します
+// SendMessage 外部からメッセージを送信します
 func (wh *WebSocketHandler) SendMessage(message *WebSocketMessage) error {
 	if atomic.LoadInt32(&wh.isRunning) == 0 {
 		return fmt.Errorf("handler is not running")
@@ -989,17 +989,17 @@ func (wh *WebSocketHandler) SendMessage(message *WebSocketMessage) error {
 
 // ユーティリティメソッド
 
-// generateConnectionID は接続IDを生成します
+// generateConnectionID 接続IDを生成します
 func (wh *WebSocketHandler) generateConnectionID() string {
 	return fmt.Sprintf("conn_%d_%d", time.Now().UnixNano(), rand.Int63())
 }
 
-// generateMessageID はメッセージIDを生成します
+// generateMessageID メッセージIDを生成します
 func (wh *WebSocketHandler) generateMessageID() string {
 	return fmt.Sprintf("msg_%d_%d", time.Now().UnixNano(), rand.Int63())
 }
 
-// Shutdown はハンドラーを停止します
+// Shutdown ハンドラーを停止します
 func (wh *WebSocketHandler) Shutdown(timeout time.Duration) error {
 	if !atomic.CompareAndSwapInt32(&wh.isRunning, 1, 0) {
 		return fmt.Errorf("handler is not running")
@@ -1045,7 +1045,7 @@ func (wh *WebSocketHandler) Shutdown(timeout time.Duration) error {
 	return nil
 }
 
-// GetStats は統計情報を取得します
+// GetStats 統計情報を取得します
 func (wh *WebSocketHandler) GetStats() map[string]interface{} {
 	wh.stats.mu.RLock()
 	defer wh.stats.mu.RUnlock()

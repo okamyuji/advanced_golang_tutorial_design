@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-// Order は注文情報を表現します
+// Order 注文情報を表現します
 type Order struct {
 	ID         int
 	CustomerID string
@@ -18,7 +18,7 @@ type Order struct {
 	CreatedAt  time.Time
 }
 
-// OrderProcessor は注文処理システムです
+// OrderProcessor 注文処理システムです
 type OrderProcessor struct {
 	orderChan      chan Order
 	resultChan     chan ProcessResult
@@ -29,7 +29,7 @@ type OrderProcessor struct {
 	wg             sync.WaitGroup // ワーカー管理用
 }
 
-// ProcessResult は処理結果を表現します
+// ProcessResult 処理結果を表現します
 type ProcessResult struct {
 	OrderID     int
 	Success     bool
@@ -37,7 +37,7 @@ type ProcessResult struct {
 	ProcessedAt time.Time
 }
 
-// NewOrderProcessor は新しい注文処理システムを作成します
+// NewOrderProcessor 新しい注文処理システムを作成します
 func NewOrderProcessor(workerCount int, bufferSize int) *OrderProcessor {
 	return &OrderProcessor{
 		orderChan:   make(chan Order, bufferSize),
@@ -46,7 +46,7 @@ func NewOrderProcessor(workerCount int, bufferSize int) *OrderProcessor {
 	}
 }
 
-// Start は注文処理システムを開始します
+// Start 注文処理システムを開始します
 func (op *OrderProcessor) Start(ctx context.Context) {
 	// 複数のワーカーGorutineを開始
 	for i := 0; i < op.workerCount; i++ {
@@ -59,7 +59,7 @@ func (op *OrderProcessor) Start(ctx context.Context) {
 	go op.resultHandler(ctx)
 }
 
-// worker は注文を処理するワーカーです
+// worker 注文を処理するワーカーです
 func (op *OrderProcessor) worker(ctx context.Context, workerID int) {
 	defer op.wg.Done()
 	for {
@@ -88,7 +88,7 @@ func (op *OrderProcessor) worker(ctx context.Context, workerID int) {
 	}
 }
 
-// processOrder は個別の注文を処理します
+// processOrder 個別の注文を処理します
 func (op *OrderProcessor) processOrder(order Order, workerID int) ProcessResult {
 	// シミュレーション用の処理時間
 	processingTime := time.Duration(rand.Intn(100)) * time.Millisecond
@@ -112,7 +112,7 @@ func (op *OrderProcessor) processOrder(order Order, workerID int) ProcessResult 
 	}
 }
 
-// resultHandler は処理結果を処理します
+// resultHandler 処理結果を処理します
 func (op *OrderProcessor) resultHandler(ctx context.Context) {
 	defer op.wg.Done()
 	for {
@@ -138,7 +138,7 @@ func (op *OrderProcessor) resultHandler(ctx context.Context) {
 	}
 }
 
-// SubmitOrder は新しい注文を送信します
+// SubmitOrder 新しい注文を送信します
 func (op *OrderProcessor) SubmitOrder(order Order) error {
 	select {
 	case op.orderChan <- order:
@@ -148,14 +148,14 @@ func (op *OrderProcessor) SubmitOrder(order Order) error {
 	}
 }
 
-// GetStats は処理統計を取得します
+// GetStats 処理統計を取得します
 func (op *OrderProcessor) GetStats() (int64, int64) {
 	op.mu.RLock()
 	defer op.mu.RUnlock()
 	return op.processedCount, op.errorCount
 }
 
-// Shutdown はシステムを適切に停止します
+// Shutdown システムを適切に停止します
 func (op *OrderProcessor) Shutdown() {
 	// 1. 新しい注文の受付を停止
 	close(op.orderChan)

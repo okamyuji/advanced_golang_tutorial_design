@@ -16,7 +16,7 @@ import (
 	_ "github.com/lib/pq"
 )
 
-// TxConfig はトランザクション設定です
+// TxConfig トランザクション設定です
 type TxConfig struct {
 	IsolationLevel sql.IsolationLevel
 	ReadOnly       bool
@@ -24,7 +24,7 @@ type TxConfig struct {
 	RetryPolicy    *RetryConfig
 }
 
-// RetryConfig はリトライ設定です
+// RetryConfig リトライ設定です
 type RetryConfig struct {
 	MaxRetries      int
 	InitialDelay    time.Duration
@@ -33,13 +33,13 @@ type RetryConfig struct {
 	RetryableErrors []string
 }
 
-// TransactionManager はトランザクション管理を行います
+// TransactionManager トランザクション管理を行います
 type TransactionManager struct {
 	db    *sql.DB
 	stats *TransactionStats
 }
 
-// TransactionStats はトランザクション統計です
+// TransactionStats トランザクション統計です
 type TransactionStats struct {
 	mu                sync.RWMutex
 	totalTransactions int64
@@ -50,7 +50,7 @@ type TransactionStats struct {
 	avgTxDuration     time.Duration
 }
 
-// NewTransactionManager は新しいトランザクションマネージャーを作成します
+// NewTransactionManager 新しいトランザクションマネージャーを作成します
 func NewTransactionManager(db *sql.DB) *TransactionManager {
 	return &TransactionManager{
 		db:    db,
@@ -58,7 +58,7 @@ func NewTransactionManager(db *sql.DB) *TransactionManager {
 	}
 }
 
-// ExecuteTransaction はトランザクションを実行します
+// ExecuteTransaction トランザクションを実行します
 func (tm *TransactionManager) ExecuteTransaction(ctx context.Context, config *TxConfig, fn func(*sql.Tx) error) error {
 	start := time.Now()
 	atomic.AddInt64(&tm.stats.totalTransactions, 1)
@@ -83,7 +83,7 @@ func (tm *TransactionManager) ExecuteTransaction(ctx context.Context, config *Tx
 	return tm.executeSingleTransaction(ctx, config, fn)
 }
 
-// executeWithRetry はリトライ付きでトランザクションを実行します
+// executeWithRetry リトライ付きでトランザクションを実行します
 func (tm *TransactionManager) executeWithRetry(ctx context.Context, config *TxConfig, fn func(*sql.Tx) error) error {
 	var lastErr error
 	retryDelay := config.RetryPolicy.InitialDelay
@@ -125,7 +125,7 @@ func (tm *TransactionManager) executeWithRetry(ctx context.Context, config *TxCo
 	return lastErr
 }
 
-// executeSingleTransaction は単一のトランザクションを実行します
+// executeSingleTransaction 単一のトランザクションを実行します
 func (tm *TransactionManager) executeSingleTransaction(ctx context.Context, config *TxConfig, fn func(*sql.Tx) error) error {
 	tx, err := tm.db.BeginTx(ctx, &sql.TxOptions{
 		Isolation: config.IsolationLevel,
@@ -165,7 +165,7 @@ func (tm *TransactionManager) executeSingleTransaction(ctx context.Context, conf
 	return nil
 }
 
-// isRetryableError はリトライ可能なエラーかチェックします
+// isRetryableError リトライ可能なエラーかチェックします
 func (tm *TransactionManager) isRetryableError(err error, retryConfig *RetryConfig) bool {
 	if err == nil {
 		return false
@@ -181,7 +181,7 @@ func (tm *TransactionManager) isRetryableError(err error, retryConfig *RetryConf
 	return false
 }
 
-// isDeadlockError はデッドロックエラーかチェックします
+// isDeadlockError デッドロックエラーかチェックします
 func (tm *TransactionManager) isDeadlockError(err error) bool {
 	if err == nil {
 		return false
@@ -190,7 +190,7 @@ func (tm *TransactionManager) isDeadlockError(err error) bool {
 	return strings.Contains(errStr, "deadlock") || strings.Contains(errStr, "40P01")
 }
 
-// updateTxDuration はトランザクション実行時間を更新します
+// updateTxDuration トランザクション実行時間を更新します
 func (tm *TransactionManager) updateTxDuration(elapsed time.Duration) {
 	tm.stats.mu.Lock()
 	defer tm.stats.mu.Unlock()
@@ -206,7 +206,7 @@ func (tm *TransactionManager) updateTxDuration(elapsed time.Duration) {
 	}
 }
 
-// GetStats は統計情報を取得します
+// GetStats 統計情報を取得します
 func (tm *TransactionManager) GetStats() TransactionStatsSnapshot {
 	tm.stats.mu.RLock()
 	defer tm.stats.mu.RUnlock()
@@ -221,7 +221,7 @@ func (tm *TransactionManager) GetStats() TransactionStatsSnapshot {
 	}
 }
 
-// TransactionStatsSnapshot は統計のスナップショットです
+// TransactionStatsSnapshot 統計のスナップショットです
 type TransactionStatsSnapshot struct {
 	TotalTransactions int64
 	CommittedTx       int64
@@ -231,17 +231,17 @@ type TransactionStatsSnapshot struct {
 	AvgTxDuration     time.Duration
 }
 
-// OptimisticLockManager は楽観的ロック管理を行います
+// OptimisticLockManager 楽観的ロック管理を行います
 type OptimisticLockManager struct {
 	tm *TransactionManager
 }
 
-// NewOptimisticLockManager は楽観的ロックマネージャーを作成します
+// NewOptimisticLockManager 楽観的ロックマネージャーを作成します
 func NewOptimisticLockManager(tm *TransactionManager) *OptimisticLockManager {
 	return &OptimisticLockManager{tm: tm}
 }
 
-// UpdateWithOptimisticLock は楽観的ロック付きで更新します
+// UpdateWithOptimisticLock 楽観的ロック付きで更新します
 func (olm *OptimisticLockManager) UpdateWithOptimisticLock(ctx context.Context, tableName string, id int64,
 	updateFields map[string]interface{}) error {
 
@@ -310,13 +310,13 @@ func (olm *OptimisticLockManager) UpdateWithOptimisticLock(ctx context.Context, 
 	})
 }
 
-// InventoryManager は在庫管理を行います
+// InventoryManager 在庫管理を行います
 type InventoryManager struct {
 	tm  *TransactionManager
 	olm *OptimisticLockManager
 }
 
-// NewInventoryManager は在庫マネージャーを作成します
+// NewInventoryManager 在庫マネージャーを作成します
 func NewInventoryManager(tm *TransactionManager) *InventoryManager {
 	return &InventoryManager{
 		tm:  tm,
@@ -324,7 +324,7 @@ func NewInventoryManager(tm *TransactionManager) *InventoryManager {
 	}
 }
 
-// ReserveInventory は在庫を予約します
+// ReserveInventory 在庫を予約します
 func (im *InventoryManager) ReserveInventory(ctx context.Context, productID int64, warehouseID int64, quantity int) error {
 	config := &TxConfig{
 		IsolationLevel: sql.LevelReadCommitted,
@@ -377,7 +377,7 @@ func (im *InventoryManager) ReserveInventory(ctx context.Context, productID int6
 	})
 }
 
-// ProcessConcurrentOrders は並行注文処理をシミュレートします
+// ProcessConcurrentOrders 並行注文処理をシミュレートします
 func (im *InventoryManager) ProcessConcurrentOrders(ctx context.Context, productID int64, warehouseID int64, orderCount int) {
 	var wg sync.WaitGroup
 	successCount := int64(0)
@@ -447,7 +447,7 @@ func main() {
 	fmt.Printf("  Average Duration: %v\n", stats.AvgTxDuration)
 }
 
-// testOptimisticLock は楽観的ロックのテストを実行します
+// testOptimisticLock 楽観的ロックのテストを実行します
 func testOptimisticLock(tm *TransactionManager) {
 	ctx := context.Background()
 	olm := NewOptimisticLockManager(tm)

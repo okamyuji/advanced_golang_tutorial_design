@@ -15,7 +15,7 @@ import (
 // 楽観的ロック付き在庫管理システム
 // 在庫の整合性を保ちながら並行処理を実現
 
-// InventoryItem は在庫アイテムを表現
+// InventoryItem 在庫アイテムを表現
 type InventoryItem struct {
 	ID        int64     `json:"id"`
 	Name      string    `json:"name"`
@@ -24,14 +24,14 @@ type InventoryItem struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
-// OrderRequest は注文リクエストを表現
+// OrderRequest 注文リクエストを表現
 type OrderRequest struct {
 	ItemID   int64  `json:"item_id"`
 	Quantity int32  `json:"quantity"`
 	OrderID  string `json:"order_id"`
 }
 
-// InventoryManager は在庫管理システム
+// InventoryManager 在庫管理システム
 type InventoryManager struct {
 	db         *sql.DB
 	maxRetries int
@@ -39,7 +39,7 @@ type InventoryManager struct {
 	metrics    *InventoryMetrics
 }
 
-// InventoryMetrics は在庫システムのメトリクス
+// InventoryMetrics 在庫システムのメトリクス
 type InventoryMetrics struct {
 	mu                    sync.RWMutex
 	successfulOrders      int64
@@ -49,7 +49,7 @@ type InventoryMetrics struct {
 	deadlockRetries       int64
 }
 
-// InventoryMetricsSnapshot はメトリクスのスナップショット（mutex無し）
+// InventoryMetricsSnapshot メトリクスのスナップショット（mutex無し）
 type InventoryMetricsSnapshot struct {
 	SuccessfulOrders      int64 `json:"successful_orders"`
 	FailedOrders          int64 `json:"failed_orders"`
@@ -66,7 +66,7 @@ var (
 	ErrDeadlock             = errors.New("deadlock detected")
 )
 
-// NewInventoryManager は新しい在庫管理システムを作成
+// NewInventoryManager 新しい在庫管理システムを作成
 func NewInventoryManager(db *sql.DB) *InventoryManager {
 	return &InventoryManager{
 		db:         db,
@@ -76,7 +76,7 @@ func NewInventoryManager(db *sql.DB) *InventoryManager {
 	}
 }
 
-// ProcessOrder は注文を処理（楽観的ロック付き）
+// ProcessOrder 注文を処理（楽観的ロック付き）
 func (im *InventoryManager) ProcessOrder(ctx context.Context, req *OrderRequest) error {
 	for attempt := 0; attempt < im.maxRetries; attempt++ {
 		err := im.processOrderAttempt(ctx, req)
@@ -120,7 +120,7 @@ func (im *InventoryManager) ProcessOrder(ctx context.Context, req *OrderRequest)
 	return ErrMaxRetriesExceeded
 }
 
-// processOrderAttempt は単一の注文処理を試行
+// processOrderAttempt 単一の注文処理を試行
 func (im *InventoryManager) processOrderAttempt(ctx context.Context, req *OrderRequest) error {
 	tx, err := im.db.BeginTx(ctx, &sql.TxOptions{
 		Isolation: sql.LevelReadCommitted,
@@ -174,7 +174,7 @@ func (im *InventoryManager) processOrderAttempt(ctx context.Context, req *OrderR
 	return nil
 }
 
-// getInventoryForUpdate は更新用に在庫情報を取得
+// getInventoryForUpdate 更新用に在庫情報を取得
 func (im *InventoryManager) getInventoryForUpdate(ctx context.Context, tx *sql.Tx, itemID int64) (*InventoryItem, error) {
 	query := `
 		SELECT id, name, quantity, version, updated_at 
@@ -196,7 +196,7 @@ func (im *InventoryManager) getInventoryForUpdate(ctx context.Context, tx *sql.T
 	return &item, nil
 }
 
-// updateInventoryWithOptimisticLock は楽観的ロック付きで在庫を更新
+// updateInventoryWithOptimisticLock 楽観的ロック付きで在庫を更新
 func (im *InventoryManager) updateInventoryWithOptimisticLock(ctx context.Context,
 	tx *sql.Tx, itemID int64, newQuantity int32, expectedVersion int32) (bool, error) {
 
@@ -218,7 +218,7 @@ func (im *InventoryManager) updateInventoryWithOptimisticLock(ctx context.Contex
 	return rowsAffected > 0, nil
 }
 
-// recordOrderHistory は注文履歴を記録
+// recordOrderHistory 注文履歴を記録
 func (im *InventoryManager) recordOrderHistory(ctx context.Context, tx *sql.Tx,
 	req *OrderRequest, beforeQuantity, afterQuantity int32) error {
 
@@ -232,7 +232,7 @@ func (im *InventoryManager) recordOrderHistory(ctx context.Context, tx *sql.Tx,
 	return err
 }
 
-// calculateBackoffDelay は指数バックオフ遅延を計算
+// calculateBackoffDelay 指数バックオフ遅延を計算
 func (im *InventoryManager) calculateBackoffDelay(attempt int) time.Duration {
 	// 指数バックオフ: 基本遅延 * 2^attempt + ジッター
 	backoff := im.retryDelay * time.Duration(1<<uint(attempt))
@@ -240,7 +240,7 @@ func (im *InventoryManager) calculateBackoffDelay(attempt int) time.Duration {
 	return backoff + jitter
 }
 
-// isDeadlockError はデッドロックエラーかどうかを判定
+// isDeadlockError デッドロックエラーかどうかを判定
 func isDeadlockError(err error) bool {
 	if err == nil {
 		return false
@@ -249,7 +249,7 @@ func isDeadlockError(err error) bool {
 	return fmt.Sprintf("%v", err) == "pq: deadlock detected"
 }
 
-// GetInventoryStatus は在庫状況を取得
+// GetInventoryStatus 在庫状況を取得
 func (im *InventoryManager) GetInventoryStatus(ctx context.Context, itemID int64) (*InventoryItem, error) {
 	query := `
 		SELECT id, name, quantity, version, updated_at 
@@ -270,7 +270,7 @@ func (im *InventoryManager) GetInventoryStatus(ctx context.Context, itemID int64
 	return &item, nil
 }
 
-// GetMetrics はシステムメトリクスを取得
+// GetMetrics システムメトリクスを取得
 func (im *InventoryManager) GetMetrics() InventoryMetricsSnapshot {
 	im.metrics.mu.RLock()
 	defer im.metrics.mu.RUnlock()

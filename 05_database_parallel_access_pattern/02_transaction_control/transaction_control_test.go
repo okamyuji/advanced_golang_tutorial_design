@@ -14,7 +14,7 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 )
 
-// setupTestDB はテスト用のPostgreSQLコンテナを起動し、初期化されたデータベースを返す
+// setupTestDB テスト用のPostgreSQLコンテナを起動し、初期化されたデータベースを返す
 func setupTestDB(t *testing.T) (*sql.DB, func()) {
 	ctx := context.Background()
 
@@ -92,7 +92,7 @@ func setupTestDB(t *testing.T) (*sql.DB, func()) {
 	return db, cleanup
 }
 
-// createTestTables はテスト用テーブルを作成
+// createTestTables テスト用テーブルを作成
 func createTestTables(db *sql.DB) error {
 	queries := []string{
 		`CREATE TABLE IF NOT EXISTS products (
@@ -131,7 +131,7 @@ func createTestTables(db *sql.DB) error {
 	return nil
 }
 
-// insertTestData はテストデータを挿入
+// insertTestData テストデータを挿入
 func insertTestData(db *sql.DB) error {
 	// テスト用商品
 	_, err := db.Exec(`

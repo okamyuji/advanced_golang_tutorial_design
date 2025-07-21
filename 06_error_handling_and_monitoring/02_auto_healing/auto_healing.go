@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-// HealthStatus は健全性チェックの結果を表します
+// HealthStatus 健全性チェックの結果を表します
 type HealthStatus struct {
 	Name      string                 `json:"name"`
 	Status    string                 `json:"status"` // "healthy", "warning", "critical"
@@ -23,14 +23,14 @@ type HealthStatus struct {
 	Score     float64                `json:"score"` // 0.0-1.0
 }
 
-// HealthChecker は健全性チェックインターフェースです
+// HealthChecker 健全性チェックインターフェースです
 type HealthChecker interface {
 	Check(ctx context.Context) HealthStatus
 	Name() string
 	Critical() bool
 }
 
-// HealingAction は復旧アクションのインターフェースです
+// HealingAction 復旧アクションのインターフェースです
 type HealingAction interface {
 	Execute(ctx context.Context, issue HealthIssue) error
 	Name() string
@@ -38,7 +38,7 @@ type HealingAction interface {
 	EstimatedDuration() time.Duration
 }
 
-// HealthIssue は検出された健全性の問題を表します
+// HealthIssue 検出された健全性の問題を表します
 type HealthIssue struct {
 	Type        string                 `json:"type"`
 	Severity    Severity               `json:"severity"`
@@ -49,7 +49,7 @@ type HealthIssue struct {
 	Predictive  bool                   `json:"predictive"`
 }
 
-// Severity は問題の重要度を表します
+// Severity 問題の重要度を表します
 type Severity int
 
 const (
@@ -74,7 +74,7 @@ func (s Severity) String() string {
 	}
 }
 
-// AlertLevel はアラートレベルを表します
+// AlertLevel アラートレベルを表します
 type AlertLevel int
 
 const (
@@ -99,7 +99,7 @@ func (a AlertLevel) String() string {
 	}
 }
 
-// Alert はアラート情報を表します
+// Alert アラート情報を表します
 type Alert struct {
 	Level     AlertLevel             `json:"level"`
 	Message   string                 `json:"message"`
@@ -108,7 +108,7 @@ type Alert struct {
 	Details   map[string]interface{} `json:"details"`
 }
 
-// AlertManager はアラート管理を行います
+// AlertManager アラート管理を行います
 type AlertManager struct {
 	alerts    []Alert
 	mutex     sync.RWMutex
@@ -116,7 +116,7 @@ type AlertManager struct {
 	callbacks []func(Alert)
 }
 
-// NewAlertManager は新しいアラートマネージャーを作成します
+// NewAlertManager 新しいアラートマネージャーを作成します
 func NewAlertManager(maxAlerts int) *AlertManager {
 	return &AlertManager{
 		alerts:    make([]Alert, 0),
@@ -125,7 +125,7 @@ func NewAlertManager(maxAlerts int) *AlertManager {
 	}
 }
 
-// Send はアラートを送信します
+// Send アラートを送信します
 func (am *AlertManager) Send(alert Alert) {
 	alert.Timestamp = time.Now()
 
@@ -144,12 +144,12 @@ func (am *AlertManager) Send(alert Alert) {
 	}
 }
 
-// AddCallback はアラートコールバックを追加します
+// AddCallback アラートコールバックを追加します
 func (am *AlertManager) AddCallback(callback func(Alert)) {
 	am.callbacks = append(am.callbacks, callback)
 }
 
-// GetAlerts は最近のアラートを取得します
+// GetAlerts 最近のアラートを取得します
 func (am *AlertManager) GetAlerts(limit int) []Alert {
 	am.mutex.RLock()
 	defer am.mutex.RUnlock()
@@ -169,7 +169,7 @@ func (am *AlertManager) GetAlerts(limit int) []Alert {
 	return result
 }
 
-// SystemMetrics はシステムメトリクスを表します
+// SystemMetrics システムメトリクスを表します
 type SystemMetrics struct {
 	CPUUsage       float64   `json:"cpu_usage"`
 	MemoryUsage    float64   `json:"memory_usage"`
@@ -178,7 +178,7 @@ type SystemMetrics struct {
 	LastUpdated    time.Time `json:"last_updated"`
 }
 
-// AutoHealingSystem は自己修復システムです
+// AutoHealingSystem 自己修復システムです
 type AutoHealingSystem struct {
 	healthCheckers []HealthChecker
 	healingActions map[string][]HealingAction
@@ -204,7 +204,7 @@ type AutoHealingSystem struct {
 	mutex sync.RWMutex
 }
 
-// HealingActionResult は復旧アクション結果を表します
+// HealingActionResult 復旧アクション結果を表します
 type HealingActionResult struct {
 	Action    string        `json:"action"`
 	Issue     HealthIssue   `json:"issue"`
@@ -214,7 +214,7 @@ type HealingActionResult struct {
 	Timestamp time.Time     `json:"timestamp"`
 }
 
-// NewAutoHealingSystem は新しい自己修復システムを作成します
+// NewAutoHealingSystem 新しい自己修復システムを作成します
 func NewAutoHealingSystem(interval time.Duration, retryAttempts int) *AutoHealingSystem {
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -235,12 +235,12 @@ func NewAutoHealingSystem(interval time.Duration, retryAttempts int) *AutoHealin
 	}
 }
 
-// AddHealthChecker は健全性チェッカーを追加します
+// AddHealthChecker 健全性チェッカーを追加します
 func (ahs *AutoHealingSystem) AddHealthChecker(checker HealthChecker) {
 	ahs.healthCheckers = append(ahs.healthCheckers, checker)
 }
 
-// AddHealingAction は復旧アクションを追加します
+// AddHealingAction 復旧アクションを追加します
 func (ahs *AutoHealingSystem) AddHealingAction(issueType string, action HealingAction) {
 	if ahs.healingActions[issueType] == nil {
 		ahs.healingActions[issueType] = make([]HealingAction, 0)
@@ -248,7 +248,7 @@ func (ahs *AutoHealingSystem) AddHealingAction(issueType string, action HealingA
 	ahs.healingActions[issueType] = append(ahs.healingActions[issueType], action)
 }
 
-// Start は自己修復システムを開始します
+// Start 自己修復システムを開始します
 func (ahs *AutoHealingSystem) Start() error {
 	if !atomic.CompareAndSwapInt64(&ahs.isRunning, 0, 1) {
 		return fmt.Errorf("auto healing system is already running")
@@ -271,7 +271,7 @@ func (ahs *AutoHealingSystem) Start() error {
 	return nil
 }
 
-// Stop は自己修復システムを停止します
+// Stop 自己修復システムを停止します
 func (ahs *AutoHealingSystem) Stop() {
 	if !atomic.CompareAndSwapInt64(&ahs.isRunning, 1, 0) {
 		return
@@ -282,7 +282,7 @@ func (ahs *AutoHealingSystem) Stop() {
 	log.Println("Auto-Healing System stopped")
 }
 
-// mainLoop はメインの監視ループです
+// mainLoop メインの監視ループです
 func (ahs *AutoHealingSystem) mainLoop() {
 	ticker := time.NewTicker(ahs.interval)
 	defer ticker.Stop()
@@ -297,7 +297,7 @@ func (ahs *AutoHealingSystem) mainLoop() {
 	}
 }
 
-// metricsUpdateLoop はメトリクス更新ループです
+// metricsUpdateLoop メトリクス更新ループです
 func (ahs *AutoHealingSystem) metricsUpdateLoop() {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
@@ -312,7 +312,7 @@ func (ahs *AutoHealingSystem) metricsUpdateLoop() {
 	}
 }
 
-// performHealthCheck は健全性チェックを実行します
+// performHealthCheck 健全性チェックを実行します
 func (ahs *AutoHealingSystem) performHealthCheck() {
 	atomic.AddInt64(&ahs.totalChecks, 1)
 
@@ -362,7 +362,7 @@ func (ahs *AutoHealingSystem) performHealthCheck() {
 	ahs.processHealthResults(healthResults)
 }
 
-// processHealthResults は健全性チェック結果を処理します
+// processHealthResults 健全性チェック結果を処理します
 func (ahs *AutoHealingSystem) processHealthResults(results chan HealthStatus) {
 	var issues []HealthIssue
 
@@ -394,7 +394,7 @@ func (ahs *AutoHealingSystem) processHealthResults(results chan HealthStatus) {
 	ahs.predictiveAnalysis()
 }
 
-// convertToIssue はHealthStatusをHealthIssueに変換します
+// convertToIssue HealthStatusをHealthIssueに変換します
 func (ahs *AutoHealingSystem) convertToIssue(status HealthStatus) HealthIssue {
 	var severity Severity
 	switch status.Status {
@@ -417,7 +417,7 @@ func (ahs *AutoHealingSystem) convertToIssue(status HealthStatus) HealthIssue {
 	}
 }
 
-// executeHealing は復旧処理を実行します
+// executeHealing 復旧処理を実行します
 func (ahs *AutoHealingSystem) executeHealing(issue HealthIssue) error {
 	actions := ahs.healingActions[issue.Type]
 	if len(actions) == 0 {
@@ -509,7 +509,7 @@ func (ahs *AutoHealingSystem) executeHealing(issue HealthIssue) error {
 	return fmt.Errorf("auto-healing failed after %d attempts", ahs.retryAttempts)
 }
 
-// verifyRecovery は復旧を確認します
+// verifyRecovery 復旧を確認します
 func (ahs *AutoHealingSystem) verifyRecovery(issue HealthIssue) bool {
 	// 対象のチェッカーを再実行
 	for _, checker := range ahs.healthCheckers {
@@ -524,7 +524,7 @@ func (ahs *AutoHealingSystem) verifyRecovery(issue HealthIssue) bool {
 	return false
 }
 
-// predictiveAnalysis は予兆検知分析を行います
+// predictiveAnalysis 予兆検知分析を行います
 func (ahs *AutoHealingSystem) predictiveAnalysis() {
 	ahs.mutex.RLock()
 	defer ahs.mutex.RUnlock()
@@ -561,7 +561,7 @@ func (ahs *AutoHealingSystem) predictiveAnalysis() {
 	}
 }
 
-// updateSystemMetrics はシステムメトリクスを更新します
+// updateSystemMetrics システムメトリクスを更新します
 func (ahs *AutoHealingSystem) updateSystemMetrics() {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
@@ -574,7 +574,7 @@ func (ahs *AutoHealingSystem) updateSystemMetrics() {
 	ahs.mutex.Unlock()
 }
 
-// addHealthHistory は健全性履歴に追加します
+// addHealthHistory 健全性履歴に追加します
 func (ahs *AutoHealingSystem) addHealthHistory(status HealthStatus) {
 	ahs.mutex.Lock()
 	defer ahs.mutex.Unlock()
@@ -585,7 +585,7 @@ func (ahs *AutoHealingSystem) addHealthHistory(status HealthStatus) {
 	}
 }
 
-// addIssueHistory は問題履歴に追加します
+// addIssueHistory 問題履歴に追加します
 func (ahs *AutoHealingSystem) addIssueHistory(issue HealthIssue) {
 	ahs.mutex.Lock()
 	defer ahs.mutex.Unlock()
@@ -596,7 +596,7 @@ func (ahs *AutoHealingSystem) addIssueHistory(issue HealthIssue) {
 	}
 }
 
-// addActionHistory はアクション履歴に追加します
+// addActionHistory アクション履歴に追加します
 func (ahs *AutoHealingSystem) addActionHistory(result HealingActionResult) {
 	ahs.mutex.Lock()
 	defer ahs.mutex.Unlock()
@@ -607,7 +607,7 @@ func (ahs *AutoHealingSystem) addActionHistory(result HealingActionResult) {
 	}
 }
 
-// GetStatus はシステム状態を取得します
+// GetStatus システム状態を取得します
 func (ahs *AutoHealingSystem) GetStatus() map[string]interface{} {
 	ahs.mutex.RLock()
 	defer ahs.mutex.RUnlock()
@@ -625,7 +625,7 @@ func (ahs *AutoHealingSystem) GetStatus() map[string]interface{} {
 	}
 }
 
-// MemoryHealthChecker はメモリ使用量をチェックします
+// MemoryHealthChecker メモリ使用量をチェックします
 type MemoryHealthChecker struct {
 	threshold float64
 }
@@ -674,7 +674,7 @@ func (mhc *MemoryHealthChecker) Check(ctx context.Context) HealthStatus {
 	return status
 }
 
-// GoroutineHealthChecker はGoroutine数をチェックします
+// GoroutineHealthChecker Goroutine数をチェックします
 type GoroutineHealthChecker struct {
 	threshold int
 }
@@ -718,7 +718,7 @@ func (ghc *GoroutineHealthChecker) Check(ctx context.Context) HealthStatus {
 	return status
 }
 
-// GCTriggerAction はGCを強制実行するアクションです
+// GCTriggerAction GCを強制実行するアクションです
 type GCTriggerAction struct{}
 
 func NewGCTriggerAction() *GCTriggerAction {
@@ -744,7 +744,7 @@ func (gca *GCTriggerAction) Execute(ctx context.Context, issue HealthIssue) erro
 	return nil
 }
 
-// HTTPHealthChecker はHTTPエンドポイントをチェックします
+// HTTPHealthChecker HTTPエンドポイントをチェックします
 type HTTPHealthChecker struct {
 	name     string
 	url      string

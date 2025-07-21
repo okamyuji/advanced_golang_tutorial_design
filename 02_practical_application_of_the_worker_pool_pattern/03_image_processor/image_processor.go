@@ -550,7 +550,7 @@ func main() {
 	}
 }
 
-// createTestFile はテスト用ファイルを作成します
+// createTestFile テスト用ファイルを作成します
 func createTestFile(path string, size int64) error {
 	file, err := os.Create(path)
 	if err != nil {

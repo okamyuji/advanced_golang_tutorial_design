@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// MockMetricsCollector はテスト用のメトリクス収集器です
+// MockMetricsCollector テスト用のメトリクス収集器です
 type MockMetricsCollector struct {
 	name        string
 	interval    time.Duration

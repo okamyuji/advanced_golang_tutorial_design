@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// MockHealthChecker はテスト用の健全性チェッカーです
+// MockHealthChecker テスト用の健全性チェッカーです
 type MockHealthChecker struct {
 	name       string
 	status     string
@@ -67,7 +67,7 @@ func (mhc *MockHealthChecker) SimulateRecovery() {
 	mhc.shouldFail = false
 }
 
-// MockHealingAction はテスト用の復旧アクションです
+// MockHealingAction テスト用の復旧アクションです
 type MockHealingAction struct {
 	name           string
 	handledTypes   []string

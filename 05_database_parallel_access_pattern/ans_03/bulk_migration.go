@@ -16,7 +16,7 @@ import (
 // 大容量データ移行システム
 // 1000万件以上のレコードを効率的に別テーブルに移行
 
-// MigrationManager は大容量データ移行管理システム
+// MigrationManager 大容量データ移行管理システム
 type MigrationManager struct {
 	db                *sql.DB
 	sourceTable       string
@@ -29,7 +29,7 @@ type MigrationManager struct {
 	metrics           *MigrationMetrics
 }
 
-// MigrationConfig は移行設定
+// MigrationConfig 移行設定
 type MigrationConfig struct {
 	SourceTable        string             `json:"source_table"`
 	TargetTable        string             `json:"target_table"`
@@ -40,14 +40,14 @@ type MigrationConfig struct {
 	CheckpointInterval time.Duration      `json:"checkpoint_interval"`
 }
 
-// ResourceThresholds はリソース使用量の閾値
+// ResourceThresholds リソース使用量の閾値
 type ResourceThresholds struct {
 	MaxCPUPercent    float64 `json:"max_cpu_percent"`
 	MaxMemoryPercent float64 `json:"max_memory_percent"`
 	MaxConnections   int     `json:"max_connections"`
 }
 
-// MigrationProgress は移行進捗
+// MigrationProgress 移行進捗
 type MigrationProgress struct {
 	TotalRecords     int64           `json:"total_records"`
 	ProcessedRecords int64           `json:"processed_records"`
@@ -59,7 +59,7 @@ type MigrationProgress struct {
 	Status           MigrationStatus `json:"status"`
 }
 
-// MigrationStatus は移行状態
+// MigrationStatus 移行状態
 type MigrationStatus string
 
 const (
@@ -70,13 +70,13 @@ const (
 	StatusFailed     MigrationStatus = "FAILED"
 )
 
-// CheckpointManager はチェックポイント管理
+// CheckpointManager チェックポイント管理
 type CheckpointManager struct {
 	db       *sql.DB
 	interval time.Duration
 }
 
-// ResourceMonitor はリソース監視
+// ResourceMonitor リソース監視
 type ResourceMonitor struct {
 	thresholds      ResourceThresholds
 	cpuUsage        atomic.Value // float64
@@ -84,7 +84,7 @@ type ResourceMonitor struct {
 	connectionCount atomic.Int64
 }
 
-// MigrationMetrics は移行メトリクス
+// MigrationMetrics 移行メトリクス
 type MigrationMetrics struct {
 	mu              sync.RWMutex
 	totalChunks     int64
@@ -97,7 +97,7 @@ type MigrationMetrics struct {
 	checkpointSaves int64
 }
 
-// ChunkInfo はチャンク情報
+// ChunkInfo チャンク情報
 type ChunkInfo struct {
 	ID          int64
 	StartID     int64
@@ -109,7 +109,7 @@ type ChunkInfo struct {
 	ErrorMsg    string
 }
 
-// ChunkStatus はチャンク状態
+// ChunkStatus チャンク状態
 type ChunkStatus string
 
 const (
@@ -119,7 +119,7 @@ const (
 	ChunkFailed     ChunkStatus = "FAILED"
 )
 
-// NewMigrationManager は新しい移行管理システムを作成
+// NewMigrationManager 新しい移行管理システムを作成
 func NewMigrationManager(db *sql.DB, config *MigrationConfig) *MigrationManager {
 	mm := &MigrationManager{
 		db:               db,
@@ -147,7 +147,7 @@ func NewMigrationManager(db *sql.DB, config *MigrationConfig) *MigrationManager 
 	return mm
 }
 
-// StartMigration は移行を開始
+// StartMigration 移行を開始
 func (mm *MigrationManager) StartMigration(ctx context.Context) error {
 	log.Printf("Starting migration from %s to %s", mm.sourceTable, mm.targetTable)
 
@@ -175,7 +175,7 @@ func (mm *MigrationManager) StartMigration(ctx context.Context) error {
 	return mm.executeMigration(ctx)
 }
 
-// prepareMigration は移行の準備
+// prepareMigration 移行の準備
 func (mm *MigrationManager) prepareMigration(ctx context.Context) error {
 	// 移行対象レコード数の取得
 	totalRecords, err := mm.getTotalRecordCount(ctx)
@@ -201,7 +201,7 @@ func (mm *MigrationManager) prepareMigration(ctx context.Context) error {
 	return mm.initializeCheckpointTable(ctx)
 }
 
-// getTotalRecordCount は対象レコード数を取得
+// getTotalRecordCount 対象レコード数を取得
 func (mm *MigrationManager) getTotalRecordCount(ctx context.Context) (int64, error) {
 	query := fmt.Sprintf("SELECT COUNT(*) FROM %s", mm.sourceTable)
 
@@ -210,7 +210,7 @@ func (mm *MigrationManager) getTotalRecordCount(ctx context.Context) (int64, err
 	return count, err
 }
 
-// createChunkPlan はチャンク分割計画を作成
+// createChunkPlan チャンク分割計画を作成
 func (mm *MigrationManager) createChunkPlan(ctx context.Context, totalRecords int64) ([]*ChunkInfo, error) {
 	chunks := make([]*ChunkInfo, 0)
 
@@ -251,7 +251,7 @@ func (mm *MigrationManager) createChunkPlan(ctx context.Context, totalRecords in
 	return chunks, nil
 }
 
-// getIDRange は移行対象のID範囲を取得
+// getIDRange 移行対象のID範囲を取得
 func (mm *MigrationManager) getIDRange(ctx context.Context) (int64, int64, error) {
 	query := fmt.Sprintf("SELECT MIN(id), MAX(id) FROM %s", mm.sourceTable)
 
@@ -260,7 +260,7 @@ func (mm *MigrationManager) getIDRange(ctx context.Context) (int64, int64, error
 	return minID, maxID, err
 }
 
-// executeMigration は実際の移行を実行
+// executeMigration 実際の移行を実行
 func (mm *MigrationManager) executeMigration(ctx context.Context) error {
 	// チャンク一覧を取得
 	chunks, err := mm.loadChunkPlan(ctx)
@@ -325,7 +325,7 @@ func (mm *MigrationManager) executeMigration(ctx context.Context) error {
 	return nil
 }
 
-// processChunk は単一チャンクを処理
+// processChunk 単一チャンクを処理
 func (mm *MigrationManager) processChunk(ctx context.Context, chunk *ChunkInfo) error {
 	startTime := time.Now()
 
@@ -382,7 +382,7 @@ func (mm *MigrationManager) processChunk(ctx context.Context, chunk *ChunkInfo) 
 	return nil
 }
 
-// getChunkData はチャンクのデータを取得
+// getChunkData チャンクのデータを取得
 func (mm *MigrationManager) getChunkData(ctx context.Context, startID, endID int64) ([]map[string]interface{}, error) {
 	query := fmt.Sprintf(`
 		SELECT * FROM %s 
@@ -434,7 +434,7 @@ func (mm *MigrationManager) getChunkData(ctx context.Context, startID, endID int
 	return records, rows.Err()
 }
 
-// migrateChunkData はチャンクデータを移行
+// migrateChunkData チャンクデータを移行
 func (mm *MigrationManager) migrateChunkData(ctx context.Context, records []map[string]interface{}) error {
 	if len(records) == 0 {
 		return nil
@@ -477,7 +477,7 @@ func (mm *MigrationManager) migrateChunkData(ctx context.Context, records []map[
 	return tx.Commit()
 }
 
-// startResourceMonitoring はリソース監視を開始
+// startResourceMonitoring リソース監視を開始
 func (mm *MigrationManager) startResourceMonitoring(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
@@ -492,7 +492,7 @@ func (mm *MigrationManager) startResourceMonitoring(ctx context.Context) {
 	}
 }
 
-// updateResourceMetrics はリソースメトリクスを更新
+// updateResourceMetrics リソースメトリクスを更新
 func (mm *MigrationManager) updateResourceMetrics() {
 	// CPU使用率の取得（簡易実装）
 	var memStats runtime.MemStats
@@ -507,7 +507,7 @@ func (mm *MigrationManager) updateResourceMetrics() {
 	mm.resourceMonitor.connectionCount.Store(int64(stats.OpenConnections))
 }
 
-// shouldPauseForResources はリソース制限により一時停止すべきかを判定
+// shouldPauseForResources リソース制限により一時停止すべきかを判定
 func (mm *MigrationManager) shouldPauseForResources() bool {
 	memUsage := mm.resourceMonitor.memoryUsage.Load().(float64)
 	connCount := mm.resourceMonitor.connectionCount.Load()
@@ -516,7 +516,7 @@ func (mm *MigrationManager) shouldPauseForResources() bool {
 		connCount > int64(mm.resourceMonitor.thresholds.MaxConnections)
 }
 
-// waitForResourceRecovery はリソース回復を待機
+// waitForResourceRecovery リソース回復を待機
 func (mm *MigrationManager) waitForResourceRecovery(ctx context.Context) {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
@@ -535,7 +535,7 @@ func (mm *MigrationManager) waitForResourceRecovery(ctx context.Context) {
 	}
 }
 
-// startCheckpointManager はチェックポイント管理を開始
+// startCheckpointManager チェックポイント管理を開始
 func (mm *MigrationManager) startCheckpointManager(ctx context.Context) {
 	ticker := time.NewTicker(mm.checkpointManager.interval)
 	defer ticker.Stop()
@@ -554,7 +554,7 @@ func (mm *MigrationManager) startCheckpointManager(ctx context.Context) {
 	}
 }
 
-// startProgressMonitoring は進捗監視を開始
+// startProgressMonitoring 進捗監視を開始
 func (mm *MigrationManager) startProgressMonitoring(ctx context.Context) {
 	ticker := time.NewTicker(mm.progressInterval)
 	defer ticker.Stop()

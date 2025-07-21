@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-// TestNewServerConfig はServerConfig作成をテストします
+// TestNewServerConfig ServerConfig作成をテストします
 func TestNewServerConfig(t *testing.T) {
 	config := NewServerConfig()
 
@@ -28,7 +28,7 @@ func TestNewServerConfig(t *testing.T) {
 	}
 }
 
-// TestNewConcurrentHTTPServer はサーバー作成をテストします
+// TestNewConcurrentHTTPServer サーバー作成をテストします
 func TestNewConcurrentHTTPServer(t *testing.T) {
 	config := NewServerConfig()
 	config.MaxWorkers = 2
@@ -46,7 +46,7 @@ func TestNewConcurrentHTTPServer(t *testing.T) {
 	}
 }
 
-// TestServerStartAndShutdown はサーバーの開始と停止をテストします
+// TestServerStartAndShutdown サーバーの開始と停止をテストします
 func TestServerStartAndShutdown(t *testing.T) {
 	config := NewServerConfig()
 	config.MaxWorkers = 2
@@ -82,7 +82,7 @@ func TestServerStartAndShutdown(t *testing.T) {
 	}
 }
 
-// TestRequestProcessing はリクエスト処理をテストします
+// TestRequestProcessing リクエスト処理をテストします
 func TestRequestProcessing(t *testing.T) {
 	config := NewServerConfig()
 	config.MaxWorkers = 2
@@ -118,7 +118,7 @@ func TestRequestProcessing(t *testing.T) {
 	}
 }
 
-// TestHealthCheckHandler はヘルスチェックハンドラーをテストします
+// TestHealthCheckHandler ヘルスチェックハンドラーをテストします
 func TestHealthCheckHandler(t *testing.T) {
 	config := NewServerConfig()
 	server := NewConcurrentHTTPServer(config)
@@ -155,7 +155,7 @@ func TestHealthCheckHandler(t *testing.T) {
 	}
 }
 
-// TestEchoHandler はエコーハンドラーをテストします
+// TestEchoHandler エコーハンドラーをテストします
 func TestEchoHandler(t *testing.T) {
 	config := NewServerConfig()
 	server := NewConcurrentHTTPServer(config)
@@ -196,7 +196,7 @@ func TestEchoHandler(t *testing.T) {
 	}
 }
 
-// TestSlowHandler は遅延ハンドラーをテストします
+// TestSlowHandler 遅延ハンドラーをテストします
 func TestSlowHandler(t *testing.T) {
 	config := NewServerConfig()
 	server := NewConcurrentHTTPServer(config)
@@ -235,7 +235,7 @@ func TestSlowHandler(t *testing.T) {
 	}
 }
 
-// TestMiddleware はミドルウェアをテストします
+// TestMiddleware ミドルウェアをテストします
 func TestMiddleware(t *testing.T) {
 	config := NewServerConfig()
 	server := NewConcurrentHTTPServer(config)
@@ -280,7 +280,7 @@ func TestMiddleware(t *testing.T) {
 	}
 }
 
-// TestConcurrentRequests は並行リクエストをテストします
+// TestConcurrentRequests 並行リクエストをテストします
 func TestConcurrentRequests(t *testing.T) {
 	config := NewServerConfig()
 	config.MaxWorkers = 3
@@ -328,7 +328,7 @@ func TestConcurrentRequests(t *testing.T) {
 	}
 }
 
-// TestWorkerStats はワーカー統計をテストします
+// TestWorkerStats ワーカー統計をテストします
 func TestWorkerStats(t *testing.T) {
 	config := NewServerConfig()
 	config.MaxWorkers = 2
@@ -379,7 +379,7 @@ func TestWorkerStats(t *testing.T) {
 	}
 }
 
-// TestGetStats は統計取得をテストします
+// TestGetStats 統計取得をテストします
 func TestGetStats(t *testing.T) {
 	config := NewServerConfig()
 	server := NewConcurrentHTTPServer(config)
@@ -400,7 +400,7 @@ func TestGetStats(t *testing.T) {
 	}
 }
 
-// TestDefaultHandler はデフォルトハンドラーをテストします
+// TestDefaultHandler デフォルトハンドラーをテストします
 func TestDefaultHandler(t *testing.T) {
 	config := NewServerConfig()
 	server := NewConcurrentHTTPServer(config)
@@ -440,7 +440,7 @@ func TestDefaultHandler(t *testing.T) {
 	}
 }
 
-// TestRequestQueueFull はリクエストキューが満杯の場合をテストします
+// TestRequestQueueFull リクエストキューが満杯の場合をテストします
 func TestRequestQueueFull(t *testing.T) {
 	config := NewServerConfig()
 	config.MaxWorkers = 1

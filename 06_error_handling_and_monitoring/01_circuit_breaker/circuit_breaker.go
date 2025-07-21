@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-// State はサーキットブレーカーの状態を表します
+// State サーキットブレーカーの状態を表します
 type State int
 
 const (
@@ -32,7 +32,7 @@ func (s State) String() string {
 	}
 }
 
-// Counts はサーキットブレーカーの統計情報です
+// Counts サーキットブレーカーの統計情報です
 type Counts struct {
 	Requests             uint64
 	TotalSuccesses       uint64
@@ -42,7 +42,7 @@ type Counts struct {
 	TotalDuration        time.Duration
 }
 
-// Settings はサーキットブレーカーの設定です
+// Settings サーキットブレーカーの設定です
 type Settings struct {
 	Name                string
 	MaxRequests         uint32
@@ -57,7 +57,7 @@ type Settings struct {
 	MinRequestThreshold uint32
 }
 
-// CircuitBreaker は高可用性サーキットブレーカーです
+// CircuitBreaker 高可用性サーキットブレーカーです
 type CircuitBreaker struct {
 	name                string
 	maxRequests         uint32
@@ -84,7 +84,7 @@ var (
 	ErrOpenTimeout        = errors.New("circuit breaker open timeout")
 )
 
-// NewCircuitBreaker は新しいサーキットブレーカーを作成します
+// NewCircuitBreaker 新しいサーキットブレーカーを作成します
 func NewCircuitBreaker(st Settings) *CircuitBreaker {
 	cb := &CircuitBreaker{
 		name:                st.Name,
@@ -138,18 +138,18 @@ func NewCircuitBreaker(st Settings) *CircuitBreaker {
 	return cb
 }
 
-// defaultReadyToTrip はデフォルトのTrip判定ロジックです
+// defaultReadyToTrip デフォルトのTrip判定ロジックです
 func (cb *CircuitBreaker) defaultReadyToTrip(counts Counts) bool {
 	return counts.Requests >= uint64(cb.minRequestThreshold) &&
 		float64(counts.TotalFailures)/float64(counts.Requests) >= cb.failureThreshold
 }
 
-// Name はサーキットブレーカーの名前を返します
+// Name サーキットブレーカーの名前を返します
 func (cb *CircuitBreaker) Name() string {
 	return cb.name
 }
 
-// State は現在の状態を返します
+// State 現在の状態を返します
 func (cb *CircuitBreaker) State() State {
 	cb.mutex.Lock()
 	defer cb.mutex.Unlock()
@@ -159,7 +159,7 @@ func (cb *CircuitBreaker) State() State {
 	return state
 }
 
-// Counts は現在の統計情報を返します
+// Counts 現在の統計情報を返します
 func (cb *CircuitBreaker) Counts() Counts {
 	cb.mutex.Lock()
 	defer cb.mutex.Unlock()
@@ -167,7 +167,7 @@ func (cb *CircuitBreaker) Counts() Counts {
 	return cb.counts
 }
 
-// Execute はサーキットブレーカーを通してリクエストを実行します
+// Execute サーキットブレーカーを通してリクエストを実行します
 func (cb *CircuitBreaker) Execute(req func() (interface{}, error)) (interface{}, error) {
 	generation, err := cb.beforeRequest()
 	if err != nil {
@@ -199,7 +199,7 @@ func (cb *CircuitBreaker) Execute(req func() (interface{}, error)) (interface{},
 	return result, err
 }
 
-// ExecuteWithTimeout はタイムアウト付きでリクエストを実行します
+// ExecuteWithTimeout タイムアウト付きでリクエストを実行します
 func (cb *CircuitBreaker) ExecuteWithTimeout(ctx context.Context, timeout time.Duration, req func() (interface{}, error)) (interface{}, error) {
 	generation, err := cb.beforeRequest()
 	if err != nil {
@@ -255,7 +255,7 @@ func (cb *CircuitBreaker) ExecuteWithTimeout(ctx context.Context, timeout time.D
 	}
 }
 
-// beforeRequest はリクエスト実行前の処理を行います
+// beforeRequest リクエスト実行前の処理を行います
 func (cb *CircuitBreaker) beforeRequest() (uint64, error) {
 	cb.mutex.Lock()
 	defer cb.mutex.Unlock()
@@ -273,7 +273,7 @@ func (cb *CircuitBreaker) beforeRequest() (uint64, error) {
 	return generation, nil
 }
 
-// afterRequest はリクエスト実行後の処理を行います
+// afterRequest リクエスト実行後の処理を行います
 func (cb *CircuitBreaker) afterRequest(before uint64, success bool, duration time.Duration) {
 	cb.mutex.Lock()
 	defer cb.mutex.Unlock()
@@ -294,7 +294,7 @@ func (cb *CircuitBreaker) afterRequest(before uint64, success bool, duration tim
 	cb.counts.TotalDuration += duration
 }
 
-// onSuccess は成功時の処理を行います
+// onSuccess 成功時の処理を行います
 func (cb *CircuitBreaker) onSuccess(state State, now time.Time) {
 	cb.counts.TotalSuccesses++
 	cb.counts.ConsecutiveSuccesses++
@@ -305,7 +305,7 @@ func (cb *CircuitBreaker) onSuccess(state State, now time.Time) {
 	}
 }
 
-// onFailure は失敗時の処理を行います
+// onFailure 失敗時の処理を行います
 func (cb *CircuitBreaker) onFailure(state State, now time.Time) {
 	cb.counts.TotalFailures++
 	cb.counts.ConsecutiveFailures++
@@ -321,7 +321,7 @@ func (cb *CircuitBreaker) onFailure(state State, now time.Time) {
 	}
 }
 
-// currentState は現在の状態を返します
+// currentState 現在の状態を返します
 func (cb *CircuitBreaker) currentState(now time.Time) (State, uint64) {
 	switch cb.state {
 	case StateClosed:
@@ -336,7 +336,7 @@ func (cb *CircuitBreaker) currentState(now time.Time) (State, uint64) {
 	return cb.state, cb.generation
 }
 
-// setState は状態を変更します
+// setState 状態を変更します
 func (cb *CircuitBreaker) setState(state State, now time.Time) {
 	if cb.state == state {
 		return
@@ -352,7 +352,7 @@ func (cb *CircuitBreaker) setState(state State, now time.Time) {
 	}
 }
 
-// toNewGeneration は新しい世代に移行します
+// toNewGeneration 新しい世代に移行します
 func (cb *CircuitBreaker) toNewGeneration(now time.Time) {
 	cb.generation++
 	cb.counts = Counts{}
@@ -372,7 +372,7 @@ func (cb *CircuitBreaker) toNewGeneration(now time.Time) {
 	}
 }
 
-// Reset はサーキットブレーカーをリセットします
+// Reset サーキットブレーカーをリセットします
 func (cb *CircuitBreaker) Reset() {
 	cb.mutex.Lock()
 	defer cb.mutex.Unlock()
@@ -381,13 +381,13 @@ func (cb *CircuitBreaker) Reset() {
 	cb.state = StateClosed
 }
 
-// HTTPClientWrapper はHTTPクライアント用のラッパーです
+// HTTPClientWrapper HTTPクライアント用のラッパーです
 type HTTPClientWrapper struct {
 	client         *http.Client
 	circuitBreaker *CircuitBreaker
 }
 
-// NewHTTPClientWrapper は新しいHTTPクライアントラッパーを作成します
+// NewHTTPClientWrapper 新しいHTTPクライアントラッパーを作成します
 func NewHTTPClientWrapper(client *http.Client, cb *CircuitBreaker) *HTTPClientWrapper {
 	if client == nil {
 		client = &http.Client{Timeout: 30 * time.Second}
@@ -398,7 +398,7 @@ func NewHTTPClientWrapper(client *http.Client, cb *CircuitBreaker) *HTTPClientWr
 	}
 }
 
-// Get はサーキットブレーカー付きのGETリクエストを実行します
+// Get サーキットブレーカー付きのGETリクエストを実行します
 func (w *HTTPClientWrapper) Get(url string) (*http.Response, error) {
 	result, err := w.circuitBreaker.Execute(func() (interface{}, error) {
 		return w.client.Get(url)
@@ -411,7 +411,7 @@ func (w *HTTPClientWrapper) Get(url string) (*http.Response, error) {
 	return result.(*http.Response), nil
 }
 
-// Post はサーキットブレーカー付きのPOSTリクエストを実行します
+// Post サーキットブレーカー付きのPOSTリクエストを実行します
 func (w *HTTPClientWrapper) Post(url, contentType string, body interface{}) (*http.Response, error) {
 	result, err := w.circuitBreaker.Execute(func() (interface{}, error) {
 		// bodyをio.Readerに変換する処理は簡略化

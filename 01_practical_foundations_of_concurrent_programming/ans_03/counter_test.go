@@ -9,57 +9,57 @@ import (
 	"time"
 )
 
-// SafeCounter は安全なカウンターです
+// SafeCounter 安全なカウンターです
 type SafeCounter struct {
 	mu    sync.Mutex
 	value int64
 }
 
-// Increment はカウンターを安全にインクリメントします
+// Increment カウンターを安全にインクリメントします
 func (sc *SafeCounter) Increment() {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 	sc.value++
 }
 
-// Value は現在の値を取得します
+// Value 現在の値を取得します
 func (sc *SafeCounter) Value() int64 {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 	return sc.value
 }
 
-// AtomicCounter は原子操作を使用するカウンターです
+// AtomicCounter 原子操作を使用するカウンターです
 type AtomicCounter struct {
 	value int64
 }
 
-// Increment はカウンターを原子的にインクリメントします
+// Increment カウンターを原子的にインクリメントします
 func (ac *AtomicCounter) Increment() {
 	atomic.AddInt64(&ac.value, 1)
 }
 
-// Value は現在の値を取得します
+// Value 現在の値を取得します
 func (ac *AtomicCounter) Value() int64 {
 	return atomic.LoadInt64(&ac.value)
 }
 
-// UnsafeCounter は安全でないカウンターです（比較用）
+// UnsafeCounter 安全でないカウンターです（比較用）
 type UnsafeCounter struct {
 	value int64
 }
 
-// Increment はカウンターを安全でないインクリメントします
+// Increment カウンターを安全でないインクリメントします
 func (uc *UnsafeCounter) Increment() {
 	uc.value++ // レースコンディションが発生する可能性
 }
 
-// Value は現在の値を取得します
+// Value 現在の値を取得します
 func (uc *UnsafeCounter) Value() int64 {
 	return uc.value
 }
 
-// TestSafeCounter_WithSynctest はMutexを使った安全なカウンターをテストします
+// TestSafeCounter_WithSynctest Mutexを使った安全なカウンターをテストします
 func TestSafeCounter_WithSynctest(t *testing.T) {
 	synctest.Run(func() {
 		counter := &SafeCounter{}
@@ -106,7 +106,7 @@ func TestSafeCounter_WithSynctest(t *testing.T) {
 	})
 }
 
-// TestAtomicCounter_WithSynctest は原子操作を使ったカウンターをテストします
+// TestAtomicCounter_WithSynctest 原子操作を使ったカウンターをテストします
 func TestAtomicCounter_WithSynctest(t *testing.T) {
 	synctest.Run(func() {
 		counter := &AtomicCounter{}
@@ -145,7 +145,7 @@ func TestAtomicCounter_WithSynctest(t *testing.T) {
 	})
 }
 
-// TestUnsafeCounter_DetectRaceCondition は安全でないカウンターでレースコンディションを検出します
+// TestUnsafeCounter_DetectRaceCondition 安全でないカウンターでレースコンディションを検出します
 func TestUnsafeCounter_DetectRaceCondition(t *testing.T) {
 	// このテストは通常の環境では間欠的に失敗する可能性があります
 	// synctestでは決定的な結果が得られます
@@ -191,7 +191,7 @@ func TestUnsafeCounter_DetectRaceCondition(t *testing.T) {
 	})
 }
 
-// TestConcurrentCounterOperations は複数の操作を同時に実行するテストです
+// TestConcurrentCounterOperations 複数の操作を同時に実行するテストです
 func TestConcurrentCounterOperations(t *testing.T) {
 	synctest.Run(func() {
 		safeCounter := &SafeCounter{}

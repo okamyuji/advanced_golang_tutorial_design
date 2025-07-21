@@ -14,7 +14,7 @@ import (
 	_ "github.com/lib/pq"
 )
 
-// DBConfig はデータベース設定を管理します
+// DBConfig データベース設定を管理します
 type DBConfig struct {
 	DSN             string
 	MaxOpenConns    int
@@ -24,14 +24,14 @@ type DBConfig struct {
 	PingInterval    time.Duration
 }
 
-// Database はコネクションプール付きデータベースラッパーです
+// Database コネクションプール付きデータベースラッパーです
 type Database struct {
 	db     *sql.DB
 	config *DBConfig
 	stats  *DatabaseStats
 }
 
-// DatabaseStats はデータベース統計情報を管理します
+// DatabaseStats データベース統計情報を管理します
 type DatabaseStats struct {
 	mu               sync.RWMutex
 	queryCount       int64
@@ -42,7 +42,7 @@ type DatabaseStats struct {
 	avgResponseTime  time.Duration
 }
 
-// NewDatabase は新しいデータベースインスタンスを作成します
+// NewDatabase 新しいデータベースインスタンスを作成します
 func NewDatabase(config *DBConfig) (*Database, error) {
 	db, err := sql.Open("postgres", config.DSN)
 	if err != nil {
@@ -72,7 +72,7 @@ func NewDatabase(config *DBConfig) (*Database, error) {
 	return database, nil
 }
 
-// NewDatabaseSQLite はSQLite用のデータベースインスタンスを作成（テスト用）
+// NewDatabaseSQLite SQLite用のデータベースインスタンスを作成（テスト用）
 func NewDatabaseSQLite(config *DBConfig) (*Database, error) {
 	// SQLiteの場合は "sqlite3" ドライバーを使用
 	db, err := sql.Open("sqlite3", config.DSN)
@@ -103,7 +103,7 @@ func NewDatabaseSQLite(config *DBConfig) (*Database, error) {
 	return database, nil
 }
 
-// ping はデータベース接続をテストします
+// ping データベース接続をテストします
 func (d *Database) ping() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -124,7 +124,7 @@ func (d *Database) ping() error {
 	return err
 }
 
-// updateResponseTime は平均応答時間を更新します
+// updateResponseTime 平均応答時間を更新します
 func (d *Database) updateResponseTime(elapsed time.Duration) {
 	queryCount := atomic.LoadInt64(&d.stats.queryCount)
 	if queryCount == 0 {
@@ -137,7 +137,7 @@ func (d *Database) updateResponseTime(elapsed time.Duration) {
 	}
 }
 
-// MonitorConnectionPool は接続プールを監視します
+// MonitorConnectionPool 接続プールを監視します
 func (d *Database) MonitorConnectionPool(ctx context.Context) {
 	ticker := time.NewTicker(d.config.PingInterval)
 	defer ticker.Stop()
@@ -155,14 +155,14 @@ func (d *Database) MonitorConnectionPool(ctx context.Context) {
 	}
 }
 
-// healthCheck はヘルスチェックを実行します
+// healthCheck ヘルスチェックを実行します
 func (d *Database) healthCheck() {
 	if err := d.ping(); err != nil {
 		log.Printf("Database health check failed: %v", err)
 	}
 }
 
-// logPoolStats は接続プールの統計をログ出力します
+// logPoolStats 接続プールの統計をログ出力します
 func (d *Database) logPoolStats() {
 	stats := d.db.Stats()
 	dbStats := d.GetStats()
@@ -177,7 +177,7 @@ func (d *Database) logPoolStats() {
 		dbStats.QueryCount, dbStats.ErrorCount, dbStats.AvgResponseTime, dbStats.ConnectionErrors)
 }
 
-// adjustPoolIfNeeded は必要に応じて接続プールを調整します
+// adjustPoolIfNeeded 必要に応じて接続プールを調整します
 func (d *Database) adjustPoolIfNeeded() {
 	stats := d.db.Stats()
 
@@ -194,7 +194,7 @@ func (d *Database) adjustPoolIfNeeded() {
 	}
 }
 
-// Query はクエリを実行し統計を記録します
+// Query クエリを実行し統計を記録します
 func (d *Database) Query(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error) {
 	start := time.Now()
 	rows, err := d.db.QueryContext(ctx, query, args...)
@@ -214,7 +214,7 @@ func (d *Database) Query(ctx context.Context, query string, args ...interface{})
 	return rows, err
 }
 
-// QueryRow は単一行クエリを実行します
+// QueryRow 単一行クエリを実行します
 func (d *Database) QueryRow(ctx context.Context, query string, args ...interface{}) *sql.Row {
 	start := time.Now()
 	row := d.db.QueryRowContext(ctx, query, args...)
@@ -231,7 +231,7 @@ func (d *Database) QueryRow(ctx context.Context, query string, args ...interface
 	return row
 }
 
-// Exec はクエリを実行します
+// Exec クエリを実行します
 func (d *Database) Exec(ctx context.Context, query string, args ...interface{}) (sql.Result, error) {
 	start := time.Now()
 	result, err := d.db.ExecContext(ctx, query, args...)
@@ -251,12 +251,12 @@ func (d *Database) Exec(ctx context.Context, query string, args ...interface{}) 
 	return result, err
 }
 
-// BeginTx はトランザクションを開始します
+// BeginTx トランザクションを開始します
 func (d *Database) BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error) {
 	return d.db.BeginTx(ctx, opts)
 }
 
-// GetStats は統計情報を取得します
+// GetStats 統計情報を取得します
 func (d *Database) GetStats() DatabaseStatsSnapshot {
 	d.stats.mu.RLock()
 	defer d.stats.mu.RUnlock()
@@ -271,7 +271,7 @@ func (d *Database) GetStats() DatabaseStatsSnapshot {
 	}
 }
 
-// DatabaseStatsSnapshot は統計情報のスナップショットです
+// DatabaseStatsSnapshot 統計情報のスナップショットです
 type DatabaseStatsSnapshot struct {
 	QueryCount       int64
 	ErrorCount       int64
@@ -281,7 +281,7 @@ type DatabaseStatsSnapshot struct {
 	AvgResponseTime  time.Duration
 }
 
-// Close はデータベース接続を閉じます
+// Close データベース接続を閉じます
 func (d *Database) Close() error {
 	return d.db.Close()
 }
@@ -330,7 +330,7 @@ func main() {
 	fmt.Printf("  Connection Errors: %d\n", finalStats.ConnectionErrors)
 }
 
-// testConnectionPool はコネクションプールのテストを実行します
+// testConnectionPool コネクションプールのテストを実行します
 func testConnectionPool(db *Database) {
 	ctx := context.Background()
 

@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-// MassiveConnectionServer は10万並行接続対応サーバー（Server-Sent Events使用）
+// MassiveConnectionServer 0万並行接続対応サーバー（Server-Sent Events使用）
 type MassiveConnectionServer struct {
 	clients       sync.Map // map[string]*SSEClient - goroutine safe
 	channels      sync.Map // map[string]*Channel - goroutine safe
@@ -24,7 +24,7 @@ type MassiveConnectionServer struct {
 	messageRouter *MessageRouter
 }
 
-// ServerConfig はサーバー設定
+// ServerConfig サーバー設定
 type ServerConfig struct {
 	MaxConnections        int           // 最大100,000接続
 	KeepAliveTimeout      time.Duration // 30秒
@@ -38,7 +38,7 @@ type ServerConfig struct {
 	HeartbeatInterval     time.Duration // 30秒
 }
 
-// SSEClient はServer-Sent Events接続クライアント
+// SSEClient Server-Sent Events接続クライアント
 type SSEClient struct {
 	ID        string
 	writer    http.ResponseWriter
@@ -52,7 +52,7 @@ type SSEClient struct {
 	mu        sync.Mutex
 }
 
-// Channel はチャンネル管理
+// Channel チャンネル管理
 type Channel struct {
 	ID           string
 	clients      sync.Map // map[string]*SSEClient - goroutine safe
@@ -61,7 +61,7 @@ type Channel struct {
 	lastActivity int64 // atomic access - Unix timestamp
 }
 
-// ConnectionHub は接続管理の中央ハブ
+// ConnectionHub 接続管理の中央ハブ
 type ConnectionHub struct {
 	register      chan *SSEClient
 	unregister    chan *SSEClient
@@ -69,14 +69,14 @@ type ConnectionHub struct {
 	activeClients int64 // atomic access
 }
 
-// BroadcastMessage はブロードキャスト用メッセージ
+// BroadcastMessage ブロードキャスト用メッセージ
 type BroadcastMessage struct {
 	ChannelID     string
 	Message       []byte
 	ExcludeClient string
 }
 
-// ServerMetrics はサーバーメトリクス
+// ServerMetrics サーバーメトリクス
 type ServerMetrics struct {
 	totalConnections  int64 // atomic access
 	activeConnections int64 // atomic access
@@ -88,13 +88,13 @@ type ServerMetrics struct {
 	startTime         time.Time
 }
 
-// MessageRouter はメッセージルーティング
+// MessageRouter メッセージルーティング
 type MessageRouter struct {
 	routes map[string]func(*SSEClient, map[string]interface{})
 	mu     sync.RWMutex
 }
 
-// NewMassiveConnectionServer は新しい大規模接続サーバーを作成
+// NewMassiveConnectionServer 新しい大規模接続サーバーを作成
 func NewMassiveConnectionServer(config *ServerConfig) *MassiveConnectionServer {
 	hub := &ConnectionHub{
 		register:   make(chan *SSEClient, 1000),
@@ -120,7 +120,7 @@ func NewMassiveConnectionServer(config *ServerConfig) *MassiveConnectionServer {
 	return server
 }
 
-// setupMessageRoutes はメッセージルートを設定
+// setupMessageRoutes メッセージルートを設定
 func (mcs *MassiveConnectionServer) setupMessageRoutes() {
 	mcs.messageRouter.routes["join_channel"] = mcs.handleJoinChannel
 	mcs.messageRouter.routes["leave_channel"] = mcs.handleLeaveChannel
@@ -129,7 +129,7 @@ func (mcs *MassiveConnectionServer) setupMessageRoutes() {
 	mcs.messageRouter.routes["ping"] = mcs.handlePing
 }
 
-// Start はサーバーを開始
+// Start サーバーを開始
 func (mcs *MassiveConnectionServer) Start(addr string) error {
 	log.Printf("Starting massive connection server on %s", addr)
 	log.Printf("Max connections: %d", mcs.config.MaxConnections)
@@ -174,7 +174,7 @@ func (mcs *MassiveConnectionServer) Start(addr string) error {
 	return server.ListenAndServe()
 }
 
-// handleSSEConnection はServer-Sent Events接続をハンドル
+// handleSSEConnection Server-Sent Events接続をハンドル
 func (mcs *MassiveConnectionServer) handleSSEConnection(w http.ResponseWriter, r *http.Request) {
 	// 接続数制限チェック
 	currentConnections := atomic.LoadInt64(&mcs.metrics.activeConnections)
@@ -227,7 +227,7 @@ func (mcs *MassiveConnectionServer) handleSSEConnection(w http.ResponseWriter, r
 	mcs.hub.unregister <- client
 }
 
-// createSSEClient は新しいSSEクライアントを作成
+// createSSEClient 新しいSSEクライアントを作成
 func (mcs *MassiveConnectionServer) createSSEClient(id string, w http.ResponseWriter, flusher http.Flusher, ctx context.Context) *SSEClient {
 	clientCtx, cancel := context.WithCancel(ctx)
 
@@ -248,7 +248,7 @@ func (mcs *MassiveConnectionServer) createSSEClient(id string, w http.ResponseWr
 	return client
 }
 
-// sendLoop はメッセージ送信ループ
+// sendLoop メッセージ送信ループ
 func (client *SSEClient) sendLoop() {
 	for {
 		select {
@@ -266,7 +266,7 @@ func (client *SSEClient) sendLoop() {
 	}
 }
 
-// writeSSE はSSEメッセージを送信
+// writeSSE SSEメッセージを送信
 func (client *SSEClient) writeSSE(data []byte) error {
 	client.mu.Lock()
 	defer client.mu.Unlock()
@@ -282,7 +282,7 @@ func (client *SSEClient) writeSSE(data []byte) error {
 	return nil
 }
 
-// sendJSON はJSONメッセージを送信
+// sendJSON JSONメッセージを送信
 func (client *SSEClient) sendJSON(data interface{}) error {
 	jsonData, err := json.Marshal(data)
 	if err != nil {
@@ -297,7 +297,7 @@ func (client *SSEClient) sendJSON(data interface{}) error {
 	}
 }
 
-// heartbeat はハートビートを送信
+// heartbeat ハートビートを送信
 func (client *SSEClient) heartbeat(interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -320,7 +320,7 @@ func (client *SSEClient) heartbeat(interval time.Duration) {
 	}
 }
 
-// run は接続ハブのメインループ
+// run 接続ハブのメインループ
 func (ch *ConnectionHub) run(server *MassiveConnectionServer) {
 	resourceTicker := time.NewTicker(server.config.ResourceCheckInterval)
 	defer resourceTicker.Stop()
@@ -345,7 +345,7 @@ func (ch *ConnectionHub) run(server *MassiveConnectionServer) {
 	}
 }
 
-// registerClient はクライアントを登録
+// registerClient クライアントを登録
 func (ch *ConnectionHub) registerClient(client *SSEClient, server *MassiveConnectionServer) {
 	server.clients.Store(client.ID, client)
 
@@ -362,7 +362,7 @@ func (ch *ConnectionHub) registerClient(client *SSEClient, server *MassiveConnec
 	}
 }
 
-// unregisterClient はクライアントを登録解除
+// unregisterClient クライアントを登録解除
 func (ch *ConnectionHub) unregisterClient(client *SSEClient, server *MassiveConnectionServer) {
 	if _, loaded := server.clients.LoadAndDelete(client.ID); loaded {
 		close(client.send)
@@ -382,7 +382,7 @@ func (ch *ConnectionHub) unregisterClient(client *SSEClient, server *MassiveConn
 	}
 }
 
-// handleBroadcast はブロードキャストを処理
+// handleBroadcast ブロードキャストを処理
 func (ch *ConnectionHub) handleBroadcast(broadcast *BroadcastMessage, server *MassiveConnectionServer) {
 	atomic.AddInt64(&server.metrics.broadcastMessages, 1)
 
@@ -444,7 +444,7 @@ func (ch *ConnectionHub) handleBroadcast(broadcast *BroadcastMessage, server *Ma
 	wg.Wait()
 }
 
-// handleSendMessage はメッセージ送信をハンドル
+// handleSendMessage メッセージ送信をハンドル
 func (mcs *MassiveConnectionServer) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Only POST method allowed", http.StatusMethodNotAllowed)
@@ -489,7 +489,7 @@ func (mcs *MassiveConnectionServer) handleSendMessage(w http.ResponseWriter, r *
 	}
 }
 
-// handleJoinChannel はチャンネル参加を処理
+// handleJoinChannel チャンネル参加を処理
 func (mcs *MassiveConnectionServer) handleJoinChannel(client *SSEClient, message map[string]interface{}) {
 	channelID, ok := message["channel"].(string)
 	if !ok || channelID == "" {
@@ -519,7 +519,7 @@ func (mcs *MassiveConnectionServer) handleJoinChannel(client *SSEClient, message
 	log.Printf("Client %s joined channel %s", client.ID, channelID)
 }
 
-// handleLeaveChannel はチャンネル退出を処理
+// handleLeaveChannel チャンネル退出を処理
 func (mcs *MassiveConnectionServer) handleLeaveChannel(client *SSEClient, message map[string]interface{}) {
 	channelID, ok := message["channel"].(string)
 	if !ok || channelID == "" {
@@ -536,7 +536,7 @@ func (mcs *MassiveConnectionServer) handleLeaveChannel(client *SSEClient, messag
 	log.Printf("Client %s left channel %s", client.ID, channelID)
 }
 
-// handleBroadcast はブロードキャストメッセージを処理
+// handleBroadcast ブロードキャストメッセージを処理
 func (mcs *MassiveConnectionServer) handleBroadcast(client *SSEClient, message map[string]interface{}) {
 	channelID, _ := message["channel"].(string)
 	content, _ := message["content"].(string)
@@ -567,7 +567,7 @@ func (mcs *MassiveConnectionServer) handleBroadcast(client *SSEClient, message m
 	}
 }
 
-// handleDirectMessage はダイレクトメッセージを処理
+// handleDirectMessage ダイレクトメッセージを処理
 func (mcs *MassiveConnectionServer) handleDirectMessage(client *SSEClient, message map[string]interface{}) {
 	targetID, ok := message["target"].(string)
 	if !ok {
@@ -592,7 +592,7 @@ func (mcs *MassiveConnectionServer) handleDirectMessage(client *SSEClient, messa
 	}
 }
 
-// handlePing はPingメッセージを処理
+// handlePing Pingメッセージを処理
 func (mcs *MassiveConnectionServer) handlePing(client *SSEClient, message map[string]interface{}) {
 	pongMsg := map[string]interface{}{
 		"type":      "pong",
@@ -604,7 +604,7 @@ func (mcs *MassiveConnectionServer) handlePing(client *SSEClient, message map[st
 	}
 }
 
-// startResourceMonitoring はリソース監視を開始
+// startResourceMonitoring リソース監視を開始
 func (mcs *MassiveConnectionServer) startResourceMonitoring() {
 	ticker := time.NewTicker(mcs.config.ResourceCheckInterval)
 	defer ticker.Stop()
@@ -619,7 +619,7 @@ func (mcs *MassiveConnectionServer) startResourceMonitoring() {
 	}
 }
 
-// monitorResources はリソース使用量を監視
+// monitorResources リソース使用量を監視
 func (mcs *MassiveConnectionServer) monitorResources() {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
@@ -648,7 +648,7 @@ func (mcs *MassiveConnectionServer) monitorResources() {
 	}
 }
 
-// checkResourceLimits はリソース制限をチェック
+// checkResourceLimits リソース制限をチェック
 func (mcs *MassiveConnectionServer) checkResourceLimits() {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
@@ -661,7 +661,7 @@ func (mcs *MassiveConnectionServer) checkResourceLimits() {
 	}
 }
 
-// startMetricsCollection はメトリクス収集を開始
+// startMetricsCollection メトリクス収集を開始
 func (mcs *MassiveConnectionServer) startMetricsCollection() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -676,7 +676,7 @@ func (mcs *MassiveConnectionServer) startMetricsCollection() {
 	}
 }
 
-// logMetrics はメトリクスをログ出力
+// logMetrics メトリクスをログ出力
 func (mcs *MassiveConnectionServer) logMetrics() {
 	activeConnections := atomic.LoadInt64(&mcs.metrics.activeConnections)
 	totalMessages := atomic.LoadInt64(&mcs.metrics.totalMessages)
@@ -695,7 +695,7 @@ func (mcs *MassiveConnectionServer) logMetrics() {
 	}
 }
 
-// startCleanupWorker はクリーンアップワーカーを開始
+// startCleanupWorker クリーンアップワーカーを開始
 func (mcs *MassiveConnectionServer) startCleanupWorker() {
 	ticker := time.NewTicker(mcs.config.CleanupInterval)
 	defer ticker.Stop()
@@ -710,7 +710,7 @@ func (mcs *MassiveConnectionServer) startCleanupWorker() {
 	}
 }
 
-// performCleanup はクリーンアップを実行
+// performCleanup クリーンアップを実行
 func (mcs *MassiveConnectionServer) performCleanup() {
 	now := time.Now().Unix()
 	cutoff := now - 300 // 5分前
@@ -737,7 +737,7 @@ func (mcs *MassiveConnectionServer) performCleanup() {
 	runtime.GC()
 }
 
-// handleMetrics はメトリクス情報を返すHTTPハンドラー
+// handleMetrics メトリクス情報を返すHTTPハンドラー
 func (mcs *MassiveConnectionServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
@@ -764,7 +764,7 @@ func (mcs *MassiveConnectionServer) handleMetrics(w http.ResponseWriter, r *http
 	}
 }
 
-// handleHealth はヘルスチェック用HTTPハンドラー
+// handleHealth ヘルスチェック用HTTPハンドラー
 func (mcs *MassiveConnectionServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
@@ -800,7 +800,7 @@ func (mcs *MassiveConnectionServer) handleHealth(w http.ResponseWriter, r *http.
 	}
 }
 
-// handleConnections は接続統計を返すHTTPハンドラー
+// handleConnections 接続統計を返すHTTPハンドラー
 func (mcs *MassiveConnectionServer) handleConnections(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
@@ -837,7 +837,7 @@ func (mcs *MassiveConnectionServer) handleConnections(w http.ResponseWriter, r *
 	}
 }
 
-// handleIndex はテスト用HTMLページを提供
+// handleIndex テスト用HTMLページを提供
 func (mcs *MassiveConnectionServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 	html := `
 <!DOCTYPE html>

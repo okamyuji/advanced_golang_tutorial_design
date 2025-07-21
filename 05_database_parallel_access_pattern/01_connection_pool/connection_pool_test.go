@@ -12,7 +12,7 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 )
 
-// setupTestDB はテスト用のPostgreSQLコンテナを起動し、初期化されたDatabaseを返す
+// setupTestDB テスト用のPostgreSQLコンテナを起動し、初期化されたDatabaseを返す
 func setupTestDB(t *testing.T) (*Database, func()) {
 	ctx := context.Background()
 

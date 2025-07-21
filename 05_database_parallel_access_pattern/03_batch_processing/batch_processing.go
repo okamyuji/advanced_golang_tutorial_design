@@ -14,7 +14,7 @@ import (
 	"github.com/lib/pq"
 )
 
-// BatchConfig はバッチ処理設定です
+// BatchConfig バッチ処理設定です
 type BatchConfig struct {
 	ChunkSize        int
 	Concurrency      int
@@ -24,7 +24,7 @@ type BatchConfig struct {
 	ProgressInterval time.Duration
 }
 
-// BatchProgress はバッチ処理の進捗情報です
+// BatchProgress バッチ処理の進捗情報です
 type BatchProgress struct {
 	mu                sync.RWMutex
 	TotalRecords      int64
@@ -37,7 +37,7 @@ type BatchProgress struct {
 	CurrentThroughput float64
 }
 
-// BatchProcessor はバッチ処理エンジンです
+// BatchProcessor バッチ処理エンジンです
 type BatchProcessor struct {
 	db       *sql.DB
 	config   *BatchConfig
@@ -45,7 +45,7 @@ type BatchProcessor struct {
 	stats    *BatchStats
 }
 
-// BatchStats はバッチ処理統計です
+// BatchStats バッチ処理統計です
 type BatchStats struct {
 	mu               sync.RWMutex
 	totalBatches     int64
@@ -57,13 +57,13 @@ type BatchStats struct {
 	minBatchTime     time.Duration
 }
 
-// Record はバッチ処理対象のレコードです
+// Record バッチ処理対象のレコードです
 type Record interface {
 	GetID() int64
 	Validate() error
 }
 
-// ProductRecord は商品レコードです
+// ProductRecord 商品レコードです
 type ProductRecord struct {
 	ID         int64
 	Name       string
@@ -88,7 +88,7 @@ func (p *ProductRecord) Validate() error {
 	return nil
 }
 
-// NewBatchProcessor は新しいバッチプロセッサーを作成します
+// NewBatchProcessor 新しいバッチプロセッサーを作成します
 func NewBatchProcessor(db *sql.DB, config *BatchConfig) *BatchProcessor {
 	return &BatchProcessor{
 		db:     db,
@@ -102,7 +102,7 @@ func NewBatchProcessor(db *sql.DB, config *BatchConfig) *BatchProcessor {
 	}
 }
 
-// ProcessBatch はバッチ処理を実行します
+// ProcessBatch バッチ処理を実行します
 func (bp *BatchProcessor) ProcessBatch(ctx context.Context, records []Record,
 	processFn func(context.Context, *sql.Tx, []Record) error) error {
 
@@ -168,7 +168,7 @@ func (bp *BatchProcessor) ProcessBatch(ctx context.Context, records []Record,
 	return nil
 }
 
-// createChunks はレコードをチャンクに分割します
+// createChunks レコードをチャンクに分割します
 func (bp *BatchProcessor) createChunks(records []Record) [][]Record {
 	chunks := make([][]Record, 0)
 	chunkSize := bp.config.ChunkSize
@@ -184,7 +184,7 @@ func (bp *BatchProcessor) createChunks(records []Record) [][]Record {
 	return chunks
 }
 
-// processChunk は単一チャンクを処理します
+// processChunk 単一チャンクを処理します
 func (bp *BatchProcessor) processChunk(ctx context.Context, chunkIndex int, chunk []Record,
 	processFn func(context.Context, *sql.Tx, []Record) error) error {
 
@@ -208,7 +208,7 @@ func (bp *BatchProcessor) processChunk(ctx context.Context, chunkIndex int, chun
 	return err
 }
 
-// executeWithRetry はリトライ付きでチャンクを処理します
+// executeWithRetry リトライ付きでチャンクを処理します
 func (bp *BatchProcessor) executeWithRetry(ctx context.Context, chunkIndex int, chunk []Record,
 	processFn func(context.Context, *sql.Tx, []Record) error) error {
 
@@ -242,7 +242,7 @@ func (bp *BatchProcessor) executeWithRetry(ctx context.Context, chunkIndex int, 
 	return fmt.Errorf("chunk %d failed after %d attempts: %v", chunkIndex, bp.config.RetryAttempts+1, lastErr)
 }
 
-// executeSingleChunk は単一チャンクを実行します
+// executeSingleChunk 単一チャンクを実行します
 func (bp *BatchProcessor) executeSingleChunk(ctx context.Context, _ int, chunk []Record,
 	processFn func(context.Context, *sql.Tx, []Record) error) error {
 
@@ -288,7 +288,7 @@ func (bp *BatchProcessor) executeSingleChunk(ctx context.Context, _ int, chunk [
 	return nil
 }
 
-// updateProgress は進捗を更新します
+// updateProgress 進捗を更新します
 func (bp *BatchProcessor) updateProgress(successCount, failCount int64) {
 	bp.progress.mu.Lock()
 	defer bp.progress.mu.Unlock()
@@ -312,7 +312,7 @@ func (bp *BatchProcessor) updateProgress(successCount, failCount int64) {
 	}
 }
 
-// updateBatchStats はバッチ統計を更新します
+// updateBatchStats バッチ統計を更新します
 func (bp *BatchProcessor) updateBatchStats(elapsed time.Duration, success bool) {
 	bp.stats.mu.Lock()
 	defer bp.stats.mu.Unlock()
@@ -342,7 +342,7 @@ func (bp *BatchProcessor) updateBatchStats(elapsed time.Duration, success bool) 
 	}
 }
 
-// updateFinalStats は最終統計を更新します
+// updateFinalStats 最終統計を更新します
 func (bp *BatchProcessor) updateFinalStats() {
 	bp.progress.mu.Lock()
 	defer bp.progress.mu.Unlock()
@@ -350,7 +350,7 @@ func (bp *BatchProcessor) updateFinalStats() {
 	bp.progress.LastUpdateTime = time.Now()
 }
 
-// monitorProgress は進捗を監視します
+// monitorProgress 進捗を監視します
 func (bp *BatchProcessor) monitorProgress(ctx context.Context) {
 	ticker := time.NewTicker(bp.config.ProgressInterval)
 	defer ticker.Stop()
@@ -365,7 +365,7 @@ func (bp *BatchProcessor) monitorProgress(ctx context.Context) {
 	}
 }
 
-// logProgress は進捗をログ出力します
+// logProgress 進捗をログ出力します
 func (bp *BatchProcessor) logProgress() {
 	bp.progress.mu.RLock()
 	defer bp.progress.mu.RUnlock()
@@ -385,7 +385,7 @@ func (bp *BatchProcessor) logProgress() {
 		bp.progress.EstimatedEndTime.Format("15:04:05"))
 }
 
-// GetProgress は現在の進捗を取得します
+// GetProgress 現在の進捗を取得します
 func (bp *BatchProcessor) GetProgress() BatchProgressSnapshot {
 	bp.progress.mu.RLock()
 	defer bp.progress.mu.RUnlock()
@@ -402,7 +402,7 @@ func (bp *BatchProcessor) GetProgress() BatchProgressSnapshot {
 	}
 }
 
-// BatchProgressSnapshot は進捗のスナップショットです
+// BatchProgressSnapshot 進捗のスナップショットです
 type BatchProgressSnapshot struct {
 	TotalRecords      int64
 	ProcessedRecords  int64
@@ -414,7 +414,7 @@ type BatchProgressSnapshot struct {
 	CurrentThroughput float64
 }
 
-// GetStats はバッチ統計を取得します
+// GetStats バッチ統計を取得します
 func (bp *BatchProcessor) GetStats() BatchStatsSnapshot {
 	bp.stats.mu.RLock()
 	defer bp.stats.mu.RUnlock()
@@ -430,7 +430,7 @@ func (bp *BatchProcessor) GetStats() BatchStatsSnapshot {
 	}
 }
 
-// BatchStatsSnapshot はバッチ統計のスナップショットです
+// BatchStatsSnapshot バッチ統計のスナップショットです
 type BatchStatsSnapshot struct {
 	TotalBatches     int64
 	CompletedBatches int64
@@ -441,17 +441,17 @@ type BatchStatsSnapshot struct {
 	MinBatchTime     time.Duration
 }
 
-// BulkInsertProcessor はバルクインサート処理を行います
+// BulkInsertProcessor バルクインサート処理を行います
 type BulkInsertProcessor struct {
 	db *sql.DB
 }
 
-// NewBulkInsertProcessor は新しいバルクインサートプロセッサーを作成します
+// NewBulkInsertProcessor 新しいバルクインサートプロセッサーを作成します
 func NewBulkInsertProcessor(db *sql.DB) *BulkInsertProcessor {
 	return &BulkInsertProcessor{db: db}
 }
 
-// BulkInsertProducts は商品を一括挿入します
+// BulkInsertProducts 商品を一括挿入します
 func (bip *BulkInsertProcessor) BulkInsertProducts(ctx context.Context, products []*ProductRecord) error {
 	tx, err := bip.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -557,7 +557,7 @@ func main() {
 	testBulkInsert(db)
 }
 
-// generateTestRecords はテスト用レコードを生成します
+// generateTestRecords テスト用レコードを生成します
 func generateTestRecords(count int) []Record {
 	records := make([]Record, count)
 	categories := []int64{1, 2, 3, 4, 5}
@@ -574,7 +574,7 @@ func generateTestRecords(count int) []Record {
 	return records
 }
 
-// processProducts は商品処理関数です
+// processProducts 商品処理関数です
 func processProducts(ctx context.Context, tx *sql.Tx, records []Record) error {
 	// 商品の更新処理をシミュレート
 	for _, record := range records {
@@ -594,7 +594,7 @@ func processProducts(ctx context.Context, tx *sql.Tx, records []Record) error {
 	return nil
 }
 
-// testBulkInsert はバルクインサートのテストを実行します
+// testBulkInsert バルクインサートのテストを実行します
 func testBulkInsert(db *sql.DB) {
 	bip := NewBulkInsertProcessor(db)
 	ctx := context.Background()

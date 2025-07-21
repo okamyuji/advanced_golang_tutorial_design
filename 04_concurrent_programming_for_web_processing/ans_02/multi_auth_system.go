@@ -17,7 +17,7 @@ import (
 	"time"
 )
 
-// MultiAuthSystem は複数認証プロバイダー並列検証システム
+// MultiAuthSystem 複数認証プロバイダー並列検証システム
 type MultiAuthSystem struct {
 	providers map[string]AuthProvider
 	cache     *AuthCache
@@ -26,7 +26,7 @@ type MultiAuthSystem struct {
 	mu        sync.RWMutex
 }
 
-// AuthConfig は認証システム設定
+// AuthConfig 認証システム設定
 type AuthConfig struct {
 	EnabledProviders  []string      // 有効なプロバイダーリスト
 	DefaultProvider   string        // デフォルトプロバイダー
@@ -39,14 +39,14 @@ type AuthConfig struct {
 	RetryDelay        time.Duration // リトライ間隔
 }
 
-// AuthProvider は認証プロバイダーインターフェース
+// AuthProvider 認証プロバイダーインターフェース
 type AuthProvider interface {
 	Authenticate(ctx context.Context, token string) (*AuthResult, error)
 	GetProviderInfo() *ProviderInfo
 	HealthCheck(ctx context.Context) error
 }
 
-// AuthResult は認証結果
+// AuthResult 認証結果
 type AuthResult struct {
 	Success      bool                   `json:"success"`
 	UserID       string                 `json:"user_id"`
@@ -61,7 +61,7 @@ type AuthResult struct {
 	ResponseTime time.Duration          `json:"response_time"`
 }
 
-// ProviderInfo はプロバイダー情報
+// ProviderInfo プロバイダー情報
 type ProviderInfo struct {
 	Name        string        `json:"name"`
 	Type        string        `json:"type"`
@@ -73,7 +73,7 @@ type ProviderInfo struct {
 	SuccessRate float64       `json:"success_rate"`
 }
 
-// AuthCache は認証結果キャッシュ
+// AuthCache 認証結果キャッシュ
 type AuthCache struct {
 	cache     map[string]*CacheEntry
 	mu        sync.RWMutex
@@ -81,7 +81,7 @@ type AuthCache struct {
 	evictions int64
 }
 
-// CacheEntry はキャッシュエントリ
+// CacheEntry キャッシュエントリ
 type CacheEntry struct {
 	Result      *AuthResult
 	ExpiresAt   time.Time
@@ -89,7 +89,7 @@ type CacheEntry struct {
 	LastAccess  time.Time
 }
 
-// AuthMetrics は認証メトリクス
+// AuthMetrics 認証メトリクス
 type AuthMetrics struct {
 	totalRequests   int64
 	successfulAuth  int64
@@ -102,7 +102,7 @@ type AuthMetrics struct {
 	mu              sync.RWMutex
 }
 
-// ProviderStats はプロバイダー統計
+// ProviderStats プロバイダー統計
 type ProviderStats struct {
 	totalRequests int64
 	successCount  int64
@@ -113,7 +113,7 @@ type ProviderStats struct {
 	lastErrorTime time.Time
 }
 
-// ParallelAuthResult は並列認証結果
+// ParallelAuthResult 並列認証結果
 type ParallelAuthResult struct {
 	Provider string
 	Result   *AuthResult
@@ -122,7 +122,7 @@ type ParallelAuthResult struct {
 	TimedOut bool
 }
 
-// OAuth2Provider はOAuth2認証プロバイダー（標準ライブラリのみ）
+// OAuth2Provider OAuth2認証プロバイダー（標準ライブラリのみ）
 type OAuth2Provider struct {
 	name         string
 	clientID     string
@@ -134,7 +134,7 @@ type OAuth2Provider struct {
 	mu           sync.RWMutex
 }
 
-// JWTProvider はJWT認証プロバイダー（標準ライブラリのみ）
+// JWTProvider JWT認証プロバイダー（標準ライブラリのみ）
 type JWTProvider struct {
 	name      string
 	secretKey []byte
@@ -145,7 +145,7 @@ type JWTProvider struct {
 	mu        sync.RWMutex
 }
 
-// APIKeyProvider はAPIキー認証プロバイダー
+// APIKeyProvider APIキー認証プロバイダー
 type APIKeyProvider struct {
 	name       string
 	apiKeys    map[string]*APIKeyInfo
@@ -156,7 +156,7 @@ type APIKeyProvider struct {
 	mu         sync.RWMutex
 }
 
-// APIKeyInfo はAPIキー情報
+// APIKeyInfo APIキー情報
 type APIKeyInfo struct {
 	KeyID     string
 	UserID    string
@@ -168,13 +168,13 @@ type APIKeyInfo struct {
 	IsActive  bool
 }
 
-// JWTHeader はJWTヘッダー
+// JWTHeader JWTヘッダー
 type JWTHeader struct {
 	Algorithm string `json:"alg"`
 	Type      string `json:"typ"`
 }
 
-// JWTPayload はJWTペイロード
+// JWTPayload JWTペイロード
 type JWTPayload struct {
 	Issuer    string                 `json:"iss,omitempty"`
 	Subject   string                 `json:"sub,omitempty"`
@@ -189,7 +189,7 @@ type JWTPayload struct {
 	Custom    map[string]interface{} `json:",inline"`
 }
 
-// NewMultiAuthSystem は新しい複数認証システムを作成
+// NewMultiAuthSystem 新しい複数認証システムを作成
 func NewMultiAuthSystem(config *AuthConfig) *MultiAuthSystem {
 	return &MultiAuthSystem{
 		providers: make(map[string]AuthProvider),
@@ -204,7 +204,7 @@ func NewMultiAuthSystem(config *AuthConfig) *MultiAuthSystem {
 	}
 }
 
-// RegisterProvider はプロバイダーを登録
+// RegisterProvider プロバイダーを登録
 func (mas *MultiAuthSystem) RegisterProvider(name string, provider AuthProvider) {
 	mas.mu.Lock()
 	defer mas.mu.Unlock()
@@ -215,7 +215,7 @@ func (mas *MultiAuthSystem) RegisterProvider(name string, provider AuthProvider)
 	log.Printf("Registered auth provider: %s", name)
 }
 
-// AuthenticateParallel は並列認証を実行（メイン機能）
+// AuthenticateParallel 並列認証を実行（メイン機能）
 func (mas *MultiAuthSystem) AuthenticateParallel(ctx context.Context, token string) (*AuthResult, error) {
 	start := time.Now()
 	defer func() {
@@ -253,7 +253,7 @@ func (mas *MultiAuthSystem) AuthenticateParallel(ctx context.Context, token stri
 	return selectedResult, nil
 }
 
-// executeParallelAuth は並列認証を実行
+// executeParallelAuth 並列認証を実行
 func (mas *MultiAuthSystem) executeParallelAuth(ctx context.Context, token string) ([]*ParallelAuthResult, error) {
 	// タイムアウト付きコンテキスト作成
 	authCtx, cancel := context.WithTimeout(ctx, mas.config.ParallelTimeout)
@@ -292,7 +292,7 @@ func (mas *MultiAuthSystem) executeParallelAuth(ctx context.Context, token strin
 	return results, nil
 }
 
-// authenticateWithProvider は個別プロバイダーで認証
+// authenticateWithProvider 個別プロバイダーで認証
 func (mas *MultiAuthSystem) authenticateWithProvider(ctx context.Context, providerName string, token string, resultChan chan<- *ParallelAuthResult) {
 	start := time.Now()
 
@@ -330,7 +330,7 @@ func (mas *MultiAuthSystem) authenticateWithProvider(ctx context.Context, provid
 	}
 }
 
-// selectBestResult は最適な認証結果を選択
+// selectBestResult 最適な認証結果を選択
 func (mas *MultiAuthSystem) selectBestResult(results []*ParallelAuthResult) *AuthResult {
 	var successResults []*AuthResult
 
@@ -382,7 +382,7 @@ func (mas *MultiAuthSystem) selectBestResult(results []*ParallelAuthResult) *Aut
 	return fastest
 }
 
-// getEnabledProviders は有効なプロバイダーリストを取得
+// getEnabledProviders 有効なプロバイダーリストを取得
 func (mas *MultiAuthSystem) getEnabledProviders() []string {
 	mas.mu.RLock()
 	defer mas.mu.RUnlock()
@@ -397,7 +397,7 @@ func (mas *MultiAuthSystem) getEnabledProviders() []string {
 	return enabled
 }
 
-// updateProviderStats はプロバイダー統計を更新
+// updateProviderStats プロバイダー統計を更新
 func (mas *MultiAuthSystem) updateProviderStats(result *ParallelAuthResult) {
 	mas.metrics.mu.Lock()
 	defer mas.metrics.mu.Unlock()
@@ -424,7 +424,7 @@ func (mas *MultiAuthSystem) updateProviderStats(result *ParallelAuthResult) {
 	}
 }
 
-// checkCache はキャッシュから認証結果をチェック
+// checkCache キャッシュから認証結果をチェック
 func (mas *MultiAuthSystem) checkCache(token string) *AuthResult {
 	tokenHash := mas.hashToken(token)
 
@@ -449,7 +449,7 @@ func (mas *MultiAuthSystem) checkCache(token string) *AuthResult {
 	return entry.Result
 }
 
-// cacheResult は認証結果をキャッシュ
+// cacheResult 認証結果をキャッシュ
 func (mas *MultiAuthSystem) cacheResult(token string, result *AuthResult) {
 	if mas.config.CacheExpiration == 0 {
 		return
@@ -481,7 +481,7 @@ func (mas *MultiAuthSystem) cacheResult(token string, result *AuthResult) {
 	mas.cache.cache[tokenHash] = entry
 }
 
-// evictLeastRecentlyUsed は最も使用頻度の低いキャッシュエントリを削除
+// evictLeastRecentlyUsed 最も使用頻度の低いキャッシュエントリを削除
 func (mas *MultiAuthSystem) evictLeastRecentlyUsed() {
 	var oldestKey string
 	var oldestTime = time.Now()
@@ -499,7 +499,7 @@ func (mas *MultiAuthSystem) evictLeastRecentlyUsed() {
 	}
 }
 
-// evictCacheEntry は指定されたキャッシュエントリを削除
+// evictCacheEntry 指定されたキャッシュエントリを削除
 func (mas *MultiAuthSystem) evictCacheEntry(tokenHash string) {
 	mas.cache.mu.Lock()
 	defer mas.cache.mu.Unlock()
@@ -508,14 +508,14 @@ func (mas *MultiAuthSystem) evictCacheEntry(tokenHash string) {
 	atomic.AddInt64(&mas.cache.evictions, 1)
 }
 
-// hashToken はトークンのハッシュを計算
+// hashToken トークンのハッシュを計算
 func (mas *MultiAuthSystem) hashToken(token string) string {
 	h := sha256.New()
 	h.Write([]byte(token))
 	return fmt.Sprintf("%x", h.Sum(nil))[:16] // 16文字に短縮
 }
 
-// NewOAuth2Provider は新しいOAuth2プロバイダーを作成
+// NewOAuth2Provider 新しいOAuth2プロバイダーを作成
 func NewOAuth2Provider(name, clientID, clientSecret, endpoint string, timeout time.Duration) *OAuth2Provider {
 	return &OAuth2Provider{
 		name:         name,
@@ -530,7 +530,7 @@ func NewOAuth2Provider(name, clientID, clientSecret, endpoint string, timeout ti
 	}
 }
 
-// Authenticate はOAuth2認証を実行
+// Authenticate OAuth2認証を実行
 func (o *OAuth2Provider) Authenticate(ctx context.Context, token string) (*AuthResult, error) {
 	start := time.Now()
 	defer func() {
@@ -583,7 +583,7 @@ func (o *OAuth2Provider) Authenticate(ctx context.Context, token string) (*AuthR
 	}, nil
 }
 
-// GetProviderInfo はプロバイダー情報を取得
+// GetProviderInfo プロバイダー情報を取得
 func (o *OAuth2Provider) GetProviderInfo() *ProviderInfo {
 	o.mu.RLock()
 	defer o.mu.RUnlock()
@@ -600,13 +600,13 @@ func (o *OAuth2Provider) GetProviderInfo() *ProviderInfo {
 	}
 }
 
-// HealthCheck はヘルスチェックを実行
+// HealthCheck ヘルスチェックを実行
 func (o *OAuth2Provider) HealthCheck(ctx context.Context) error {
 	// 実際の実装では外部サービスへのpingまたはヘルスチェックエンドポイントへのアクセス
 	return nil
 }
 
-// calculateSuccessRate は成功率を計算
+// calculateSuccessRate 成功率を計算
 func (o *OAuth2Provider) calculateSuccessRate() float64 {
 	total := atomic.LoadInt64(&o.stats.totalRequests)
 	if total == 0 {
@@ -616,14 +616,14 @@ func (o *OAuth2Provider) calculateSuccessRate() float64 {
 	return float64(success) / float64(total) * 100.0
 }
 
-// hashToken はトークンのハッシュを計算
+// hashToken トークンのハッシュを計算
 func (o *OAuth2Provider) hashToken(token string) string {
 	h := sha256.New()
 	h.Write([]byte(token))
 	return fmt.Sprintf("oauth2_%x", h.Sum(nil))[:16]
 }
 
-// NewJWTProvider は新しいJWTプロバイダーを作成
+// NewJWTProvider 新しいJWTプロバイダーを作成
 func NewJWTProvider(name string, secretKey []byte, issuer, audience string, timeout time.Duration) *JWTProvider {
 	return &JWTProvider{
 		name:      name,
@@ -635,7 +635,7 @@ func NewJWTProvider(name string, secretKey []byte, issuer, audience string, time
 	}
 }
 
-// Authenticate はJWT認証を実行（標準ライブラリのみ）
+// Authenticate JWT認証を実行（標準ライブラリのみ）
 func (j *JWTProvider) Authenticate(ctx context.Context, tokenString string) (*AuthResult, error) {
 	start := time.Now()
 	defer func() {
@@ -736,14 +736,14 @@ func (j *JWTProvider) Authenticate(ctx context.Context, tokenString string) (*Au
 	return result, nil
 }
 
-// generateSignature はHMAC-SHA256署名を生成
+// generateSignature HMAC-SHA256署名を生成
 func (j *JWTProvider) generateSignature(message string) []byte {
 	h := hmac.New(sha256.New, j.secretKey)
 	h.Write([]byte(message))
 	return h.Sum(nil)
 }
 
-// GetProviderInfo はプロバイダー情報を取得
+// GetProviderInfo プロバイダー情報を取得
 func (j *JWTProvider) GetProviderInfo() *ProviderInfo {
 	j.mu.RLock()
 	defer j.mu.RUnlock()
@@ -760,12 +760,12 @@ func (j *JWTProvider) GetProviderInfo() *ProviderInfo {
 	}
 }
 
-// HealthCheck はヘルスチェックを実行
+// HealthCheck ヘルスチェックを実行
 func (j *JWTProvider) HealthCheck(ctx context.Context) error {
 	return nil
 }
 
-// calculateSuccessRate は成功率を計算
+// calculateSuccessRate 成功率を計算
 func (j *JWTProvider) calculateSuccessRate() float64 {
 	total := atomic.LoadInt64(&j.stats.totalRequests)
 	if total == 0 {
@@ -775,14 +775,14 @@ func (j *JWTProvider) calculateSuccessRate() float64 {
 	return float64(success) / float64(total) * 100.0
 }
 
-// hashToken はトークンのハッシュを計算
+// hashToken トークンのハッシュを計算
 func (j *JWTProvider) hashToken(token string) string {
 	h := sha256.New()
 	h.Write([]byte(token))
 	return fmt.Sprintf("jwt_%x", h.Sum(nil))[:16]
 }
 
-// NewAPIKeyProvider は新しいAPIキープロバイダーを作成
+// NewAPIKeyProvider 新しいAPIキープロバイダーを作成
 func NewAPIKeyProvider(name, headerName, keyPrefix string, timeout time.Duration) *APIKeyProvider {
 	return &APIKeyProvider{
 		name:       name,
@@ -794,7 +794,7 @@ func NewAPIKeyProvider(name, headerName, keyPrefix string, timeout time.Duration
 	}
 }
 
-// AddAPIKey はAPIキーを追加
+// AddAPIKey APIキーを追加
 func (a *APIKeyProvider) AddAPIKey(keyID, userID, username, email string, roles []string, expiresAt time.Time) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -811,7 +811,7 @@ func (a *APIKeyProvider) AddAPIKey(keyID, userID, username, email string, roles 
 	}
 }
 
-// Authenticate はAPIキー認証を実行
+// Authenticate APIキー認証を実行
 func (a *APIKeyProvider) Authenticate(ctx context.Context, token string) (*AuthResult, error) {
 	start := time.Now()
 	defer func() {
@@ -858,7 +858,7 @@ func (a *APIKeyProvider) Authenticate(ctx context.Context, token string) (*AuthR
 	}, nil
 }
 
-// GetProviderInfo はプロバイダー情報を取得
+// GetProviderInfo プロバイダー情報を取得
 func (a *APIKeyProvider) GetProviderInfo() *ProviderInfo {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
@@ -874,12 +874,12 @@ func (a *APIKeyProvider) GetProviderInfo() *ProviderInfo {
 	}
 }
 
-// HealthCheck はヘルスチェックを実行
+// HealthCheck ヘルスチェックを実行
 func (a *APIKeyProvider) HealthCheck(ctx context.Context) error {
 	return nil
 }
 
-// calculateSuccessRate は成功率を計算
+// calculateSuccessRate 成功率を計算
 func (a *APIKeyProvider) calculateSuccessRate() float64 {
 	total := atomic.LoadInt64(&a.stats.totalRequests)
 	if total == 0 {
@@ -889,14 +889,14 @@ func (a *APIKeyProvider) calculateSuccessRate() float64 {
 	return float64(success) / float64(total) * 100.0
 }
 
-// hashToken はトークンのハッシュを計算
+// hashToken トークンのハッシュを計算
 func (a *APIKeyProvider) hashToken(token string) string {
 	h := sha256.New()
 	h.Write([]byte(token))
 	return fmt.Sprintf("apikey_%x", h.Sum(nil))[:16]
 }
 
-// HTTPHandler はHTTPハンドラー
+// HTTPHandler HTTPハンドラー
 func (mas *MultiAuthSystem) HTTPHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Authorization ヘッダーからトークン取得
@@ -934,7 +934,7 @@ func (mas *MultiAuthSystem) HTTPHandler() http.HandlerFunc {
 	}
 }
 
-// MetricsHandler はメトリクス情報を返すハンドラー
+// MetricsHandler メトリクス情報を返すハンドラー
 func (mas *MultiAuthSystem) MetricsHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -983,7 +983,7 @@ func (mas *MultiAuthSystem) MetricsHandler() http.HandlerFunc {
 	}
 }
 
-// TestJWTGenerator はテスト用JWTを生成
+// TestJWTGenerator テスト用JWTを生成
 func (mas *MultiAuthSystem) TestJWTGenerator() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {

@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// TestNewLimiterConfig はLimiterConfig作成をテストします
+// TestNewLimiterConfig LimiterConfig作成をテストします
 func TestNewLimiterConfig(t *testing.T) {
 	config := NewLimiterConfig()
 
@@ -29,7 +29,7 @@ func TestNewLimiterConfig(t *testing.T) {
 	}
 }
 
-// TestNewAPIRateLimiter はAPIRateLimiter作成をテストします
+// TestNewAPIRateLimiter APIRateLimiter作成をテストします
 func TestNewAPIRateLimiter(t *testing.T) {
 	config := NewLimiterConfig()
 	config.WorkerCount = 3
@@ -47,7 +47,7 @@ func TestNewAPIRateLimiter(t *testing.T) {
 	}
 }
 
-// TestLimiterStartAndShutdown はリミッターの開始と停止をテストします
+// TestLimiterStartAndShutdown リミッターの開始と停止をテストします
 func TestLimiterStartAndShutdown(t *testing.T) {
 	config := NewLimiterConfig()
 	config.WorkerCount = 2
@@ -82,7 +82,7 @@ func TestLimiterStartAndShutdown(t *testing.T) {
 	}
 }
 
-// TestBasicRateLimit は基本的なレート制限をテストします
+// TestBasicRateLimit 基本的なレート制限をテストします
 func TestBasicRateLimit(t *testing.T) {
 	config := NewLimiterConfig()
 	config.WorkerCount = 2
@@ -162,7 +162,7 @@ func TestBasicRateLimit(t *testing.T) {
 	}
 }
 
-// TestRuleMatching はルールマッチングをテストします
+// TestRuleMatching ルールマッチングをテストします
 func TestRuleMatching(t *testing.T) {
 	config := NewLimiterConfig()
 
@@ -257,7 +257,7 @@ func TestRuleMatching(t *testing.T) {
 	}
 }
 
-// TestBurstLimit はバースト制限をテストします
+// TestBurstLimit バースト制限をテストします
 func TestBurstLimit(t *testing.T) {
 	config := NewLimiterConfig()
 
@@ -318,7 +318,7 @@ func TestBurstLimit(t *testing.T) {
 	}
 }
 
-// TestConcurrentRateLimit は並行レート制限をテストします
+// TestConcurrentRateLimit 並行レート制限をテストします
 func TestConcurrentRateLimit(t *testing.T) {
 	config := NewLimiterConfig()
 	config.WorkerCount = 3
@@ -405,7 +405,7 @@ func TestConcurrentRateLimit(t *testing.T) {
 	}
 }
 
-// TestHTTPMiddleware はHTTPミドルウェアをテストします
+// TestHTTPMiddleware HTTPミドルウェアをテストします
 func TestHTTPMiddleware(t *testing.T) {
 	config := NewLimiterConfig()
 
@@ -479,7 +479,7 @@ func TestHTTPMiddleware(t *testing.T) {
 	}
 }
 
-// TestBucketCleanup はバケットクリーンアップをテストします
+// TestBucketCleanup バケットクリーンアップをテストします
 func TestBucketCleanup(t *testing.T) {
 	config := NewLimiterConfig()
 	config.CleanupInterval = 100 * time.Millisecond // 短いクリーンアップ間隔
@@ -539,7 +539,7 @@ func TestBucketCleanup(t *testing.T) {
 	}
 }
 
-// TestWorkerStats はワーカー統計をテストします
+// TestWorkerStats ワーカー統計をテストします
 func TestWorkerStats(t *testing.T) {
 	config := NewLimiterConfig()
 	config.WorkerCount = 2
@@ -599,7 +599,7 @@ func TestWorkerStats(t *testing.T) {
 	}
 }
 
-// TestGetStats は統計取得をテストします
+// TestGetStats 統計取得をテストします
 func TestGetStats(t *testing.T) {
 	config := NewLimiterConfig()
 	limiter := NewAPIRateLimiter(config)
@@ -621,7 +621,7 @@ func TestGetStats(t *testing.T) {
 	}
 }
 
-// TestCustomRule はカスタムルール追加をテストします
+// TestCustomRule カスタムルール追加をテストします
 func TestCustomRule(t *testing.T) {
 	config := NewLimiterConfig()
 	config.DefaultRules = []*RateLimitRule{} // デフォルトルールを空にする
@@ -675,7 +675,7 @@ func TestCustomRule(t *testing.T) {
 	}
 }
 
-// TestEndpointPattern はエンドポイントパターンマッチングをテストします
+// TestEndpointPattern エンドポイントパターンマッチングをテストします
 func TestEndpointPattern(t *testing.T) {
 	config := NewLimiterConfig()
 
@@ -738,7 +738,7 @@ func TestEndpointPattern(t *testing.T) {
 	}
 }
 
-// TestNoMatchingRule はマッチするルールがない場合をテストします
+// TestNoMatchingRule マッチするルールがない場合をテストします
 func TestNoMatchingRule(t *testing.T) {
 	config := NewLimiterConfig()
 

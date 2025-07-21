@@ -119,7 +119,7 @@ func (pq *PriorityTaskQueue) Pop() interface{} {
 	return task
 }
 
-// Enqueue はタスクをキューに追加します
+// Enqueue タスクをキューに追加します
 func (pq *PriorityTaskQueue) Enqueue(task *PriorityTask) {
 	pq.mu.Lock()
 	defer pq.mu.Unlock()

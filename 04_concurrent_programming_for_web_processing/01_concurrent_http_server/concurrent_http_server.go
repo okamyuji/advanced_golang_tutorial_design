@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-// HTTPRequest は処理対象のHTTPリクエストです
+// HTTPRequest 処理対象のHTTPリクエストです
 type HTTPRequest struct {
 	ID        string
 	Method    string
@@ -25,7 +25,7 @@ type HTTPRequest struct {
 	Timestamp time.Time
 }
 
-// HTTPResponse は処理済みHTTPレスポンスです
+// HTTPResponse 処理済みHTTPレスポンスです
 type HTTPResponse struct {
 	RequestID   string
 	StatusCode  int
@@ -38,7 +38,7 @@ type HTTPResponse struct {
 	CompletedAt time.Time
 }
 
-// ConcurrentHTTPServer は並行HTTPサーバーです
+// ConcurrentHTTPServer TPサーバーです
 type ConcurrentHTTPServer struct {
 	// サーバー設定
 	address       string
@@ -71,7 +71,7 @@ type ConcurrentHTTPServer struct {
 	startTime time.Time
 }
 
-// HTTPRequestContext はリクエストコンテキストです
+// HTTPRequestContext リクエストコンテキストです
 type HTTPRequestContext struct {
 	Request        *HTTPRequest
 	ResponseWriter http.ResponseWriter
@@ -80,7 +80,7 @@ type HTTPRequestContext struct {
 	StartTime      time.Time
 }
 
-// HTTPWorker は並行HTTPワーカーです
+// HTTPWorker 並行HTTPワーカーです
 type HTTPWorker struct {
 	ID       int
 	server   *ConcurrentHTTPServer
@@ -88,10 +88,10 @@ type HTTPWorker struct {
 	handlers map[string]HandlerFunc
 }
 
-// HandlerFunc はハンドラー関数です
+// HandlerFunc ハンドラー関数です
 type HandlerFunc func(ctx context.Context, req *HTTPRequest) (*HTTPResponse, error)
 
-// ServerStats はサーバー統計です
+// ServerStats サーバー統計です
 type ServerStats struct {
 	mu                  sync.RWMutex
 	totalRequests       int64
@@ -104,7 +104,7 @@ type ServerStats struct {
 	startTime           time.Time
 }
 
-// WorkerStats はワーカー統計です
+// WorkerStats ワーカー統計です
 type WorkerStats struct {
 	WorkerID           int
 	ProcessedRequests  int64
@@ -114,16 +114,16 @@ type WorkerStats struct {
 	AverageProcessTime time.Duration
 }
 
-// MiddlewareManager はミドルウェア管理です
+// MiddlewareManager ミドルウェア管理です
 type MiddlewareManager struct {
 	middlewares []MiddlewareFunc
 	mu          sync.RWMutex
 }
 
-// MiddlewareFunc はミドルウェア関数です
+// MiddlewareFunc ミドルウェア関数です
 type MiddlewareFunc func(next HandlerFunc) HandlerFunc
 
-// ServerConfig はサーバー設定です
+// ServerConfig サーバー設定です
 type ServerConfig struct {
 	Address         string
 	Port            int
@@ -137,7 +137,7 @@ type ServerConfig struct {
 	MetricsInterval time.Duration
 }
 
-// NewServerConfig はデフォルトサーバー設定を作成します
+// NewServerConfig デフォルトサーバー設定を作成します
 func NewServerConfig() *ServerConfig {
 	return &ServerConfig{
 		Address:         "localhost",
@@ -153,7 +153,7 @@ func NewServerConfig() *ServerConfig {
 	}
 }
 
-// NewConcurrentHTTPServer は新しい並行HTTPサーバーを作成します
+// NewConcurrentHTTPServer 新しい並行HTTPサーバーを作成します
 func NewConcurrentHTTPServer(config *ServerConfig) *ConcurrentHTTPServer {
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -207,7 +207,7 @@ func NewConcurrentHTTPServer(config *ServerConfig) *ConcurrentHTTPServer {
 	return server
 }
 
-// registerDefaultHandlers はデフォルトハンドラーを登録します
+// registerDefaultHandlers デフォルトハンドラーを登録します
 func (s *ConcurrentHTTPServer) registerDefaultHandlers() {
 	s.RegisterHandler("GET", "/health", s.healthCheckHandler)
 	s.RegisterHandler("GET", "/metrics", s.metricsHandler)
@@ -217,7 +217,7 @@ func (s *ConcurrentHTTPServer) registerDefaultHandlers() {
 	s.RegisterHandler("GET", "/api/cpu", s.cpuIntensiveHandler)
 }
 
-// ServeHTTP はHTTPリクエストを処理します
+// ServeHTTP HTTPリクエストを処理します
 func (s *ConcurrentHTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if atomic.LoadInt32(&s.isRunning) == 0 {
 		http.Error(w, "Server is not running", http.StatusServiceUnavailable)
@@ -273,7 +273,7 @@ func (s *ConcurrentHTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	}
 }
 
-// Start はサーバーを開始します
+// Start サーバーを開始します
 func (s *ConcurrentHTTPServer) Start() error {
 	if !atomic.CompareAndSwapInt32(&s.isRunning, 0, 1) {
 		return fmt.Errorf("server is already running")
@@ -314,7 +314,7 @@ func (s *ConcurrentHTTPServer) Start() error {
 	return nil
 }
 
-// run はワーカーのメインループです
+// run ワーカーのメインループです
 func (w *HTTPWorker) run() {
 	defer w.server.wg.Done()
 
@@ -337,7 +337,7 @@ func (w *HTTPWorker) run() {
 	}
 }
 
-// processRequest はリクエストを処理します
+// processRequest リクエストを処理します
 func (w *HTTPWorker) processRequest(requestCtx *HTTPRequestContext) {
 	start := time.Now()
 
@@ -382,7 +382,7 @@ func (w *HTTPWorker) processRequest(requestCtx *HTTPRequestContext) {
 	}
 }
 
-// findHandler は適切なハンドラーを見つけます
+// findHandler 適切なハンドラーを見つけます
 func (w *HTTPWorker) findHandler(method, path string) HandlerFunc {
 	handlerKey := method + " " + path
 	if handler, exists := w.handlers[handlerKey]; exists {
@@ -393,7 +393,7 @@ func (w *HTTPWorker) findHandler(method, path string) HandlerFunc {
 	return w.server.getDefaultHandler(method, path)
 }
 
-// sendResponse はレスポンスを送信します
+// sendResponse レスポンスを送信します
 func (w *HTTPWorker) sendResponse(requestCtx *HTTPRequestContext, response *HTTPResponse) {
 	responseWriter := requestCtx.ResponseWriter
 
@@ -432,7 +432,7 @@ func (w *HTTPWorker) sendResponse(requestCtx *HTTPRequestContext, response *HTTP
 	}
 }
 
-// sendErrorResponse はエラーレスポンスを送信します
+// sendErrorResponse エラーレスポンスを送信します
 func (w *HTTPWorker) sendErrorResponse(requestCtx *HTTPRequestContext, statusCode int, message string) {
 	response := &HTTPResponse{
 		StatusCode:  statusCode,
@@ -446,7 +446,7 @@ func (w *HTTPWorker) sendErrorResponse(requestCtx *HTTPRequestContext, statusCod
 	w.sendResponse(requestCtx, response)
 }
 
-// RegisterHandler はハンドラーを登録します
+// RegisterHandler ハンドラーを登録します
 func (s *ConcurrentHTTPServer) RegisterHandler(method, path string, handler HandlerFunc) {
 	handlerKey := method + " " + path
 
@@ -457,7 +457,7 @@ func (s *ConcurrentHTTPServer) RegisterHandler(method, path string, handler Hand
 	log.Printf("Handler registered: %s %s", method, path)
 }
 
-// getDefaultHandler はデフォルトハンドラーを取得します
+// getDefaultHandler デフォルトハンドラーを取得します
 func (s *ConcurrentHTTPServer) getDefaultHandler(method, path string) HandlerFunc {
 	// メソッドとパスに基づいてデフォルトハンドラーを返す
 	return func(ctx context.Context, req *HTTPRequest) (*HTTPResponse, error) {
@@ -490,7 +490,7 @@ func (s *ConcurrentHTTPServer) getDefaultHandler(method, path string) HandlerFun
 	}
 }
 
-// AddMiddleware はミドルウェアを追加します
+// AddMiddleware ミドルウェアを追加します
 func (s *ConcurrentHTTPServer) AddMiddleware(middleware MiddlewareFunc) {
 	s.middleware.mu.Lock()
 	defer s.middleware.mu.Unlock()
@@ -498,7 +498,7 @@ func (s *ConcurrentHTTPServer) AddMiddleware(middleware MiddlewareFunc) {
 	s.middleware.middlewares = append(s.middleware.middlewares, middleware)
 }
 
-// apply はミドルウェアを適用します
+// apply ミドルウェアを適用します
 func (mm *MiddlewareManager) apply(handler HandlerFunc) HandlerFunc {
 	mm.mu.RLock()
 	defer mm.mu.RUnlock()
@@ -513,7 +513,7 @@ func (mm *MiddlewareManager) apply(handler HandlerFunc) HandlerFunc {
 	return result
 }
 
-// handleResponses はレスポンスを処理します
+// handleResponses レスポンスを処理します
 func (s *ConcurrentHTTPServer) handleResponses() {
 	defer s.wg.Done()
 
@@ -536,7 +536,7 @@ func (s *ConcurrentHTTPServer) handleResponses() {
 	}
 }
 
-// processResponse はレスポンスを処理します
+// processResponse レスポンスを処理します
 func (s *ConcurrentHTTPServer) processResponse(response *HTTPResponse) {
 	// 平均レスポンス時間を更新
 	completed := atomic.LoadInt64(&s.stats.completedRequests)
@@ -554,7 +554,7 @@ func (s *ConcurrentHTTPServer) processResponse(response *HTTPResponse) {
 	}
 }
 
-// monitorMetrics はメトリクスを監視します
+// monitorMetrics メトリクスを監視します
 func (s *ConcurrentHTTPServer) monitorMetrics() {
 	defer s.wg.Done()
 
@@ -574,7 +574,7 @@ func (s *ConcurrentHTTPServer) monitorMetrics() {
 	}
 }
 
-// reportMetrics はメトリクスを報告します
+// reportMetrics メトリクスを報告します
 func (s *ConcurrentHTTPServer) reportMetrics() {
 	s.stats.mu.RLock()
 	defer s.stats.mu.RUnlock()
@@ -615,7 +615,7 @@ func (s *ConcurrentHTTPServer) reportMetrics() {
 
 // デフォルトハンドラー実装
 
-// healthCheckHandler はヘルスチェックハンドラーです
+// healthCheckHandler ヘルスチェックハンドラーです
 func (s *ConcurrentHTTPServer) healthCheckHandler(ctx context.Context, req *HTTPRequest) (*HTTPResponse, error) {
 	healthData := map[string]interface{}{
 		"status":    "healthy",
@@ -638,7 +638,7 @@ func (s *ConcurrentHTTPServer) healthCheckHandler(ctx context.Context, req *HTTP
 	}, nil
 }
 
-// metricsHandler はメトリクスハンドラーです
+// metricsHandler メトリクスハンドラーです
 func (s *ConcurrentHTTPServer) metricsHandler(ctx context.Context, req *HTTPRequest) (*HTTPResponse, error) {
 	s.stats.mu.RLock()
 	defer s.stats.mu.RUnlock()
@@ -668,7 +668,7 @@ func (s *ConcurrentHTTPServer) metricsHandler(ctx context.Context, req *HTTPRequ
 	}, nil
 }
 
-// statusHandler はステータスハンドラーです
+// statusHandler ステータスハンドラーです
 func (s *ConcurrentHTTPServer) statusHandler(ctx context.Context, req *HTTPRequest) (*HTTPResponse, error) {
 	workerStats := make([]map[string]interface{}, len(s.workerPool))
 
@@ -705,7 +705,7 @@ func (s *ConcurrentHTTPServer) statusHandler(ctx context.Context, req *HTTPReque
 	}, nil
 }
 
-// echoHandler はエコーハンドラーです
+// echoHandler エコーハンドラーです
 func (s *ConcurrentHTTPServer) echoHandler(ctx context.Context, req *HTTPRequest) (*HTTPResponse, error) {
 	echoData := map[string]interface{}{
 		"method":     req.Method,
@@ -731,7 +731,7 @@ func (s *ConcurrentHTTPServer) echoHandler(ctx context.Context, req *HTTPRequest
 	}, nil
 }
 
-// slowHandler は遅延ハンドラーです
+// slowHandler 遅延ハンドラーです
 func (s *ConcurrentHTTPServer) slowHandler(ctx context.Context, req *HTTPRequest) (*HTTPResponse, error) {
 	// 遅延をシミュレート
 	delay := time.Duration(rand.Intn(2000)+1000) * time.Millisecond
@@ -763,7 +763,7 @@ func (s *ConcurrentHTTPServer) slowHandler(ctx context.Context, req *HTTPRequest
 	}, nil
 }
 
-// cpuIntensiveHandler はCPU集約的ハンドラーです
+// cpuIntensiveHandler CPU集約的ハンドラーです
 func (s *ConcurrentHTTPServer) cpuIntensiveHandler(ctx context.Context, req *HTTPRequest) (*HTTPResponse, error) {
 	// CPU集約的処理をシミュレート
 	iterations := rand.Intn(1000000) + 500000
@@ -810,12 +810,12 @@ func (s *ConcurrentHTTPServer) cpuIntensiveHandler(ctx context.Context, req *HTT
 
 // ユーティリティメソッド
 
-// generateRequestID はリクエストIDを生成します
+// generateRequestID リクエストIDを生成します
 func (s *ConcurrentHTTPServer) generateRequestID() string {
 	return fmt.Sprintf("req_%d_%d", time.Now().UnixNano(), rand.Int63())
 }
 
-// extractHeaders はヘッダーを抽出します
+// extractHeaders ヘッダーを抽出します
 func (s *ConcurrentHTTPServer) extractHeaders(r *http.Request) map[string]string {
 	headers := make(map[string]string)
 	for key, values := range r.Header {
@@ -826,7 +826,7 @@ func (s *ConcurrentHTTPServer) extractHeaders(r *http.Request) map[string]string
 	return headers
 }
 
-// getClientIP はクライアントIPを取得します
+// getClientIP クライアントIPを取得します
 func (s *ConcurrentHTTPServer) getClientIP(r *http.Request) string {
 	// X-Forwarded-Forヘッダーをチェック
 	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
@@ -842,7 +842,7 @@ func (s *ConcurrentHTTPServer) getClientIP(r *http.Request) string {
 	return r.RemoteAddr
 }
 
-// Shutdown はサーバーを停止します
+// Shutdown サーバーを停止します
 func (s *ConcurrentHTTPServer) Shutdown(timeout time.Duration) error {
 	if !atomic.CompareAndSwapInt32(&s.isRunning, 1, 0) {
 		return fmt.Errorf("server is not running")
@@ -891,7 +891,7 @@ func (s *ConcurrentHTTPServer) Shutdown(timeout time.Duration) error {
 	return nil
 }
 
-// GetStats は統計情報を取得します
+// GetStats 統計情報を取得します
 func (s *ConcurrentHTTPServer) GetStats() map[string]interface{} {
 	s.stats.mu.RLock()
 	defer s.stats.mu.RUnlock()
@@ -970,7 +970,7 @@ func main() {
 
 // ミドルウェア実装
 
-// LoggingMiddleware はログミドルウェアです
+// LoggingMiddleware ログミドルウェアです
 func LoggingMiddleware(next HandlerFunc) HandlerFunc {
 	return func(ctx context.Context, req *HTTPRequest) (*HTTPResponse, error) {
 		start := time.Now()
@@ -989,7 +989,7 @@ func LoggingMiddleware(next HandlerFunc) HandlerFunc {
 	}
 }
 
-// CORSMiddleware はCORSミドルウェアです
+// CORSMiddleware CORSミドルウェアです
 func CORSMiddleware(next HandlerFunc) HandlerFunc {
 	return func(ctx context.Context, req *HTTPRequest) (*HTTPResponse, error) {
 		response, err := next(ctx, req)
@@ -1009,7 +1009,7 @@ func CORSMiddleware(next HandlerFunc) HandlerFunc {
 
 // カスタムハンドラー実装
 
-// TestHandler はテストハンドラーです
+// TestHandler テストハンドラーです
 func TestHandler(ctx context.Context, req *HTTPRequest) (*HTTPResponse, error) {
 	data := map[string]interface{}{
 		"message":    "Test handler response",
@@ -1031,7 +1031,7 @@ func TestHandler(ctx context.Context, req *HTTPRequest) (*HTTPResponse, error) {
 	}, nil
 }
 
-// DataHandler はデータハンドラーです
+// DataHandler データハンドラーです
 func DataHandler(ctx context.Context, req *HTTPRequest) (*HTTPResponse, error) {
 	// リクエストボディを解析
 	var requestData map[string]interface{}

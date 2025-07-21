@@ -9,14 +9,14 @@ import (
 	"time"
 )
 
-// Task はタスクを表現します
+// Task タスクを表現します
 type Task struct {
 	ID        int
 	CreatedAt time.Time
 	Execute   func() error
 }
 
-// TaskQueueSystem はタスクキューシステムです
+// TaskQueueSystem タスクキューシステムです
 type TaskQueueSystem struct {
 	tasks          chan Task
 	maxQueueSize   int
@@ -30,7 +30,7 @@ type TaskQueueSystem struct {
 	isShuttingDown bool
 }
 
-// NewTaskQueueSystem は新しいタスクキューシステムを作成します
+// NewTaskQueueSystem 新しいタスクキューシステムを作成します
 func NewTaskQueueSystem(maxQueueSize, maxWorkers int) *TaskQueueSystem {
 	return &TaskQueueSystem{
 		tasks:        make(chan Task, maxQueueSize),
@@ -40,7 +40,7 @@ func NewTaskQueueSystem(maxQueueSize, maxWorkers int) *TaskQueueSystem {
 	}
 }
 
-// Start はシステムを開始します
+// Start システムを開始します
 func (tqs *TaskQueueSystem) Start(ctx context.Context) {
 	// ワーカーを開始
 	for i := 0; i < tqs.maxWorkers; i++ {
@@ -52,7 +52,7 @@ func (tqs *TaskQueueSystem) Start(ctx context.Context) {
 	go tqs.statsReporter(ctx)
 }
 
-// worker はタスクを処理するワーカーです
+// worker タスクを処理するワーカーです
 func (tqs *TaskQueueSystem) worker(ctx context.Context, workerID int) {
 	defer tqs.workerWG.Done()
 	atomic.AddInt64(&tqs.currentWorkers, 1)
@@ -86,7 +86,7 @@ func (tqs *TaskQueueSystem) worker(ctx context.Context, workerID int) {
 	}
 }
 
-// SubmitTask はタスクをキューに追加します
+// SubmitTask タスクをキューに追加します
 func (tqs *TaskQueueSystem) SubmitTask(task Task) error {
 	tqs.mu.RLock()
 	isShuttingDown := tqs.isShuttingDown
@@ -119,7 +119,7 @@ func (tqs *TaskQueueSystem) SubmitTask(task Task) error {
 	}
 }
 
-// Shutdown はシステムを適切に停止します
+// Shutdown システムを適切に停止します
 func (tqs *TaskQueueSystem) Shutdown(timeout time.Duration) error {
 	tqs.mu.Lock()
 	if tqs.isShuttingDown {
@@ -153,7 +153,7 @@ func (tqs *TaskQueueSystem) Shutdown(timeout time.Duration) error {
 	}
 }
 
-// GetStats は統計情報を取得します
+// GetStats 統計情報を取得します
 func (tqs *TaskQueueSystem) GetStats() (int64, int64, int64, int) {
 	processed := atomic.LoadInt64(&tqs.processedCount)
 	dropped := atomic.LoadInt64(&tqs.droppedCount)
@@ -163,7 +163,7 @@ func (tqs *TaskQueueSystem) GetStats() (int64, int64, int64, int) {
 	return processed, dropped, workers, queueLength
 }
 
-// statsReporter は統計情報を定期的に出力します
+// statsReporter 統計情報を定期的に出力します
 func (tqs *TaskQueueSystem) statsReporter(ctx context.Context) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()

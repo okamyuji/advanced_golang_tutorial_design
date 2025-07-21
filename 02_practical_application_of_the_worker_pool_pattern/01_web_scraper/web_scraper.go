@@ -277,7 +277,7 @@ func (ws *WebScraper) updateStats(result ScrapingResult) {
 		(int64(ws.stats.averageLatency)*totalRequests + int64(result.Duration)) / (totalRequests + 1))
 }
 
-// statsReporter は統計を定期的に報告します
+// statsReporter 統計を定期的に報告します
 func (ws *WebScraper) statsReporter() {
 	defer ws.wg.Done()
 
@@ -294,7 +294,7 @@ func (ws *WebScraper) statsReporter() {
 	}
 }
 
-// printStat は統計を出力します
+// printStat 統計を出力します
 func (ws *WebScraper) printStats() {
 	ws.stats.mu.RLock()
 	defer ws.stats.mu.RUnlock()

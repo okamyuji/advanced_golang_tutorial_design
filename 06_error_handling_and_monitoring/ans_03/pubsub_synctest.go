@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-// Message はパブリッシュ・サブスクライブシステムのメッセージです
+// Message パブリッシュ・サブスクライブシステムのメッセージです
 type Message struct {
 	ID        string      `json:"id"`
 	Topic     string      `json:"topic"`
@@ -19,13 +19,13 @@ type Message struct {
 	Sequence  uint64      `json:"sequence"`
 }
 
-// MessageHandler はメッセージハンドラーのインターフェースです
+// MessageHandler メッセージハンドラーのインターフェースです
 type MessageHandler interface {
 	Handle(msg Message) error
 	Name() string
 }
 
-// PubSubConfig はパブリッシュ・サブスクライブシステムの設定です
+// PubSubConfig パブリッシュ・サブスクライブシステムの設定です
 type PubSubConfig struct {
 	BufferSize              int
 	MaxRetries              int
@@ -35,7 +35,7 @@ type PubSubConfig struct {
 	EnableDeliveryGuarantee bool // 配信保証を有効にするか
 }
 
-// PubSubSystem はパブリッシュ・サブスクライブシステムです
+// PubSubSystem パブリッシュ・サブスクライブシステムです
 type PubSubSystem struct {
 	config        PubSubConfig
 	topics        map[string]*Topic
@@ -48,7 +48,7 @@ type PubSubSystem struct {
 	cancel        context.CancelFunc
 }
 
-// Topic はトピックを表します
+// Topic トピックを表します
 type Topic struct {
 	name         string
 	messageChan  chan Message
@@ -57,7 +57,7 @@ type Topic struct {
 	mutex        sync.RWMutex
 }
 
-// Subscriber はサブスクライバーを表します
+// Subscriber サブスクライバーを表します
 type Subscriber struct {
 	id              string
 	topic           string
@@ -73,7 +73,7 @@ type Subscriber struct {
 	mutex           sync.RWMutex
 }
 
-// NewPubSubSystem は新しいパブリッシュ・サブスクライブシステムを作成します
+// NewPubSubSystem 新しいパブリッシュ・サブスクライブシステムを作成します
 func NewPubSubSystem(config PubSubConfig) *PubSubSystem {
 	if config.BufferSize == 0 {
 		config.BufferSize = 1000
@@ -97,7 +97,7 @@ func NewPubSubSystem(config PubSubConfig) *PubSubSystem {
 	}
 }
 
-// Start はシステムを開始します
+// Start システムを開始します
 func (ps *PubSubSystem) Start() error {
 	if !atomic.CompareAndSwapInt64(&ps.isRunning, 0, 1) {
 		return fmt.Errorf("pubsub system is already running")
@@ -107,7 +107,7 @@ func (ps *PubSubSystem) Start() error {
 	return nil
 }
 
-// Stop はシステムを停止します
+// Stop システムを停止します
 func (ps *PubSubSystem) Stop() error {
 	if !atomic.CompareAndSwapInt64(&ps.isRunning, 1, 0) {
 		return fmt.Errorf("pubsub system is not running")
@@ -130,7 +130,7 @@ func (ps *PubSubSystem) Stop() error {
 	return nil
 }
 
-// CreateTopic はトピックを作成します
+// CreateTopic トピックを作成します
 func (ps *PubSubSystem) CreateTopic(topicName string) error {
 	ps.mutex.Lock()
 	defer ps.mutex.Unlock()
@@ -155,7 +155,7 @@ func (ps *PubSubSystem) CreateTopic(topicName string) error {
 	return nil
 }
 
-// Subscribe はトピックをサブスクライブします
+// Subscribe トピックをサブスクライブします
 func (ps *PubSubSystem) Subscribe(topicName, subscriberID string, handler MessageHandler) (*Subscriber, error) {
 	ps.mutex.Lock()
 	defer ps.mutex.Unlock()
@@ -194,7 +194,7 @@ func (ps *PubSubSystem) Subscribe(topicName, subscriberID string, handler Messag
 	return subscriber, nil
 }
 
-// Publish はメッセージをパブリッシュします
+// Publish メッセージをパブリッシュします
 func (ps *PubSubSystem) Publish(topicName string, payload interface{}) error {
 	ps.mutex.RLock()
 	topic, exists := ps.topics[topicName]
@@ -228,7 +228,7 @@ func (ps *PubSubSystem) Publish(topicName string, payload interface{}) error {
 	}
 }
 
-// processTopicMessages はトピックメッセージを処理します
+// processTopicMessages トピックメッセージを処理します
 func (ps *PubSubSystem) processTopicMessages(topic *Topic) {
 	for {
 		select {
@@ -240,7 +240,7 @@ func (ps *PubSubSystem) processTopicMessages(topic *Topic) {
 	}
 }
 
-// distributeMessage はメッセージを配信します
+// distributeMessage メッセージを配信します
 func (ps *PubSubSystem) distributeMessage(topic *Topic, message Message) {
 	topic.mutex.RLock()
 	subscribers := make([]*Subscriber, 0, len(topic.subscribers))
@@ -263,7 +263,7 @@ func (ps *PubSubSystem) distributeMessage(topic *Topic, message Message) {
 	}
 }
 
-// processOrderedMessages は順序保証付きでメッセージを処理します
+// processOrderedMessages 順序保証付きでメッセージを処理します
 func (ps *PubSubSystem) processOrderedMessages(topic *Topic, subscribers []*Subscriber) {
 	for len(topic.messageQueue) > 0 {
 		message := topic.messageQueue[0]
@@ -291,7 +291,7 @@ func (ps *PubSubSystem) processOrderedMessages(topic *Topic, subscribers []*Subs
 	}
 }
 
-// deliverToSubscriber はサブスクライバーにメッセージを配信します
+// deliverToSubscriber サブスクライバーにメッセージを配信します
 func (ps *PubSubSystem) deliverToSubscriber(subscriber *Subscriber, message Message) {
 	// 重複排除チェック
 	if ps.config.EnableDuplication {
@@ -316,7 +316,7 @@ func (ps *PubSubSystem) deliverToSubscriber(subscriber *Subscriber, message Mess
 	}
 }
 
-// Start はサブスクライバーを開始します
+// Start サブスクライバーを開始します
 func (s *Subscriber) Start() error {
 	if !atomic.CompareAndSwapInt64(&s.isRunning, 0, 1) {
 		return fmt.Errorf("subscriber %s is already running", s.id)
@@ -328,7 +328,7 @@ func (s *Subscriber) Start() error {
 	return nil
 }
 
-// Stop はサブスクライバーを停止します
+// Stop サブスクライバーを停止します
 func (s *Subscriber) Stop() error {
 	if !atomic.CompareAndSwapInt64(&s.isRunning, 1, 0) {
 		return fmt.Errorf("subscriber %s is not running", s.id)
@@ -338,7 +338,7 @@ func (s *Subscriber) Stop() error {
 	return nil
 }
 
-// processMessages はメッセージを処理します
+// processMessages メッセージを処理します
 func (s *Subscriber) processMessages() {
 	for {
 		select {
@@ -350,7 +350,7 @@ func (s *Subscriber) processMessages() {
 	}
 }
 
-// handleMessage はメッセージを処理します
+// handleMessage メッセージを処理します
 func (s *Subscriber) handleMessage(message Message) {
 	// 重複排除
 	s.mutex.Lock()
@@ -378,7 +378,7 @@ func (s *Subscriber) handleMessage(message Message) {
 	}
 }
 
-// processAcknowledgments は配信確認を処理します
+// processAcknowledgments 配信確認を処理します
 func (s *Subscriber) processAcknowledgments() {
 	for {
 		select {
@@ -392,7 +392,7 @@ func (s *Subscriber) processAcknowledgments() {
 	}
 }
 
-// GetProcessedMessages は処理済みメッセージIDリストを取得します
+// GetProcessedMessages 処理済みメッセージIDリストを取得します
 func (s *Subscriber) GetProcessedMessages() []string {
 	s.mutex.RLock()
 	defer s.mutex.RUnlock()
@@ -404,7 +404,7 @@ func (s *Subscriber) GetProcessedMessages() []string {
 	return messages
 }
 
-// GetPendingMessages はペンディングメッセージを取得します
+// GetPendingMessages ペンディングメッセージを取得します
 func (s *Subscriber) GetPendingMessages() []Message {
 	s.mutex.RLock()
 	defer s.mutex.RUnlock()
@@ -416,7 +416,7 @@ func (s *Subscriber) GetPendingMessages() []Message {
 	return messages
 }
 
-// TestMessageHandler はテスト用のメッセージハンドラーです
+// TestMessageHandler テスト用のメッセージハンドラーです
 type TestMessageHandler struct {
 	name            string
 	processedMsgs   []Message

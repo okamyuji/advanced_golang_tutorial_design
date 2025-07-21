@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-// Metric は単一のメトリクスデータポイントを表します
+// Metric 単一のメトリクスデータポイントを表します
 type Metric struct {
 	Name      string                 `json:"name"`
 	Value     float64                `json:"value"`
@@ -23,13 +23,13 @@ type Metric struct {
 	Metadata  map[string]interface{} `json:"metadata,omitempty"`
 }
 
-// TimeSeriesPoint は時系列データポイントを表します
+// TimeSeriesPoint 時系列データポイントを表します
 type TimeSeriesPoint struct {
 	Timestamp time.Time `json:"timestamp"`
 	Value     float64   `json:"value"`
 }
 
-// TimeSeries は時系列データを表します
+// TimeSeries 時系列データを表します
 type TimeSeries struct {
 	Name       string                 `json:"name"`
 	Points     []TimeSeriesPoint      `json:"points"`
@@ -38,14 +38,14 @@ type TimeSeries struct {
 	LastUpdate time.Time              `json:"last_update"`
 }
 
-// MetricsCollector はメトリクス収集インターフェースです
+// MetricsCollector メトリクス収集インターフェースです
 type MetricsCollector interface {
 	Collect(ctx context.Context) ([]Metric, error)
 	Name() string
 	Interval() time.Duration
 }
 
-// AlertRule はアラートルールを表します
+// AlertRule アラートルールを表します
 type AlertRule struct {
 	Name        string                 `json:"name"`
 	MetricName  string                 `json:"metric_name"`
@@ -59,7 +59,7 @@ type AlertRule struct {
 	Metadata    map[string]interface{} `json:"metadata,omitempty"`
 }
 
-// TimeSeriesStore は時系列データを格納します
+// TimeSeriesStore 時系列データを格納します
 type TimeSeriesStore struct {
 	series          map[string]*TimeSeries
 	maxDataPoints   int
@@ -67,7 +67,7 @@ type TimeSeriesStore struct {
 	mutex           sync.RWMutex
 }
 
-// NewTimeSeriesStore は新しい時系列ストアを作成します
+// NewTimeSeriesStore 新しい時系列ストアを作成します
 func NewTimeSeriesStore(maxDataPoints int, retentionPeriod time.Duration) *TimeSeriesStore {
 	return &TimeSeriesStore{
 		series:          make(map[string]*TimeSeries),
@@ -76,7 +76,7 @@ func NewTimeSeriesStore(maxDataPoints int, retentionPeriod time.Duration) *TimeS
 	}
 }
 
-// Store はメトリクスを格納します
+// Store メトリクスを格納します
 func (tss *TimeSeriesStore) Store(metrics []Metric) {
 	tss.mutex.Lock()
 	defer tss.mutex.Unlock()
@@ -126,7 +126,7 @@ func (tss *TimeSeriesStore) Store(metrics []Metric) {
 	tss.cleanupOldData()
 }
 
-// Query は時系列データを検索します
+// Query 時系列データを検索します
 func (tss *TimeSeriesStore) Query(metricName string, tags map[string]string, start, end time.Time) []TimeSeries {
 	tss.mutex.RLock()
 	defer tss.mutex.RUnlock()
@@ -166,7 +166,7 @@ func (tss *TimeSeriesStore) Query(metricName string, tags map[string]string, sta
 	return result
 }
 
-// GetAllMetrics は全メトリクス名を取得します
+// GetAllMetrics 全メトリクス名を取得します
 func (tss *TimeSeriesStore) GetAllMetrics() []string {
 	tss.mutex.RLock()
 	defer tss.mutex.RUnlock()
@@ -185,7 +185,7 @@ func (tss *TimeSeriesStore) GetAllMetrics() []string {
 	return metrics
 }
 
-// getSeriesKey はシリーズキーを生成します
+// getSeriesKey シリーズキーを生成します
 func (tss *TimeSeriesStore) getSeriesKey(name string, tags map[string]string) string {
 	key := name
 	if tags != nil {
@@ -201,7 +201,7 @@ func (tss *TimeSeriesStore) getSeriesKey(name string, tags map[string]string) st
 	return key
 }
 
-// matchTags はタグがマッチするかチェックします
+// matchTags タグがマッチするかチェックします
 func (tss *TimeSeriesStore) matchTags(seriesTags, queryTags map[string]string) bool {
 	if queryTags == nil {
 		return true
@@ -215,7 +215,7 @@ func (tss *TimeSeriesStore) matchTags(seriesTags, queryTags map[string]string) b
 	return true
 }
 
-// cleanupOldData は古いデータを削除します
+// cleanupOldData 古いデータを削除します
 func (tss *TimeSeriesStore) cleanupOldData() {
 	cutoff := time.Now().Add(-tss.retentionPeriod)
 
@@ -230,7 +230,7 @@ func (tss *TimeSeriesStore) cleanupOldData() {
 	}
 }
 
-// MonitoringDashboard はリアルタイム監視ダッシュボードです
+// MonitoringDashboard リアルタイム監視ダッシュボードです
 type MonitoringDashboard struct {
 	metricsCollectors map[string]MetricsCollector
 	alertRules        []AlertRule
@@ -252,7 +252,7 @@ type MonitoringDashboard struct {
 	activeAlerts map[string]time.Time
 }
 
-// NewMonitoringDashboard は新しい監視ダッシュボードを作成します
+// NewMonitoringDashboard 新しい監視ダッシュボードを作成します
 func NewMonitoringDashboard(updateInterval, retentionPeriod time.Duration, maxDataPoints int) *MonitoringDashboard {
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -269,19 +269,19 @@ func NewMonitoringDashboard(updateInterval, retentionPeriod time.Duration, maxDa
 	}
 }
 
-// AddCollector はメトリクスコレクターを追加します
+// AddCollector メトリクスコレクターを追加します
 func (md *MonitoringDashboard) AddCollector(collector MetricsCollector) {
 	md.metricsCollectors[collector.Name()] = collector
 }
 
-// AddAlertRule はアラートルールを追加します
+// AddAlertRule アラートルールを追加します
 func (md *MonitoringDashboard) AddAlertRule(rule AlertRule) {
 	md.mutex.Lock()
 	defer md.mutex.Unlock()
 	md.alertRules = append(md.alertRules, rule)
 }
 
-// Start は監視ダッシュボードを開始します
+// Start 監視ダッシュボードを開始します
 func (md *MonitoringDashboard) Start(port int) error {
 	if !atomic.CompareAndSwapInt64(&md.isRunning, 0, 1) {
 		return fmt.Errorf("monitoring dashboard is already running")
@@ -316,7 +316,7 @@ func (md *MonitoringDashboard) Start(port int) error {
 	return nil
 }
 
-// Stop は監視ダッシュボードを停止します
+// Stop 監視ダッシュボードを停止します
 func (md *MonitoringDashboard) Stop() error {
 	if !atomic.CompareAndSwapInt64(&md.isRunning, 1, 0) {
 		return fmt.Errorf("monitoring dashboard is not running")
@@ -341,7 +341,7 @@ func (md *MonitoringDashboard) Stop() error {
 	return nil
 }
 
-// collectAndDistribute はメトリクス収集と配信を行います
+// collectAndDistribute メトリクス収集と配信を行います
 func (md *MonitoringDashboard) collectAndDistribute() {
 	ticker := time.NewTicker(md.updateInterval)
 	defer ticker.Stop()
@@ -356,7 +356,7 @@ func (md *MonitoringDashboard) collectAndDistribute() {
 	}
 }
 
-// performCollection はメトリクス収集を実行します
+// performCollection メトリクス収集を実行します
 func (md *MonitoringDashboard) performCollection() {
 	atomic.AddInt64(&md.totalCollections, 1)
 
@@ -394,7 +394,7 @@ func (md *MonitoringDashboard) performCollection() {
 	md.aggregateAndStore(metricsChan)
 }
 
-// aggregateAndStore はメトリクスを集約して保存します
+// aggregateAndStore メトリクスを集約して保存します
 func (md *MonitoringDashboard) aggregateAndStore(metricsChan chan []Metric) {
 	var allMetrics []Metric
 
@@ -408,7 +408,7 @@ func (md *MonitoringDashboard) aggregateAndStore(metricsChan chan []Metric) {
 	}
 }
 
-// evaluateAlerts はアラートルールを評価します
+// evaluateAlerts アラートルールを評価します
 func (md *MonitoringDashboard) evaluateAlerts() {
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
@@ -423,7 +423,7 @@ func (md *MonitoringDashboard) evaluateAlerts() {
 	}
 }
 
-// checkAlertRules はアラートルールをチェックします
+// checkAlertRules アラートルールをチェックします
 func (md *MonitoringDashboard) checkAlertRules() {
 	md.mutex.RLock()
 	rules := make([]AlertRule, len(md.alertRules))
@@ -439,7 +439,7 @@ func (md *MonitoringDashboard) checkAlertRules() {
 	}
 }
 
-// evaluateRule は単一のアラートルールを評価します
+// evaluateRule 単一のアラートルールを評価します
 func (md *MonitoringDashboard) evaluateRule(rule AlertRule) {
 	// 最近のメトリクスデータを取得
 	end := time.Now()
@@ -464,7 +464,7 @@ func (md *MonitoringDashboard) evaluateRule(rule AlertRule) {
 	}
 }
 
-// getLatestValue は最新の値を取得します
+// getLatestValue 最新の値を取得します
 func (md *MonitoringDashboard) getLatestValue(series []TimeSeries) float64 {
 	if len(series) == 0 {
 		return math.NaN()
@@ -485,7 +485,7 @@ func (md *MonitoringDashboard) getLatestValue(series []TimeSeries) float64 {
 	return latestValue
 }
 
-// checkCondition は条件をチェックします
+// checkCondition 条件をチェックします
 func (md *MonitoringDashboard) checkCondition(condition string, value, threshold float64) bool {
 	switch condition {
 	case "gt":
@@ -503,7 +503,7 @@ func (md *MonitoringDashboard) checkCondition(condition string, value, threshold
 	}
 }
 
-// fireAlert はアラートを発火します
+// fireAlert アラートを発火します
 func (md *MonitoringDashboard) fireAlert(rule AlertRule, value float64) {
 	// 重複アラートを防ぐ
 	alertKey := fmt.Sprintf("%s_%s", rule.Name, rule.MetricName)
@@ -520,7 +520,7 @@ func (md *MonitoringDashboard) fireAlert(rule AlertRule, value float64) {
 		rule.Severity, rule.Description, value, rule.Threshold)
 }
 
-// setupRoutes はHTTPルートを設定します
+// setupRoutes HTTPルートを設定します
 func (md *MonitoringDashboard) setupRoutes(mux *http.ServeMux) {
 	// メトリクス一覧API
 	mux.HandleFunc("/api/metrics", md.handleMetrics)
@@ -541,7 +541,7 @@ func (md *MonitoringDashboard) setupRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/", md.handleDashboard)
 }
 
-// handleMetrics はメトリクス一覧を返します
+// handleMetrics メトリクス一覧を返します
 func (md *MonitoringDashboard) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	metrics := md.dataStore.GetAllMetrics()
 
@@ -554,7 +554,7 @@ func (md *MonitoringDashboard) handleMetrics(w http.ResponseWriter, r *http.Requ
 	}
 }
 
-// handleQuery は時系列データクエリを処理します
+// handleQuery 時系列データクエリを処理します
 func (md *MonitoringDashboard) handleQuery(w http.ResponseWriter, r *http.Request) {
 	metricName := r.URL.Query().Get("metric")
 	if metricName == "" {
@@ -592,7 +592,7 @@ func (md *MonitoringDashboard) handleQuery(w http.ResponseWriter, r *http.Reques
 	}
 }
 
-// handleAlerts はアラート情報を返します
+// handleAlerts アラート情報を返します
 func (md *MonitoringDashboard) handleAlerts(w http.ResponseWriter, r *http.Request) {
 	md.mutex.RLock()
 	rules := make([]AlertRule, len(md.alertRules))
@@ -609,7 +609,7 @@ func (md *MonitoringDashboard) handleAlerts(w http.ResponseWriter, r *http.Reque
 	}
 }
 
-// handleStats はダッシュボード統計を返します
+// handleStats ダッシュボード統計を返します
 func (md *MonitoringDashboard) handleStats(w http.ResponseWriter, r *http.Request) {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
@@ -632,7 +632,7 @@ func (md *MonitoringDashboard) handleStats(w http.ResponseWriter, r *http.Reques
 	}
 }
 
-// handleHealth はヘルスチェックを処理します
+// handleHealth ヘルスチェックを処理します
 func (md *MonitoringDashboard) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -644,7 +644,7 @@ func (md *MonitoringDashboard) handleHealth(w http.ResponseWriter, r *http.Reque
 	}
 }
 
-// handleDashboard はダッシュボードページを表示します
+// handleDashboard ダッシュボードページを表示します
 func (md *MonitoringDashboard) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	html := `
 <!DOCTYPE html>
@@ -727,7 +727,7 @@ func (md *MonitoringDashboard) handleDashboard(w http.ResponseWriter, r *http.Re
 	}
 }
 
-// SystemMetricsCollector はシステムメトリクスを収集します
+// SystemMetricsCollector システムメトリクスを収集します
 type SystemMetricsCollector struct {
 	interval time.Duration
 }

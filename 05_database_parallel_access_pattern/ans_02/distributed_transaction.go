@@ -15,7 +15,7 @@ import (
 // 分散トランザクション処理システム
 // 複数テーブル（注文、在庫、決済）にまたがる処理を2フェーズコミットで実装
 
-// TransactionCoordinator は分散トランザクションコーディネーター
+// TransactionCoordinator 分散トランザクションコーディネーター
 type TransactionCoordinator struct {
 	db              *sql.DB
 	timeout         time.Duration
@@ -24,7 +24,7 @@ type TransactionCoordinator struct {
 	metrics         *DistributedTxMetrics
 }
 
-// ParticipantManager は分散トランザクション参加者
+// ParticipantManager 分散トランザクション参加者
 type ParticipantManager interface {
 	Prepare(ctx context.Context, tx *sql.Tx, data interface{}) error
 	Commit(ctx context.Context, tx *sql.Tx, data interface{}) error
@@ -32,7 +32,7 @@ type ParticipantManager interface {
 	GetName() string
 }
 
-// OrderData は注文データ
+// OrderData 注文データ
 type OrderData struct {
 	OrderID     string    `json:"order_id"`
 	CustomerID  int64     `json:"customer_id"`
@@ -42,7 +42,7 @@ type OrderData struct {
 	CreatedAt   time.Time `json:"created_at"`
 }
 
-// DistributedTransaction は分散トランザクション
+// DistributedTransaction 分散トランザクション
 type DistributedTransaction struct {
 	ID           string
 	Participants []string
@@ -52,7 +52,7 @@ type DistributedTransaction struct {
 	UpdatedAt    time.Time
 }
 
-// TransactionStatus はトランザクション状態
+// TransactionStatus トランザクション状態
 type TransactionStatus string
 
 const (
@@ -62,7 +62,7 @@ const (
 	StatusAborted   TransactionStatus = "ABORTED"
 )
 
-// DistributedTxMetrics は分散トランザクションメトリクス
+// DistributedTxMetrics 分散トランザクションメトリクス
 type DistributedTxMetrics struct {
 	mu                sync.RWMutex
 	totalTransactions int64
@@ -73,7 +73,7 @@ type DistributedTxMetrics struct {
 	timeouts          int64
 }
 
-// DistributedTxMetricsSnapshot はメトリクスのスナップショット（mutex無し）
+// DistributedTxMetricsSnapshot メトリクスのスナップショット（mutex無し）
 type DistributedTxMetricsSnapshot struct {
 	TotalTransactions int64 `json:"total_transactions"`
 	CommittedTx       int64 `json:"committed_tx"`
@@ -91,7 +91,7 @@ var (
 	ErrParticipantNotFound = errors.New("participant not found")
 )
 
-// NewTransactionCoordinator は新しい分散トランザクションコーディネーターを作成
+// NewTransactionCoordinator 新しい分散トランザクションコーディネーターを作成
 func NewTransactionCoordinator(db *sql.DB) *TransactionCoordinator {
 	coordinator := &TransactionCoordinator{
 		db:              db,
@@ -109,12 +109,12 @@ func NewTransactionCoordinator(db *sql.DB) *TransactionCoordinator {
 	return coordinator
 }
 
-// RegisterParticipant は参加者を登録
+// RegisterParticipant 参加者を登録
 func (tc *TransactionCoordinator) RegisterParticipant(pm ParticipantManager) {
 	tc.participantMgrs[pm.GetName()] = pm
 }
 
-// ExecuteDistributedTransaction は分散トランザクションを実行
+// ExecuteDistributedTransaction 分散トランザクションを実行
 func (tc *TransactionCoordinator) ExecuteDistributedTransaction(ctx context.Context, data *OrderData) error {
 	tc.metrics.incrementTotalTransactions()
 
@@ -153,7 +153,7 @@ func (tc *TransactionCoordinator) ExecuteDistributedTransaction(ctx context.Cont
 	return nil
 }
 
-// executeTwoPhaseCommit は2フェーズコミットを実行
+// executeTwoPhaseCommit 2フェーズコミットを実行
 func (tc *TransactionCoordinator) executeTwoPhaseCommit(ctx context.Context, txID string, data *OrderData) error {
 	// Phase 1: Prepare Phase
 	log.Printf("Phase 1: Prepare phase for transaction %s", txID)
@@ -226,7 +226,7 @@ func (tc *TransactionCoordinator) executeTwoPhaseCommit(ctx context.Context, txI
 	return nil
 }
 
-// rollbackAll はすべてのトランザクションをロールバック
+// rollbackAll すべてのトランザクションをロールバック
 func (tc *TransactionCoordinator) rollbackAll(txs map[string]*sql.Tx, data *OrderData) {
 	for name, tx := range txs {
 		participant := tc.participantMgrs[name]
@@ -243,13 +243,13 @@ func (tc *TransactionCoordinator) rollbackAll(txs map[string]*sql.Tx, data *Orde
 	}
 }
 
-// forceRollbackAll は強制的にすべてをロールバック
+// forceRollbackAll 強制的にすべてをロールバック
 func (tc *TransactionCoordinator) forceRollbackAll(txs map[string]*sql.Tx, data *OrderData, failedParticipant string) {
 	log.Printf("Force rollback initiated due to failure in %s", failedParticipant)
 	tc.rollbackAll(txs, data)
 }
 
-// OrderManager は注文管理参加者
+// OrderManager 注文管理参加者
 type OrderManager struct{}
 
 func (om *OrderManager) GetName() string { return "order" }
@@ -305,7 +305,7 @@ func (om *OrderManager) Rollback(ctx context.Context, tx *sql.Tx, data interface
 	return nil
 }
 
-// InventoryManager は在庫管理参加者
+// InventoryManager 在庫管理参加者
 type InventoryManager struct{}
 
 func (im *InventoryManager) GetName() string { return "inventory" }
@@ -381,7 +381,7 @@ func (im *InventoryManager) Rollback(ctx context.Context, tx *sql.Tx, data inter
 	return nil
 }
 
-// PaymentManager は決済管理参加者
+// PaymentManager 決済管理参加者
 type PaymentManager struct{}
 
 func (pm *PaymentManager) GetName() string { return "payment" }
@@ -518,7 +518,7 @@ func (m *DistributedTxMetrics) incrementCommitFailures() {
 	m.commitFailures++
 }
 
-// GetMetrics はメトリクスを取得
+// GetMetrics メトリクスを取得
 func (tc *TransactionCoordinator) GetMetrics() DistributedTxMetricsSnapshot {
 	tc.metrics.mu.RLock()
 	defer tc.metrics.mu.RUnlock()

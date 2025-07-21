@@ -16,7 +16,7 @@ import (
 	"time"
 )
 
-// RateLimitRequest はレート制限チェック要求です
+// RateLimitRequest レート制限チェック要求です
 type RateLimitRequest struct {
 	ClientID    string
 	APIKey      string
@@ -28,7 +28,7 @@ type RateLimitRequest struct {
 	RequestTime time.Time
 }
 
-// RateLimitResult はレート制限チェック結果です
+// RateLimitResult レート制限チェック結果です
 type RateLimitResult struct {
 	Allowed        bool
 	Remaining      int64
@@ -41,7 +41,7 @@ type RateLimitResult struct {
 	BurstAvailable int64
 }
 
-// RateLimitRule はレート制限ルールです
+// RateLimitRule レート制限ルールです
 type RateLimitRule struct {
 	Name        string
 	Limit       int64
@@ -54,7 +54,7 @@ type RateLimitRule struct {
 	Priority    int
 }
 
-// ClientBucket はクライアント用バケットです
+// ClientBucket クライアント用バケットです
 type ClientBucket struct {
 	ClientID string
 	APIKey   string
@@ -76,7 +76,7 @@ type ClientBucket struct {
 	mu sync.RWMutex
 }
 
-// APIRateLimiter はAPI並行レート制限システムです
+// APIRateLimiter API並行レート制限システムです
 type APIRateLimiter struct {
 	// 設定
 	config *LimiterConfig
@@ -111,21 +111,21 @@ type APIRateLimiter struct {
 	startTime time.Time
 }
 
-// RateLimitContext はレート制限コンテキストです
+// RateLimitContext レート制限コンテキストです
 type RateLimitContext struct {
 	Request      *RateLimitRequest
 	ResponseChan chan *RateLimitResult
 	StartTime    time.Time
 }
 
-// RateLimitWorker はレート制限ワーカーです
+// RateLimitWorker レート制限ワーカーです
 type RateLimitWorker struct {
 	ID      int
 	limiter *APIRateLimiter
 	stats   *WorkerStats
 }
 
-// LimiterStats はリミッター統計です
+// LimiterStats リミッター統計です
 type LimiterStats struct {
 	mu                sync.RWMutex
 	totalRequests     int64
@@ -138,7 +138,7 @@ type LimiterStats struct {
 	startTime         time.Time
 }
 
-// WorkerStats はワーカー統計です
+// WorkerStats ワーカー統計です
 type WorkerStats struct {
 	WorkerID           int
 	ProcessedRequests  int64
@@ -148,7 +148,7 @@ type WorkerStats struct {
 	AverageProcessTime time.Duration
 }
 
-// EndpointStats はエンドポイント統計です
+// EndpointStats エンドポイント統計です
 type EndpointStats struct {
 	Endpoint        string
 	TotalRequests   int64
@@ -157,7 +157,7 @@ type EndpointStats struct {
 	BlockRate       float64
 }
 
-// TierStats はユーザーティア統計です
+// TierStats ユーザーティア統計です
 type TierStats struct {
 	Tier            string
 	TotalRequests   int64
@@ -166,7 +166,7 @@ type TierStats struct {
 	ActiveClients   int64
 }
 
-// LimiterConfig はリミッター設定です
+// LimiterConfig リミッター設定です
 type LimiterConfig struct {
 	WorkerCount       int
 	RequestBufferSize int
@@ -177,7 +177,7 @@ type LimiterConfig struct {
 	MetricsInterval   time.Duration
 }
 
-// NewLimiterConfig はデフォルト設定を作成します
+// NewLimiterConfig デフォルト設定を作成します
 func NewLimiterConfig() *LimiterConfig {
 	return &LimiterConfig{
 		WorkerCount:       4,
@@ -190,7 +190,7 @@ func NewLimiterConfig() *LimiterConfig {
 	}
 }
 
-// getDefaultRateLimitRules はデフォルトレート制限ルールを取得します
+// getDefaultRateLimitRules デフォルトレート制限ルールを取得します
 func getDefaultRateLimitRules() []*RateLimitRule {
 	return []*RateLimitRule{
 		{
@@ -241,7 +241,7 @@ func getDefaultRateLimitRules() []*RateLimitRule {
 	}
 }
 
-// NewAPIRateLimiter は新しいAPIレート制限システムを作成します
+// NewAPIRateLimiter 新しいAPIレート制限システムを作成します
 func NewAPIRateLimiter(config *LimiterConfig) *APIRateLimiter {
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -283,7 +283,7 @@ func NewAPIRateLimiter(config *LimiterConfig) *APIRateLimiter {
 	return limiter
 }
 
-// AddRule はレート制限ルールを追加します
+// AddRule レート制限ルールを追加します
 func (arl *APIRateLimiter) AddRule(rule *RateLimitRule) {
 	arl.rulesMu.Lock()
 	defer arl.rulesMu.Unlock()
@@ -299,7 +299,7 @@ func (arl *APIRateLimiter) AddRule(rule *RateLimitRule) {
 		rule.Name, rule.Priority, rule.Limit, rule.Window)
 }
 
-// Start はレート制限システムを開始します
+// Start レート制限システムを開始します
 func (arl *APIRateLimiter) Start() error {
 	if !atomic.CompareAndSwapInt32(&arl.isRunning, 0, 1) {
 		return fmt.Errorf("limiter is already running")
@@ -334,7 +334,7 @@ func (arl *APIRateLimiter) Start() error {
 	return nil
 }
 
-// CheckRateLimit はレート制限をチェックします
+// CheckRateLimit レート制限をチェックします
 func (arl *APIRateLimiter) CheckRateLimit(request *RateLimitRequest) (*RateLimitResult, error) {
 	if atomic.LoadInt32(&arl.isRunning) == 0 {
 		return nil, fmt.Errorf("limiter is not running")
@@ -370,7 +370,7 @@ func (arl *APIRateLimiter) CheckRateLimit(request *RateLimitRequest) (*RateLimit
 	}
 }
 
-// run はワーカーのメインループです
+// run ワーカーのメインループです
 func (rlw *RateLimitWorker) run() {
 	defer rlw.limiter.wg.Done()
 
@@ -402,7 +402,7 @@ func (rlw *RateLimitWorker) run() {
 	}
 }
 
-// processRateLimitCheck はレート制限チェックを処理します
+// processRateLimitCheck レート制限チェックを処理します
 func (rlw *RateLimitWorker) processRateLimitCheck(rateLimitCtx *RateLimitContext) *RateLimitResult {
 	start := time.Now()
 	request := rateLimitCtx.Request
@@ -447,7 +447,7 @@ func (rlw *RateLimitWorker) processRateLimitCheck(rateLimitCtx *RateLimitContext
 	return result
 }
 
-// findApplicableRule は適用可能なルールを見つけます
+// findApplicableRule 適用可能なルールを見つけます
 func (rlw *RateLimitWorker) findApplicableRule(request *RateLimitRequest) *RateLimitRule {
 	rlw.limiter.rulesMu.RLock()
 	defer rlw.limiter.rulesMu.RUnlock()
@@ -461,7 +461,7 @@ func (rlw *RateLimitWorker) findApplicableRule(request *RateLimitRequest) *RateL
 	return nil
 }
 
-// ruleMatches はルールがリクエストに適用可能かチェックします
+// ruleMatches ルールがリクエストに適用可能かチェックします
 func (rlw *RateLimitWorker) ruleMatches(rule *RateLimitRule, request *RateLimitRequest) bool {
 	// ユーザーティアチェック
 	if len(rule.UserTiers) > 0 {
@@ -508,7 +508,7 @@ func (rlw *RateLimitWorker) ruleMatches(rule *RateLimitRule, request *RateLimitR
 	return true
 }
 
-// endpointMatches はエンドポイントがパターンにマッチするかチェックします
+// endpointMatches エンドポイントがパターンにマッチするかチェックします
 func (rlw *RateLimitWorker) endpointMatches(pattern, endpoint string) bool {
 	// 簡単なワイルドカードマッチング
 	if strings.Contains(pattern, "*") {
@@ -521,7 +521,7 @@ func (rlw *RateLimitWorker) endpointMatches(pattern, endpoint string) bool {
 	return pattern == endpoint
 }
 
-// getOrCreateBucket はクライアントバケットを取得または作成します
+// getOrCreateBucket クライアントバケットを取得または作成します
 func (arl *APIRateLimiter) getOrCreateBucket(clientID, apiKey, userTier string) *ClientBucket {
 	bucketKey := fmt.Sprintf("%s:%s", clientID, apiKey)
 
@@ -557,7 +557,7 @@ func (arl *APIRateLimiter) getOrCreateBucket(clientID, apiKey, userTier string) 
 	return bucket
 }
 
-// checkRateLimit はレート制限をチェックします
+// checkRateLimit レート制限をチェックします
 func (rlw *RateLimitWorker) checkRateLimit(bucket *ClientBucket, rule *RateLimitRule, request *RateLimitRequest) *RateLimitResult {
 	bucket.mu.Lock()
 	defer bucket.mu.Unlock()
@@ -629,7 +629,7 @@ func (rlw *RateLimitWorker) checkRateLimit(bucket *ClientBucket, rule *RateLimit
 	}
 }
 
-// updateProcessingTime は処理時間を更新します
+// updateProcessingTime 処理時間を更新します
 func (rlw *RateLimitWorker) updateProcessingTime(duration time.Duration) {
 	rlw.stats.TotalProcessTime += duration
 
@@ -638,7 +638,7 @@ func (rlw *RateLimitWorker) updateProcessingTime(duration time.Duration) {
 	}
 }
 
-// updateAllowedStats は許可統計を更新します
+// updateAllowedStats 許可統計を更新します
 func (arl *APIRateLimiter) updateAllowedStats(request *RateLimitRequest) {
 	arl.stats.mu.Lock()
 	defer arl.stats.mu.Unlock()
@@ -669,7 +669,7 @@ func (arl *APIRateLimiter) updateAllowedStats(request *RateLimitRequest) {
 	tierStat.AllowedRequests++
 }
 
-// updateBlockedStats はブロック統計を更新します
+// updateBlockedStats ブロック統計を更新します
 func (arl *APIRateLimiter) updateBlockedStats(request *RateLimitRequest) {
 	arl.stats.mu.Lock()
 	defer arl.stats.mu.Unlock()
@@ -703,7 +703,7 @@ func (arl *APIRateLimiter) updateBlockedStats(request *RateLimitRequest) {
 	tierStat.BlockedRequests++
 }
 
-// handleResults は結果を処理します
+// handleResults 結果を処理します
 func (arl *APIRateLimiter) handleResults() {
 	defer arl.wg.Done()
 
@@ -726,7 +726,7 @@ func (arl *APIRateLimiter) handleResults() {
 	}
 }
 
-// processResult は結果を処理します
+// processResult 結果を処理します
 func (arl *APIRateLimiter) processResult(result *RateLimitResult) {
 	// 平均処理時間を更新
 	// 実際の実装では、より詳細な処理ログやアラート処理を行う
@@ -736,7 +736,7 @@ func (arl *APIRateLimiter) processResult(result *RateLimitResult) {
 	}
 }
 
-// cleanupLoop はクリーンアップループを実行します
+// cleanupLoop クリーンアップループを実行します
 func (arl *APIRateLimiter) cleanupLoop() {
 	defer arl.wg.Done()
 
@@ -756,7 +756,7 @@ func (arl *APIRateLimiter) cleanupLoop() {
 	}
 }
 
-// cleanupBuckets は古いバケットを削除します
+// cleanupBuckets 古いバケットを削除します
 func (arl *APIRateLimiter) cleanupBuckets() {
 	now := time.Now()
 	cutoff := now.Add(-arl.config.BucketTTL)
@@ -783,7 +783,7 @@ func (arl *APIRateLimiter) cleanupBuckets() {
 	}
 }
 
-// monitorMetrics はメトリクスを監視します
+// monitorMetrics メトリクスを監視します
 func (arl *APIRateLimiter) monitorMetrics() {
 	defer arl.wg.Done()
 
@@ -803,7 +803,7 @@ func (arl *APIRateLimiter) monitorMetrics() {
 	}
 }
 
-// reportMetrics はメトリクスを報告します
+// reportMetrics メトリクスを報告します
 func (arl *APIRateLimiter) reportMetrics() {
 	arl.stats.mu.RLock()
 	defer arl.stats.mu.RUnlock()
@@ -847,7 +847,7 @@ func (arl *APIRateLimiter) reportMetrics() {
 	arl.reportTopClients()
 }
 
-// reportTopClients はトップクライアントを報告します
+// reportTopClients トップクライアントを報告します
 func (arl *APIRateLimiter) reportTopClients() {
 	// トップブロッククライアント
 	type clientStat struct {
@@ -875,7 +875,7 @@ func (arl *APIRateLimiter) reportTopClients() {
 	}
 }
 
-// HTTPMiddleware はHTTPミドルウェアとして機能します
+// HTTPMiddleware HTTPミドルウェアとして機能します
 func (arl *APIRateLimiter) HTTPMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// リクエスト情報を抽出
@@ -929,7 +929,7 @@ func (arl *APIRateLimiter) HTTPMiddleware(next http.HandlerFunc) http.HandlerFun
 
 // ユーティリティメソッド
 
-// extractClientID はクライアントIDを抽出します
+// extractClientID クライアントIDを抽出します
 func (arl *APIRateLimiter) extractClientID(r *http.Request) string {
 	// Authorization ヘッダーからクライアントIDを抽出
 	auth := r.Header.Get("Authorization")
@@ -944,7 +944,7 @@ func (arl *APIRateLimiter) extractClientID(r *http.Request) string {
 	return arl.extractClientIP(r)
 }
 
-// extractAPIKey はAPIキーを抽出します
+// extractAPIKey APIキーを抽出します
 func (arl *APIRateLimiter) extractAPIKey(r *http.Request) string {
 	// X-API-Key ヘッダーから抽出
 	if apiKey := r.Header.Get("X-API-Key"); apiKey != "" {
@@ -959,7 +959,7 @@ func (arl *APIRateLimiter) extractAPIKey(r *http.Request) string {
 	return "default"
 }
 
-// extractUserTier はユーザーティアを抽出します
+// extractUserTier ユーザーティアを抽出します
 func (arl *APIRateLimiter) extractUserTier(r *http.Request) string {
 	// X-User-Tier ヘッダーから抽出
 	if tier := r.Header.Get("X-User-Tier"); tier != "" {
@@ -977,7 +977,7 @@ func (arl *APIRateLimiter) extractUserTier(r *http.Request) string {
 	return "free"
 }
 
-// extractClientIP はクライアントIPを抽出します
+// extractClientIP クライアントIPを抽出します
 func (arl *APIRateLimiter) extractClientIP(r *http.Request) string {
 	// X-Forwarded-For ヘッダーをチェック
 	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
@@ -998,7 +998,7 @@ func (arl *APIRateLimiter) extractClientIP(r *http.Request) string {
 	return "unknown"
 }
 
-// min は最小値を返します
+// min 最小値を返します
 func min(a, b int) int {
 	if a < b {
 		return a
@@ -1006,7 +1006,7 @@ func min(a, b int) int {
 	return b
 }
 
-// Shutdown はレート制限システムを停止します
+// Shutdown レート制限システムを停止します
 func (arl *APIRateLimiter) Shutdown(timeout time.Duration) error {
 	if !atomic.CompareAndSwapInt32(&arl.isRunning, 1, 0) {
 		return fmt.Errorf("limiter is not running")
@@ -1047,7 +1047,7 @@ func (arl *APIRateLimiter) Shutdown(timeout time.Duration) error {
 	return nil
 }
 
-// GetStats は統計情報を取得します
+// GetStats 統計情報を取得します
 func (arl *APIRateLimiter) GetStats() map[string]interface{} {
 	arl.stats.mu.RLock()
 	defer arl.stats.mu.RUnlock()
