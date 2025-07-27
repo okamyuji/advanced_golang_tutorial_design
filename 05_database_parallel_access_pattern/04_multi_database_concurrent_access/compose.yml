@@ -1,0 +1,222 @@
+services:
+  # PostgreSQL データベース
+  postgres:
+    image: postgres:15
+    container_name: multi_db_postgres
+    environment:
+      POSTGRES_DB: testdb
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --locale=C"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgresql/init-postgres.sql:/docker-entrypoint-initdb.d/01-init.sql
+    networks:
+      - multi_db_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d testdb"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  # MySQL データベース
+  mysql:
+    image: mysql:8.0
+    container_name: multi_db_mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: testdb
+      MYSQL_USER: testuser
+      MYSQL_PASSWORD: testpass
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./docker/mysql/init-mysql.sql:/docker-entrypoint-initdb.d/01-init.sql
+    networks:
+      - multi_db_network
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "mysqladmin",
+          "ping",
+          "-h",
+          "localhost",
+          "-u",
+          "root",
+          "-prootpass",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+
+  # MSSQL データベース
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: multi_db_mssql
+    environment:
+      ACCEPT_EULA: Y
+      SA_PASSWORD: StrongPass123!
+      MSSQL_PID: Express
+    ports:
+      - "1433:1433"
+    volumes:
+      - mssql_data:/var/opt/mssql
+      - ./docker/mssql/init-mssql.sql:/opt/mssql-tools/bin/init-mssql.sql
+      - ./docker/mssql/entrypoint.sh:/usr/local/bin/entrypoint.sh
+    entrypoint: ["/bin/bash", "/usr/local/bin/entrypoint.sh"]
+    networks:
+      - multi_db_network
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "/opt/mssql-tools18/bin/sqlcmd -S localhost -U SA -P 'StrongPass123!' -Q 'SELECT 1' -C",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    restart: unless-stopped
+
+  # Oracle データベース
+  oracle:
+    image: gvenzl/oracle-free:23-slim
+    container_name: multi_db_oracle
+    environment:
+      ORACLE_PASSWORD: OraclePass123
+      ORACLE_DATABASE: FREEPDB1
+    ports:
+      - "1521:1521"
+      - "5500:5500"
+    volumes:
+      - oracle_data:/opt/oracle/oradata
+      - ./docker/oracle/init.sql:/opt/oracle/scripts/startup/01-init.sql
+    networks:
+      - multi_db_network
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "sqlplus -s system/OraclePass123@localhost:1521/FREE <<< 'SELECT 1 FROM dual;' || exit 1",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 180s
+    restart: unless-stopped
+    shm_size: 1g
+
+
+  # 監視用のPrometheus
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: multi_db_prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    networks:
+      - multi_db_network
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.console.libraries=/etc/prometheus/console_libraries"
+      - "--web.console.templates=/etc/prometheus/consoles"
+      - "--storage.tsdb.retention.time=200h"
+      - "--web.enable-lifecycle"
+    restart: unless-stopped
+
+  # メトリクス可視化用のGrafana
+  grafana:
+    image: grafana/grafana:latest
+    container_name: multi_db_grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+    networks:
+      - multi_db_network
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_INSTALL_PLUGINS: grafana-piechart-panel
+    restart: unless-stopped
+
+  # アプリケーション
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: multi_db_app
+    ports:
+      - "8080:8080"
+      - "8081:8081" # メトリクス用ポート
+    environment:
+      DB_POSTGRES_HOST: postgres
+      DB_POSTGRES_PORT: 5432
+      DB_POSTGRES_USER: postgres
+      DB_POSTGRES_PASSWORD: postgres
+      DB_POSTGRES_DATABASE: testdb
+
+      DB_MYSQL_HOST: mysql
+      DB_MYSQL_PORT: 3306
+      DB_MYSQL_USER: testuser
+      DB_MYSQL_PASSWORD: testpass
+      DB_MYSQL_DATABASE: testdb
+
+      DB_MSSQL_HOST: mssql
+      DB_MSSQL_PORT: 1433
+      DB_MSSQL_USER: sa
+      DB_MSSQL_PASSWORD: StrongPass123!
+      DB_MSSQL_DATABASE: testdb
+
+      DB_ORACLE_HOST: oracle
+      DB_ORACLE_PORT: 1521
+      DB_ORACLE_USER: system
+      DB_ORACLE_PASSWORD: OraclePass123
+      DB_ORACLE_SERVICE: FREE
+
+    networks:
+      - multi_db_network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+      mssql:
+        condition: service_healthy
+      oracle:
+        condition: service_healthy
+    restart: unless-stopped
+
+# ネットワーク定義
+networks:
+  multi_db_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+# ボリューム定義
+volumes:
+  postgres_data:
+    driver: local
+  mysql_data:
+    driver: local
+  mssql_data:
+    driver: local
+  oracle_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local

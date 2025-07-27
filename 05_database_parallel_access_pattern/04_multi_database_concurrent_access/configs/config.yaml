@@ -1,0 +1,271 @@
+# マルチデータベース並行アクセス設定ファイル
+server:
+  port: 8080
+  host: "0.0.0.0"
+  read_timeout: 30s
+  write_timeout: 30s
+  idle_timeout: 60s
+
+# データベース設定
+databases:
+  postgresql:
+    enabled: true
+    host: ${DB_POSTGRES_HOST:localhost}
+    port: ${DB_POSTGRES_PORT:5432}
+    username: ${DB_POSTGRES_USER:postgres}
+    password: ${DB_POSTGRES_PASSWORD:postgres}
+    database: ${DB_POSTGRES_DATABASE:testdb}
+    max_open_conns: 70
+    max_idle_conns: 35
+    conn_max_lifetime: 10m
+    conn_max_idle_time: 5m
+    retry_attempts: 3
+    retry_delay: 100ms
+    
+  mysql:
+    enabled: true
+    host: ${DB_MYSQL_HOST:localhost}
+    port: ${DB_MYSQL_PORT:3306}
+    username: ${DB_MYSQL_USER:testuser}
+    password: ${DB_MYSQL_PASSWORD:testpass}
+    database: ${DB_MYSQL_DATABASE:testdb}
+    max_open_conns: 100
+    max_idle_conns: 50
+    conn_max_lifetime: 10m
+    conn_max_idle_time: 5m
+    retry_attempts: 3
+    retry_delay: 100ms
+    
+  mssql:
+    enabled: true
+    host: ${DB_MSSQL_HOST:localhost}
+    port: ${DB_MSSQL_PORT:1433}
+    username: ${DB_MSSQL_USER:sa}
+    password: ${DB_MSSQL_PASSWORD:StrongPass123!}
+    database: ${DB_MSSQL_DATABASE:testdb}
+    max_open_conns: 50
+    max_idle_conns: 25
+    conn_max_lifetime: 10m
+    conn_max_idle_time: 5m
+    retry_attempts: 3
+    retry_delay: 200ms
+    
+  oracle:
+    enabled: true
+    host: ${DB_ORACLE_HOST:localhost}
+    port: ${DB_ORACLE_PORT:1521}
+    username: ${DB_ORACLE_USER:system}
+    password: ${DB_ORACLE_PASSWORD:OraclePass123}
+    database: ${DB_ORACLE_SERVICE:FREE}
+    max_open_conns: 80
+    max_idle_conns: 40
+    conn_max_lifetime: 10m
+    conn_max_idle_time: 5m
+    retry_attempts: 3
+    retry_delay: 150ms
+
+# ワーカープール設定
+worker_pool:
+  max_workers: 48  # 12コア×4 (M3 Pro最適化)
+  queue_size: 2000
+  timeout_duration: 15s
+
+# 監視設定
+monitoring:
+  enabled: true
+  metrics_port: 8081
+  health_check_interval: 30s
+  prometheus:
+    enabled: true
+    namespace: "multidb"
+    subsystem: "concurrent_access"
+  
+  grafana:
+    enabled: true
+    dashboard_refresh: 5s
+
+# ログ設定
+logging:
+  level: "debug"  # debug, info, warn, error
+  format: "json"  # json, text
+  output: "stdout"  # stdout, stderr, file
+  file_path: "/var/log/multidb/app.log"
+  max_size: 100MB
+  max_backups: 3
+  max_age: 7  # days
+  compress: true
+
+# セキュリティ設定
+security:
+  cors:
+    allowed_origins: ["*"]
+    allowed_methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
+    allowed_headers: ["Content-Type", "Authorization"]
+    expose_headers: []
+    allow_credentials: false
+    max_age: 3600
+    
+  rate_limiting:
+    enabled: true
+    requests_per_minute: 1000
+    burst: 100
+    
+  api_key:
+    enabled: false
+    header_name: "X-API-Key"
+    keys: []
+
+# パフォーマンス設定
+performance:
+  enable_query_cache: true
+  cache_ttl: 5m
+  max_cache_entries: 10000
+  
+  connection_pooling:
+    enable_load_balancing: true
+    health_check_interval: 30s
+    
+  batch_processing:
+    max_batch_size: 1000
+    batch_timeout: 5s
+    
+  query_timeout: 30s
+  transaction_timeout: 60s
+
+# 開発・デバッグ設定
+development:
+  debug: false
+  enable_profiling: false
+  profiling_port: 6060
+  
+  hot_reload: false
+  
+  mock_databases:
+    enabled: false
+    response_delay: 10ms
+    error_rate: 0.01  # 1%
+
+# 負荷テスト設定
+load_testing:
+  default_config:
+    concurrent_clients: 50
+    requests_per_client: 100
+    test_duration: 1m
+    ramp_up_duration: 10s
+    
+  scenarios:
+    - name: "light_load"
+      concurrent_clients: 10
+      requests_per_client: 50
+      test_duration: 30s
+      
+    - name: "medium_load"
+      concurrent_clients: 50
+      requests_per_client: 200
+      test_duration: 2m
+      
+    - name: "heavy_load"
+      concurrent_clients: 200
+      requests_per_client: 500
+      test_duration: 5m
+      
+    - name: "stress_test"
+      concurrent_clients: 500
+      requests_per_client: 1000
+      test_duration: 10m
+
+# アラート設定
+alerts:
+  enabled: true
+  
+  thresholds:
+    error_rate: 0.05  # 5%
+    response_time_p95: 1s
+    connection_usage: 0.8  # 80%
+    memory_usage: 0.85  # 85%
+    cpu_usage: 0.9  # 90%
+    
+  channels:
+    slack:
+      enabled: false
+      webhook_url: ""
+      channel: "#alerts"
+      
+    email:
+      enabled: false
+      smtp_host: ""
+      smtp_port: 587
+      username: ""
+      password: ""
+      recipients: []
+      
+    webhook:
+      enabled: false
+      url: ""
+      timeout: 5s
+
+# バックアップ設定
+backup:
+  enabled: false
+  
+  schedule: "0 2 * * *"  # 毎日午前2時
+  retention_days: 30
+  
+  destinations:
+    s3:
+      enabled: false
+      bucket: ""
+      region: ""
+      access_key: ""
+      secret_key: ""
+      
+    local:
+      enabled: true
+      path: "/backups"
+      
+  compression: true
+  encryption: false
+
+# 環境固有設定
+environments:
+  development:
+    databases:
+      postgresql:
+        max_open_conns: 5
+      mysql:
+        max_open_conns: 5
+      mssql:
+        max_open_conns: 3
+      oracle:
+        max_open_conns: 5
+        
+  staging:
+    databases:
+      postgresql:
+        max_open_conns: 15
+      mysql:
+        max_open_conns: 12
+      mssql:
+        max_open_conns: 10
+      oracle:
+        max_open_conns: 20
+        
+  production:
+    databases:
+      postgresql:
+        max_open_conns: 50
+      mysql:
+        max_open_conns: 40
+      mssql:
+        max_open_conns: 30
+      oracle:
+        max_open_conns: 60
+    
+    security:
+      rate_limiting:
+        requests_per_minute: 10000
+        burst: 500
+        
+    monitoring:
+      enabled: true
+      health_check_interval: 10s

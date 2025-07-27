@@ -1,0 +1,13 @@
+# Grafana ダッシュボードプロビジョニング設定
+apiVersion: 1
+
+providers:
+  - name: 'Multi-DB Dashboards'
+    orgId: 1
+    folder: 'Multi-Database'
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 10
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/provisioning/dashboards

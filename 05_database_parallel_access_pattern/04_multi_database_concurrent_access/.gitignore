@@ -1,0 +1,116 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+dist/
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+coverage.html
+coverage.out
+
+# Dependency directories (remove the comment below to include it)
+# vendor/
+
+# Go workspace file
+go.work
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs
+*.log
+logs/
+*.log.*
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Environment variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Docker volumes
+docker-data/
+postgres-data/
+mysql-data/
+mssql-data/
+oracle-data/
+
+# Test results
+test-results/
+performance-results/
+*.csv
+*.json.test
+
+# Build artifacts
+*.tar.gz
+*.zip
+release/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+
+# Configuration overrides
+config.local.yaml
+config.override.yaml
+
+# Generated protobuf files
+*.pb.go
+
+# Node modules (if any frontend components)
+node_modules/
+
+# Monitoring data
+grafana-data/
+prometheus-data/
+
+# Load testing results
+loadtest-results/
+*.har
+
+# Backup files
+*.bak
+*.backup
+
+# Security
+*.pem
+*.key
+*.crt
+*.cert
+
+# Local development
+.local/
+*.local
+
+# Profiling
+*.pprof
+cpu.prof
+mem.prof
