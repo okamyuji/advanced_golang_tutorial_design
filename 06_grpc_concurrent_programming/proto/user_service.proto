@@ -1,0 +1,102 @@
+syntax = "proto3";
+
+package grpcservice;
+
+option go_package = "./grpcservice";
+
+// ユーザーサービス定義
+service UserService {
+    // Unary RPC - 単一リクエスト/レスポンス
+    rpc GetUser(GetUserRequest) returns (GetUserResponse);
+    rpc CreateUser(CreateUserRequest) returns (CreateUserResponse);
+    rpc UpdateUser(UpdateUserRequest) returns (UpdateUserResponse);
+    rpc DeleteUser(DeleteUserRequest) returns (DeleteUserResponse);
+    
+    // Server Streaming RPC - サーバーからストリーミング
+    rpc ListUsers(ListUsersRequest) returns (stream User);
+    rpc WatchUserChanges(WatchUserChangesRequest) returns (stream UserEvent);
+    
+    // Client Streaming RPC - クライアントからストリーミング
+    rpc BulkCreateUsers(stream CreateUserRequest) returns (BulkCreateUsersResponse);
+    
+    // Bidirectional Streaming RPC - 双方向ストリーミング
+    rpc UserChat(stream ChatMessage) returns (stream ChatMessage);
+}
+
+// メッセージ定義
+message User {
+    int64 id = 1;
+    string name = 2;
+    string email = 3;
+    int64 created_at = 4;
+    int64 updated_at = 5;
+}
+
+message GetUserRequest {
+    int64 id = 1;
+}
+
+message GetUserResponse {
+    User user = 1;
+}
+
+message CreateUserRequest {
+    string name = 1;
+    string email = 2;
+}
+
+message CreateUserResponse {
+    User user = 1;
+}
+
+message UpdateUserRequest {
+    int64 id = 1;
+    string name = 2;
+    string email = 3;
+}
+
+message UpdateUserResponse {
+    User user = 1;
+}
+
+message DeleteUserRequest {
+    int64 id = 1;
+}
+
+message DeleteUserResponse {
+    bool success = 1;
+}
+
+message ListUsersRequest {
+    int32 page_size = 1;
+    string page_token = 2;
+    string filter = 3;
+}
+
+message WatchUserChangesRequest {
+    repeated int64 user_ids = 1;
+}
+
+message UserEvent {
+    enum EventType {
+        CREATED = 0;
+        UPDATED = 1;
+        DELETED = 2;
+    }
+    EventType type = 1;
+    User user = 2;
+    int64 timestamp = 3;
+}
+
+message BulkCreateUsersResponse {
+    repeated User users = 1;
+    int32 total_created = 2;
+    repeated string errors = 3;
+}
+
+message ChatMessage {
+    int64 user_id = 1;
+    string content = 2;
+    int64 timestamp = 3;
+    string message_id = 4;
+}
