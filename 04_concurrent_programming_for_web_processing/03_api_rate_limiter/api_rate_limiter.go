@@ -553,7 +553,7 @@ func (arl *APIRateLimiter) getOrCreateBucket(clientID, apiKey, userTier string) 
 
 	arl.buckets[bucketKey] = bucket
 
-	log.Printf("Created new rate limit bucket: %s (tier=%s)", bucketKey, userTier)
+	log.Printf("Created new rate limit bucket: clientID=%s (tier=%s)", clientID, userTier)
 	return bucket
 }
 

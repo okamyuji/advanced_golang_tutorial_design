@@ -510,42 +510,17 @@ func bulkCreateUsersHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(bulkResult)
 }
 
-func executeQueryHandler(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		DBType string        `json:"db_type"`
-		Query  string        `json:"query"`
-		Args   []interface{} `json:"args"`
-	}
-
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "無効なリクエストボディ", http.StatusBadRequest)
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-	defer cancel()
-
-	resultChan := dbManager.ExecuteQuery(ctx, req.DBType, req.Query, req.Args...)
-	result := <-resultChan
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(result)
+// executeQueryHandler は任意の SQL をリクエストボディから受け取って実行する
+// エンドポイントでしたが、SQL インジェクションの温床となるため無効化しています。
+// 本番用途では GetUsersByAgeRange のようにパラメータ化された専用ハンドラを追加してください。
+func executeQueryHandler(w http.ResponseWriter, _ *http.Request) {
+	http.Error(w, "任意 SQL 実行エンドポイントは無効化されています", http.StatusGone)
 }
 
-func executeParallelQueriesHandler(w http.ResponseWriter, r *http.Request) {
-	var queries map[string]string
-	if err := json.NewDecoder(r.Body).Decode(&queries); err != nil {
-		http.Error(w, "無効なリクエストボディ", http.StatusBadRequest)
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
-	defer cancel()
-
-	results := dbManager.ExecuteParallelQueries(ctx, queries)
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(results)
+// executeParallelQueriesHandler も同様に、任意 SQL をリクエストボディから受け取って
+// 並列実行するデモ用ハンドラでしたが、SQL インジェクションの温床となるため無効化しています。
+func executeParallelQueriesHandler(w http.ResponseWriter, _ *http.Request) {
+	http.Error(w, "任意 SQL 並列実行エンドポイントは無効化されています", http.StatusGone)
 }
 
 func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
