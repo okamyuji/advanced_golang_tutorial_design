@@ -1,8 +1,6 @@
 module multi-db
 
-go 1.24.0
-
-toolchain go1.24.5
+go 1.25.0
 
 require (
 	github.com/denisenkom/go-mssqldb v0.12.3
@@ -24,7 +22,7 @@ require (
 	github.com/prometheus/client_model v0.4.1-0.20230718164431-9a2bf3000d16 // indirect
 	github.com/prometheus/common v0.44.0 // indirect
 	github.com/prometheus/procfs v0.11.1 // indirect
-	golang.org/x/crypto v0.45.0 // indirect
-	golang.org/x/sys v0.38.0 // indirect
+	golang.org/x/crypto v0.52.0 // indirect
+	golang.org/x/sys v0.45.0 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 )
