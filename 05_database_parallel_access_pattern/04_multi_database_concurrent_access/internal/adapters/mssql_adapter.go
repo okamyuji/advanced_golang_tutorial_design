@@ -3,7 +3,10 @@ package adapters
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"log"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -51,14 +54,12 @@ func (ms *MSSQLAdapter) Connect(ctx context.Context, cfg config.DatabaseConfig) 
 	defer cancel()
 
 	if err := db.PingContext(ctxTimeout); err != nil {
-		db.Close()
-		return fmt.Errorf("MSSQL接続テストエラー: %w", err)
+		return fmt.Errorf("MSSQL接続テストエラー: %w", errors.Join(err, db.Close()))
 	}
 
 	// MSSQL固有の設定を実行
 	if err := ms.configureMSSQLSession(ctx, db); err != nil {
-		db.Close()
-		return fmt.Errorf("MSSQLセッション設定エラー: %w", err)
+		return fmt.Errorf("MSSQLセッション設定エラー: %w", errors.Join(err, db.Close()))
 	}
 
 	ms.db = db
@@ -91,7 +92,7 @@ func (ms *MSSQLAdapter) configureMSSQLSession(ctx context.Context, db *sql.DB) e
 }
 
 // Query データを取得
-func (ms *MSSQLAdapter) Query(ctx context.Context, query string, args ...interface{}) (*QueryResult, error) {
+func (ms *MSSQLAdapter) Query(ctx context.Context, query string, args ...any) (*QueryResult, error) {
 	start := time.Now()
 
 	ms.mutex.RLock()
@@ -109,7 +110,7 @@ func (ms *MSSQLAdapter) Query(ctx context.Context, query string, args ...interfa
 			DBType:  "MSSQL",
 		}, nil
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 
 	columns, err := rows.Columns()
 	if err != nil {
@@ -120,10 +121,10 @@ func (ms *MSSQLAdapter) Query(ctx context.Context, query string, args ...interfa
 		}, nil
 	}
 
-	var results []map[string]interface{}
+	var results []map[string]any
 	for rows.Next() {
-		values := make([]interface{}, len(columns))
-		valuePtrs := make([]interface{}, len(columns))
+		values := make([]any, len(columns))
+		valuePtrs := make([]any, len(columns))
 		for i := range columns {
 			valuePtrs[i] = &values[i]
 		}
@@ -136,7 +137,7 @@ func (ms *MSSQLAdapter) Query(ctx context.Context, query string, args ...interfa
 			}, nil
 		}
 
-		row := make(map[string]interface{})
+		row := make(map[string]any)
 		for i, col := range columns {
 			// MSSQL特有のデータ型変換
 			val := values[i]
@@ -172,7 +173,7 @@ func (ms *MSSQLAdapter) Query(ctx context.Context, query string, args ...interfa
 }
 
 // Execute データを変更
-func (ms *MSSQLAdapter) Execute(ctx context.Context, query string, args ...interface{}) (sql.Result, error) {
+func (ms *MSSQLAdapter) Execute(ctx context.Context, query string, args ...any) (sql.Result, error) {
 	ms.mutex.RLock()
 	defer ms.mutex.RUnlock()
 
@@ -201,13 +202,17 @@ func (ms *MSSQLAdapter) Transaction(ctx context.Context, fn func(*sql.Tx) error)
 
 	defer func() {
 		if r := recover(); r != nil {
-			tx.Rollback()
+			if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+				log.Printf("ロールバックエラー: %v", err)
+			}
 			panic(r)
 		}
 	}()
 
 	if err := fn(tx); err != nil {
-		tx.Rollback()
+		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+			return errors.Join(err, fmt.Errorf("ロールバックエラー: %w", rbErr))
+		}
 		return err
 	}
 
@@ -260,15 +265,15 @@ func (ms *MSSQLAdapter) CreateUser(ctx context.Context, user *models.User) (*mod
 	var existingID int64
 	checkQuery := `SELECT id FROM users WHERE email = ?`
 	err := ms.db.QueryRowContext(ctx, checkQuery, user.Email).Scan(&existingID)
-	
-	if err != nil && err != sql.ErrNoRows {
+
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("存在チェックエラー: %w", err)
 	}
 
 	var id int64
 	var createdAt, updatedAt time.Time
 
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		// レコードが存在しない場合はINSERT
 		insertQuery := `
 			INSERT INTO users (name, email, age) 
@@ -279,7 +284,7 @@ func (ms *MSSQLAdapter) CreateUser(ctx context.Context, user *models.User) (*mod
 		if err != nil {
 			return nil, fmt.Errorf("ユーザー作成エラー: %w", err)
 		}
-		defer rows.Close()
+		defer closeRows(rows)
 
 		if rows.Next() {
 			if err := rows.Scan(&id, &createdAt, &updatedAt); err != nil {
@@ -298,7 +303,7 @@ func (ms *MSSQLAdapter) CreateUser(ctx context.Context, user *models.User) (*mod
 		if err != nil {
 			return nil, fmt.Errorf("ユーザー更新エラー: %w", err)
 		}
-		defer rows.Close()
+		defer closeRows(rows)
 
 		if rows.Next() {
 			if err := rows.Scan(&id, &createdAt, &updatedAt); err != nil {
@@ -326,6 +331,9 @@ func (ms *MSSQLAdapter) GetUsersByAgeRange(ctx context.Context, minAge, maxAge i
 	result, err := ms.Query(ctx, query, minAge, maxAge)
 	if err != nil {
 		return nil, fmt.Errorf("年齢範囲クエリエラー: %w", err)
+	}
+	if result.Error != nil {
+		return nil, fmt.Errorf("年齢範囲クエリエラー: %w", result.Error)
 	}
 
 	var users []*models.User
@@ -369,15 +377,12 @@ func (ms *MSSQLAdapter) BulkInsertUsers(ctx context.Context, users []*models.Use
 	// MSSQL最適化: Table Valued Parametersを使用したバッチ挿入
 	// ここでは簡易版として通常のバッチ挿入を実装
 	batchSize := 1000
-	for i := 0; i < len(users); i += batchSize {
-		end := i + batchSize
-		if end > len(users) {
-			end = len(users)
+	offset := 0
+	for batch := range slices.Chunk(users, batchSize) {
+		if err := ms.insertBatch(ctx, batch); err != nil {
+			return fmt.Errorf("バッチ挿入エラー (batch %d-%d): %w", offset, offset+len(batch)-1, err)
 		}
-
-		if err := ms.insertBatch(ctx, users[i:end]); err != nil {
-			return fmt.Errorf("バッチ挿入エラー (batch %d-%d): %w", i, end-1, err)
-		}
+		offset += len(batch)
 	}
 
 	return nil
@@ -393,15 +398,9 @@ func (ms *MSSQLAdapter) insertBatch(ctx context.Context, users []*models.User) e
 	paramsPerUser := 3
 	usersPerBatch := maxParamsPerBatch / paramsPerUser
 
-	for i := 0; i < len(users); i += usersPerBatch {
-		end := i + usersPerBatch
-		if end > len(users) {
-			end = len(users)
-		}
-
-		batchUsers := users[i:end]
+	for batchUsers := range slices.Chunk(users, usersPerBatch) {
 		query := "INSERT INTO users (name, email, age) VALUES "
-		values := make([]interface{}, 0, len(batchUsers)*paramsPerUser)
+		values := make([]any, 0, len(batchUsers)*paramsPerUser)
 		placeholders := make([]string, len(batchUsers))
 
 		for j, user := range batchUsers {
@@ -421,7 +420,7 @@ func (ms *MSSQLAdapter) insertBatch(ctx context.Context, users []*models.User) e
 }
 
 // ExecuteStoredProcedure ストアドプロシージャ実行（MSSQL特有）
-func (ms *MSSQLAdapter) ExecuteStoredProcedure(ctx context.Context, procName string, args ...interface{}) (*QueryResult, error) {
+func (ms *MSSQLAdapter) ExecuteStoredProcedure(ctx context.Context, procName string, args ...any) (*QueryResult, error) {
 	start := time.Now()
 
 	ms.mutex.RLock()
@@ -447,7 +446,7 @@ func (ms *MSSQLAdapter) ExecuteStoredProcedure(ctx context.Context, procName str
 			DBType:  "MSSQL",
 		}, nil
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 
 	columns, err := rows.Columns()
 	if err != nil {
@@ -458,10 +457,10 @@ func (ms *MSSQLAdapter) ExecuteStoredProcedure(ctx context.Context, procName str
 		}, nil
 	}
 
-	var results []map[string]interface{}
+	var results []map[string]any
 	for rows.Next() {
-		values := make([]interface{}, len(columns))
-		valuePtrs := make([]interface{}, len(columns))
+		values := make([]any, len(columns))
+		valuePtrs := make([]any, len(columns))
 		for i := range columns {
 			valuePtrs[i] = &values[i]
 		}
@@ -474,7 +473,7 @@ func (ms *MSSQLAdapter) ExecuteStoredProcedure(ctx context.Context, procName str
 			}, nil
 		}
 
-		row := make(map[string]interface{})
+		row := make(map[string]any)
 		for i, col := range columns {
 			row[col] = values[i]
 		}

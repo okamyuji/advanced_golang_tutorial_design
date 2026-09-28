@@ -3,12 +3,15 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"math"
 	"net/http"
 	"runtime"
-	"sort"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,11 +19,11 @@ import (
 
 // Metric 単一のメトリクスデータポイントを表します
 type Metric struct {
-	Name      string                 `json:"name"`
-	Value     float64                `json:"value"`
-	Timestamp time.Time              `json:"timestamp"`
-	Tags      map[string]string      `json:"tags,omitempty"`
-	Metadata  map[string]interface{} `json:"metadata,omitempty"`
+	Name      string            `json:"name"`
+	Value     float64           `json:"value"`
+	Timestamp time.Time         `json:"timestamp"`
+	Tags      map[string]string `json:"tags,omitempty"`
+	Metadata  map[string]any    `json:"metadata,omitempty"`
 }
 
 // TimeSeriesPoint 時系列データポイントを表します
@@ -31,11 +34,11 @@ type TimeSeriesPoint struct {
 
 // TimeSeries 時系列データを表します
 type TimeSeries struct {
-	Name       string                 `json:"name"`
-	Points     []TimeSeriesPoint      `json:"points"`
-	Tags       map[string]string      `json:"tags,omitempty"`
-	Metadata   map[string]interface{} `json:"metadata,omitempty"`
-	LastUpdate time.Time              `json:"last_update"`
+	Name       string            `json:"name"`
+	Points     []TimeSeriesPoint `json:"points"`
+	Tags       map[string]string `json:"tags,omitempty"`
+	Metadata   map[string]any    `json:"metadata,omitempty"`
+	LastUpdate time.Time         `json:"last_update"`
 }
 
 // MetricsCollector メトリクス収集インターフェースです
@@ -47,16 +50,16 @@ type MetricsCollector interface {
 
 // AlertRule アラートルールを表します
 type AlertRule struct {
-	Name        string                 `json:"name"`
-	MetricName  string                 `json:"metric_name"`
-	Condition   string                 `json:"condition"` // "gt", "lt", "eq", "gte", "lte"
-	Threshold   float64                `json:"threshold"`
-	Duration    time.Duration          `json:"duration"`
-	Severity    string                 `json:"severity"`
-	Enabled     bool                   `json:"enabled"`
-	LastFired   time.Time              `json:"last_fired"`
-	Description string                 `json:"description"`
-	Metadata    map[string]interface{} `json:"metadata,omitempty"`
+	Name        string         `json:"name"`
+	MetricName  string         `json:"metric_name"`
+	Condition   string         `json:"condition"` // "gt", "lt", "eq", "gte", "lte"
+	Threshold   float64        `json:"threshold"`
+	Duration    time.Duration  `json:"duration"`
+	Severity    string         `json:"severity"`
+	Enabled     bool           `json:"enabled"`
+	LastFired   time.Time      `json:"last_fired"`
+	Description string         `json:"description"`
+	Metadata    map[string]any `json:"metadata,omitempty"`
 }
 
 // TimeSeriesStore 時系列データを格納します
@@ -110,8 +113,8 @@ func (tss *TimeSeriesStore) Store(metrics []Metric) {
 		}
 
 		// 時間順にソート
-		sort.Slice(series.Points, func(i, j int) bool {
-			return series.Points[i].Timestamp.Before(series.Points[j].Timestamp)
+		slices.SortFunc(series.Points, func(a, b TimeSeriesPoint) int {
+			return a.Timestamp.Compare(b.Timestamp)
 		})
 
 		// データポイント数制限（最新のポイントを保持）
@@ -176,29 +179,24 @@ func (tss *TimeSeriesStore) GetAllMetrics() []string {
 		metricSet[series.Name] = true
 	}
 
-	var metrics []string
-	for metric := range metricSet {
-		metrics = append(metrics, metric)
-	}
-
-	sort.Strings(metrics)
-	return metrics
+	return slices.Sorted(maps.Keys(metricSet))
 }
 
 // getSeriesKey シリーズキーを生成します
 func (tss *TimeSeriesStore) getSeriesKey(name string, tags map[string]string) string {
-	key := name
+	var key strings.Builder
+	key.WriteString(name)
 	if tags != nil {
 		var tagPairs []string
 		for k, v := range tags {
 			tagPairs = append(tagPairs, fmt.Sprintf("%s=%s", k, v))
 		}
-		sort.Strings(tagPairs)
+		slices.Sort(tagPairs)
 		for _, pair := range tagPairs {
-			key += "|" + pair
+			key.WriteString("|" + pair)
 		}
 	}
-	return key
+	return key.String()
 }
 
 // matchTags タグがマッチするかチェックします
@@ -238,18 +236,25 @@ type MonitoringDashboard struct {
 	webServer         *http.Server
 
 	updateInterval  time.Duration
+	alertInterval   time.Duration
 	retentionPeriod time.Duration
 	maxDataPoints   int
 
 	ctx              context.Context
 	cancel           context.CancelFunc
-	isRunning        int64
-	totalCollections int64
-	totalMetrics     int64
-	totalAlerts      int64
+	isRunning        atomic.Bool
+	totalCollections atomic.Int64
+	totalMetrics     atomic.Int64
+	totalAlerts      atomic.Int64
+
+	// lifecycle Start と Stop を直列化し、webServer の設定と wg.Wait / wg.Go が同時に走らないようにします
+	lifecycle sync.Mutex
+	// wg 収集ループ、アラート評価ループ、HTTP サーバーの goroutine を数えます
+	wg sync.WaitGroup
 
 	mutex        sync.RWMutex
 	activeAlerts map[string]time.Time
+	startedAt    time.Time
 }
 
 // NewMonitoringDashboard 新しい監視ダッシュボードを作成します
@@ -261,6 +266,7 @@ func NewMonitoringDashboard(updateInterval, retentionPeriod time.Duration, maxDa
 		alertRules:        make([]AlertRule, 0),
 		dataStore:         NewTimeSeriesStore(maxDataPoints, retentionPeriod),
 		updateInterval:    updateInterval,
+		alertInterval:     15 * time.Second,
 		retentionPeriod:   retentionPeriod,
 		maxDataPoints:     maxDataPoints,
 		ctx:               ctx,
@@ -271,6 +277,8 @@ func NewMonitoringDashboard(updateInterval, retentionPeriod time.Duration, maxDa
 
 // AddCollector メトリクスコレクターを追加します
 func (md *MonitoringDashboard) AddCollector(collector MetricsCollector) {
+	md.mutex.Lock()
+	defer md.mutex.Unlock()
 	md.metricsCollectors[collector.Name()] = collector
 }
 
@@ -283,9 +291,19 @@ func (md *MonitoringDashboard) AddAlertRule(rule AlertRule) {
 
 // Start 監視ダッシュボードを開始します
 func (md *MonitoringDashboard) Start(port int) error {
-	if !atomic.CompareAndSwapInt64(&md.isRunning, 0, 1) {
-		return fmt.Errorf("monitoring dashboard is already running")
+	md.lifecycle.Lock()
+	defer md.lifecycle.Unlock()
+
+	if md.ctx.Err() != nil {
+		return errors.New("monitoring dashboard has been stopped")
 	}
+	if !md.isRunning.CompareAndSwap(false, true) {
+		return errors.New("monitoring dashboard is already running")
+	}
+
+	md.mutex.Lock()
+	md.startedAt = time.Now()
+	md.mutex.Unlock()
 
 	log.Println("Starting Monitoring Dashboard...")
 
@@ -299,18 +317,19 @@ func (md *MonitoringDashboard) Start(port int) error {
 	}
 
 	// データ収集ループを開始
-	go md.collectAndDistribute()
+	md.wg.Go(md.collectAndDistribute)
 
 	// アラート評価ループを開始
-	go md.evaluateAlerts()
+	md.wg.Go(md.evaluateAlerts)
 
 	// HTTPサーバーを開始
-	go func() {
+	server := md.webServer
+	md.wg.Go(func() {
 		log.Printf("HTTP server starting on port %d", port)
-		if err := md.webServer.ListenAndServe(); err != http.ErrServerClosed {
+		if err := server.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 			log.Printf("HTTP server error: %v", err)
 		}
-	}()
+	})
 
 	log.Println("Monitoring Dashboard started successfully")
 	return nil
@@ -318,8 +337,11 @@ func (md *MonitoringDashboard) Start(port int) error {
 
 // Stop 監視ダッシュボードを停止します
 func (md *MonitoringDashboard) Stop() error {
-	if !atomic.CompareAndSwapInt64(&md.isRunning, 1, 0) {
-		return fmt.Errorf("monitoring dashboard is not running")
+	md.lifecycle.Lock()
+	defer md.lifecycle.Unlock()
+
+	if !md.isRunning.CompareAndSwap(true, false) {
+		return errors.New("monitoring dashboard is not running")
 	}
 
 	log.Println("Stopping Monitoring Dashboard...")
@@ -337,20 +359,21 @@ func (md *MonitoringDashboard) Stop() error {
 		}
 	}
 
+	md.wg.Wait()
+
 	log.Println("Monitoring Dashboard stopped")
 	return nil
 }
 
 // collectAndDistribute メトリクス収集と配信を行います
 func (md *MonitoringDashboard) collectAndDistribute() {
-	ticker := time.NewTicker(md.updateInterval)
-	defer ticker.Stop()
+	tick := time.Tick(md.updateInterval)
 
 	for {
 		select {
 		case <-md.ctx.Done():
 			return
-		case <-ticker.C:
+		case <-tick:
 			md.performCollection()
 		}
 	}
@@ -358,15 +381,17 @@ func (md *MonitoringDashboard) collectAndDistribute() {
 
 // performCollection メトリクス収集を実行します
 func (md *MonitoringDashboard) performCollection() {
-	atomic.AddInt64(&md.totalCollections, 1)
+	md.totalCollections.Add(1)
+
+	md.mutex.RLock()
+	collectors := maps.Clone(md.metricsCollectors)
+	md.mutex.RUnlock()
 
 	var wg sync.WaitGroup
-	metricsChan := make(chan []Metric, len(md.metricsCollectors))
+	metricsChan := make(chan []Metric, len(collectors))
 
-	for name, collector := range md.metricsCollectors {
-		wg.Add(1)
-		go func(name string, collector MetricsCollector) {
-			defer wg.Done()
+	for name, collector := range collectors {
+		wg.Go(func() {
 			defer func() {
 				if r := recover(); r != nil {
 					log.Printf("Metrics collector %s panicked: %v", name, r)
@@ -383,7 +408,7 @@ func (md *MonitoringDashboard) performCollection() {
 			}
 
 			metricsChan <- metrics
-		}(name, collector)
+		})
 	}
 
 	go func() {
@@ -403,21 +428,20 @@ func (md *MonitoringDashboard) aggregateAndStore(metricsChan chan []Metric) {
 	}
 
 	if len(allMetrics) > 0 {
-		atomic.AddInt64(&md.totalMetrics, int64(len(allMetrics)))
+		md.totalMetrics.Add(int64(len(allMetrics)))
 		md.dataStore.Store(allMetrics)
 	}
 }
 
 // evaluateAlerts アラートルールを評価します
 func (md *MonitoringDashboard) evaluateAlerts() {
-	ticker := time.NewTicker(15 * time.Second)
-	defer ticker.Stop()
+	tick := time.Tick(md.alertInterval)
 
 	for {
 		select {
 		case <-md.ctx.Done():
 			return
-		case <-ticker.C:
+		case <-tick:
 			md.checkAlertRules()
 		}
 	}
@@ -426,8 +450,7 @@ func (md *MonitoringDashboard) evaluateAlerts() {
 // checkAlertRules アラートルールをチェックします
 func (md *MonitoringDashboard) checkAlertRules() {
 	md.mutex.RLock()
-	rules := make([]AlertRule, len(md.alertRules))
-	copy(rules, md.alertRules)
+	rules := slices.Clone(md.alertRules)
 	md.mutex.RUnlock()
 
 	for _, rule := range rules {
@@ -507,14 +530,17 @@ func (md *MonitoringDashboard) checkCondition(condition string, value, threshold
 func (md *MonitoringDashboard) fireAlert(rule AlertRule, value float64) {
 	// 重複アラートを防ぐ
 	alertKey := fmt.Sprintf("%s_%s", rule.Name, rule.MetricName)
-	if lastFired, exists := md.activeAlerts[alertKey]; exists {
-		if time.Since(lastFired) < 5*time.Minute {
-			return
-		}
-	}
 
+	// activeAlerts は HTTP ハンドラーも読むのでロックの下で更新する
+	md.mutex.Lock()
+	if lastFired, exists := md.activeAlerts[alertKey]; exists && time.Since(lastFired) < 5*time.Minute {
+		md.mutex.Unlock()
+		return
+	}
 	md.activeAlerts[alertKey] = time.Now()
-	atomic.AddInt64(&md.totalAlerts, 1)
+	md.mutex.Unlock()
+
+	md.totalAlerts.Add(1)
 
 	log.Printf("ALERT: %s - %s (value: %.2f, threshold: %.2f)",
 		rule.Severity, rule.Description, value, rule.Threshold)
@@ -546,7 +572,7 @@ func (md *MonitoringDashboard) handleMetrics(w http.ResponseWriter, r *http.Requ
 	metrics := md.dataStore.GetAllMetrics()
 
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(map[string]interface{}{
+	if err := json.NewEncoder(w).Encode(map[string]any{
 		"metrics": metrics,
 		"count":   len(metrics),
 	}); err != nil {
@@ -581,7 +607,7 @@ func (md *MonitoringDashboard) handleQuery(w http.ResponseWriter, r *http.Reques
 	series := md.dataStore.Query(metricName, nil, start, end)
 
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(map[string]interface{}{
+	if err := json.NewEncoder(w).Encode(map[string]any{
 		"metric": metricName,
 		"start":  start,
 		"end":    end,
@@ -595,15 +621,15 @@ func (md *MonitoringDashboard) handleQuery(w http.ResponseWriter, r *http.Reques
 // handleAlerts アラート情報を返します
 func (md *MonitoringDashboard) handleAlerts(w http.ResponseWriter, r *http.Request) {
 	md.mutex.RLock()
-	rules := make([]AlertRule, len(md.alertRules))
-	copy(rules, md.alertRules)
+	rules := slices.Clone(md.alertRules)
+	activeAlerts := maps.Clone(md.activeAlerts)
 	md.mutex.RUnlock()
 
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(map[string]interface{}{
+	if err := json.NewEncoder(w).Encode(map[string]any{
 		"rules":         rules,
-		"active_alerts": md.activeAlerts,
-		"total_alerts":  atomic.LoadInt64(&md.totalAlerts),
+		"active_alerts": activeAlerts,
+		"total_alerts":  md.totalAlerts.Load(),
 	}); err != nil {
 		log.Printf("Failed to encode alerts: %v", err)
 	}
@@ -614,14 +640,23 @@ func (md *MonitoringDashboard) handleStats(w http.ResponseWriter, r *http.Reques
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
 
-	stats := map[string]interface{}{
-		"is_running":        atomic.LoadInt64(&md.isRunning) == 1,
-		"total_collections": atomic.LoadInt64(&md.totalCollections),
-		"total_metrics":     atomic.LoadInt64(&md.totalMetrics),
-		"total_alerts":      atomic.LoadInt64(&md.totalAlerts),
-		"collectors":        len(md.metricsCollectors),
-		"alert_rules":       len(md.alertRules),
-		"uptime":            time.Since(time.Now()), // 簡略化
+	md.mutex.RLock()
+	collectors := len(md.metricsCollectors)
+	alertRules := len(md.alertRules)
+	var uptime time.Duration
+	if !md.startedAt.IsZero() {
+		uptime = time.Since(md.startedAt)
+	}
+	md.mutex.RUnlock()
+
+	stats := map[string]any{
+		"is_running":        md.isRunning.Load(),
+		"total_collections": md.totalCollections.Load(),
+		"total_metrics":     md.totalMetrics.Load(),
+		"total_alerts":      md.totalAlerts.Load(),
+		"collectors":        collectors,
+		"alert_rules":       alertRules,
+		"uptime":            uptime,
 		"memory_usage":      m.HeapAlloc,
 		"goroutines":        runtime.NumGoroutine(),
 	}

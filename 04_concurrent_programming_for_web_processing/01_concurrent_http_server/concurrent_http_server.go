@@ -3,11 +3,14 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
-	"math/rand"
+	"math/rand/v2"
 	"net/http"
 	"runtime"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -38,7 +41,7 @@ type HTTPResponse struct {
 	CompletedAt time.Time
 }
 
-// ConcurrentHTTPServer TPサーバーです
+// ConcurrentHTTPServer ワーカープールでリクエストを処理する並行HTTPサーバーです
 type ConcurrentHTTPServer struct {
 	// サーバー設定
 	address       string
@@ -48,7 +51,6 @@ type ConcurrentHTTPServer struct {
 
 	// HTTP処理
 	server *http.Server
-	mux    *http.ServeMux
 
 	// 並行処理制御
 	requestQueue  chan *HTTPRequestContext
@@ -67,17 +69,19 @@ type ConcurrentHTTPServer struct {
 	middleware *MiddlewareManager
 
 	// 制御フラグ
-	isRunning int32
+	isRunning atomic.Bool
 	startTime time.Time
 }
 
 // HTTPRequestContext リクエストコンテキストです
 type HTTPRequestContext struct {
-	Request        *HTTPRequest
-	ResponseWriter http.ResponseWriter
-	HTTPRequest    *http.Request
-	Context        context.Context
-	StartTime      time.Time
+	Request     *HTTPRequest
+	HTTPRequest *http.Request
+	Context     context.Context
+	StartTime   time.Time
+	// result 処理結果をServeHTTPへ渡すチャネルです。ResponseWriterへの書き込みは
+	// ServeHTTPを呼び出したgoroutineだけが行い、ワーカーは直接触りません。
+	result chan *HTTPResponse
 }
 
 // HTTPWorker 並行HTTPワーカーです
@@ -94,24 +98,54 @@ type HandlerFunc func(ctx context.Context, req *HTTPRequest) (*HTTPResponse, err
 // ServerStats サーバー統計です
 type ServerStats struct {
 	mu                  sync.RWMutex
-	totalRequests       int64
-	activeRequests      int64
-	completedRequests   int64
-	errorRequests       int64
+	totalRequests       atomic.Int64
+	activeRequests      atomic.Int64
+	completedRequests   atomic.Int64
+	errorRequests       atomic.Int64
 	averageResponseTime time.Duration
 	statusCodeCounts    map[int]int64
 	pathCounts          map[string]int64
 	startTime           time.Time
 }
 
-// WorkerStats ワーカー統計です
+// WorkerStats ワーカー統計です。フィールドはワーカーgoroutineと監視・API側から
+// 並行に読み書きされるため、すべて型付きatomicで保持します。
 type WorkerStats struct {
+	WorkerID          int
+	ProcessedRequests atomic.Int64
+	SuccessRequests   atomic.Int64
+	ErrorRequests     atomic.Int64
+	TotalProcessTime  atomic.Int64 // ナノ秒
+}
+
+// WorkerStatsSnapshot ある時点のワーカー統計の値コピーです
+type WorkerStatsSnapshot struct {
 	WorkerID           int
 	ProcessedRequests  int64
 	SuccessRequests    int64
 	ErrorRequests      int64
 	TotalProcessTime   time.Duration
 	AverageProcessTime time.Duration
+}
+
+// Snapshot 現在の値をプレーンな構造体へコピーします
+func (s *WorkerStats) Snapshot() WorkerStatsSnapshot {
+	processed := s.ProcessedRequests.Load()
+	total := time.Duration(s.TotalProcessTime.Load())
+
+	var avg time.Duration
+	if processed > 0 {
+		avg = total / time.Duration(processed)
+	}
+
+	return WorkerStatsSnapshot{
+		WorkerID:           s.WorkerID,
+		ProcessedRequests:  processed,
+		SuccessRequests:    s.SuccessRequests.Load(),
+		ErrorRequests:      s.ErrorRequests.Load(),
+		TotalProcessTime:   total,
+		AverageProcessTime: avg,
+	}
 }
 
 // MiddlewareManager ミドルウェア管理です
@@ -125,31 +159,34 @@ type MiddlewareFunc func(next HandlerFunc) HandlerFunc
 
 // ServerConfig サーバー設定です
 type ServerConfig struct {
-	Address         string
-	Port            int
-	MaxWorkers      int
-	RequestBuffer   int
-	ReadTimeout     time.Duration
-	WriteTimeout    time.Duration
-	IdleTimeout     time.Duration
-	MaxHeaderBytes  int
-	EnableMetrics   bool
-	MetricsInterval time.Duration
+	Address        string
+	Port           int
+	MaxWorkers     int
+	RequestBuffer  int
+	ReadTimeout    time.Duration
+	WriteTimeout   time.Duration
+	IdleTimeout    time.Duration
+	MaxHeaderBytes int
+	// MaxConcurrentStreams HTTP/2の1接続あたりの同時ストリーム数の上限（0ならGoの既定値）
+	MaxConcurrentStreams int
+	EnableMetrics        bool
+	MetricsInterval      time.Duration
 }
 
 // NewServerConfig デフォルトサーバー設定を作成します
 func NewServerConfig() *ServerConfig {
 	return &ServerConfig{
-		Address:         "localhost",
-		Port:            8080,
-		MaxWorkers:      runtime.NumCPU() * 2,
-		RequestBuffer:   1000,
-		ReadTimeout:     30 * time.Second,
-		WriteTimeout:    30 * time.Second,
-		IdleTimeout:     60 * time.Second,
-		MaxHeaderBytes:  1 << 20, // 1MB
-		EnableMetrics:   true,
-		MetricsInterval: 10 * time.Second,
+		Address:              "localhost",
+		Port:                 8080,
+		MaxWorkers:           runtime.GOMAXPROCS(0) * 2,
+		RequestBuffer:        1000,
+		ReadTimeout:          30 * time.Second,
+		WriteTimeout:         30 * time.Second,
+		IdleTimeout:          60 * time.Second,
+		MaxHeaderBytes:       1 << 20, // 1MB
+		MaxConcurrentStreams: 250,
+		EnableMetrics:        true,
+		MetricsInterval:      10 * time.Second,
 	}
 }
 
@@ -177,8 +214,12 @@ func NewConcurrentHTTPServer(config *ServerConfig) *ConcurrentHTTPServer {
 		},
 	}
 
+	// HTTP/1.1と平文のHTTP/2（h2c）を同じポートで受ける（Go 1.24以降）
+	var protocols http.Protocols
+	protocols.SetHTTP1(true)
+	protocols.SetUnencryptedHTTP2(true)
+
 	// HTTPサーバーを設定
-	server.mux = http.NewServeMux()
 	server.server = &http.Server{
 		Addr:           fmt.Sprintf("%s:%d", config.Address, config.Port),
 		Handler:        server,
@@ -186,10 +227,12 @@ func NewConcurrentHTTPServer(config *ServerConfig) *ConcurrentHTTPServer {
 		WriteTimeout:   config.WriteTimeout,
 		IdleTimeout:    config.IdleTimeout,
 		MaxHeaderBytes: config.MaxHeaderBytes,
+		Protocols:      &protocols,
+		HTTP2:          &http.HTTP2Config{MaxConcurrentStreams: config.MaxConcurrentStreams},
 	}
 
 	// ワーカーを初期化
-	for i := 0; i < config.MaxWorkers; i++ {
+	for i := range config.MaxWorkers {
 		worker := &HTTPWorker{
 			ID:     i,
 			server: server,
@@ -209,17 +252,17 @@ func NewConcurrentHTTPServer(config *ServerConfig) *ConcurrentHTTPServer {
 
 // registerDefaultHandlers デフォルトハンドラーを登録します
 func (s *ConcurrentHTTPServer) registerDefaultHandlers() {
-	s.RegisterHandler("GET", "/health", s.healthCheckHandler)
-	s.RegisterHandler("GET", "/metrics", s.metricsHandler)
-	s.RegisterHandler("GET", "/status", s.statusHandler)
-	s.RegisterHandler("POST", "/api/echo", s.echoHandler)
-	s.RegisterHandler("GET", "/api/slow", s.slowHandler)
-	s.RegisterHandler("GET", "/api/cpu", s.cpuIntensiveHandler)
+	s.RegisterHandler(http.MethodGet, "/health", s.healthCheckHandler)
+	s.RegisterHandler(http.MethodGet, "/metrics", s.metricsHandler)
+	s.RegisterHandler(http.MethodGet, "/status", s.statusHandler)
+	s.RegisterHandler(http.MethodPost, "/api/echo", s.echoHandler)
+	s.RegisterHandler(http.MethodGet, "/api/slow", s.slowHandler)
+	s.RegisterHandler(http.MethodGet, "/api/cpu", s.cpuIntensiveHandler)
 }
 
-// ServeHTTP HTTPリクエストを処理します
+// ServeHTTP HTTPリクエストを処理します。レスポンスの書き込みはこのgoroutineだけが行います。
 func (s *ConcurrentHTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if atomic.LoadInt32(&s.isRunning) == 0 {
+	if s.ctx.Err() != nil || !s.isRunning.Load() {
 		http.Error(w, "Server is not running", http.StatusServiceUnavailable)
 		return
 	}
@@ -235,26 +278,26 @@ func (s *ConcurrentHTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request)
 			UserAgent: r.UserAgent(),
 			Timestamp: time.Now(),
 		},
-		ResponseWriter: w,
-		HTTPRequest:    r,
-		Context:        r.Context(),
-		StartTime:      time.Now(),
+		HTTPRequest: r,
+		Context:     r.Context(),
+		StartTime:   time.Now(),
+		result:      make(chan *HTTPResponse, 1),
 	}
 
 	// リクエストボディを読み取り
-	if r.ContentLength > 0 {
-		body := make([]byte, r.ContentLength)
-		_, err := r.Body.Read(body)
-		if err != nil && err.Error() != "EOF" {
-			http.Error(w, "Failed to read request body", http.StatusBadRequest)
-			return
-		}
+	// Readを1回呼ぶだけでは全体が返らないことがあるので、ReadAllで読み切る
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 10<<20))
+	if err != nil {
+		http.Error(w, "Failed to read request body", http.StatusBadRequest)
+		return
+	}
+	if len(body) > 0 {
 		requestCtx.Request.Body = body
 	}
 
 	// 統計更新
-	atomic.AddInt64(&s.stats.totalRequests, 1)
-	atomic.AddInt64(&s.stats.activeRequests, 1)
+	s.stats.totalRequests.Add(1)
+	s.stats.activeRequests.Add(1)
 
 	// リクエストをワーカーキューに送信
 	select {
@@ -262,21 +305,46 @@ func (s *ConcurrentHTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		// 正常にキューイング
 	case <-s.ctx.Done():
 		http.Error(w, "Server is shutting down", http.StatusServiceUnavailable)
-		atomic.AddInt64(&s.stats.activeRequests, -1)
+		s.stats.activeRequests.Add(-1)
 		return
 	default:
 		// キューが満杯
 		http.Error(w, "Server is busy, please try again later", http.StatusTooManyRequests)
-		atomic.AddInt64(&s.stats.activeRequests, -1)
-		atomic.AddInt64(&s.stats.errorRequests, 1)
+		s.stats.activeRequests.Add(-1)
+		s.stats.errorRequests.Add(1)
 		return
+	}
+
+	// ワーカーが処理した結果を待ってから書き込む
+	select {
+	case response := <-requestCtx.result:
+		s.writeResponse(w, response)
+	case <-s.ctx.Done():
+		http.Error(w, "Server is shutting down", http.StatusServiceUnavailable)
+	case <-r.Context().Done():
+		// クライアント切断。ワーカー側のsendResponseは非ブロッキング送信なので残留しない。
+	}
+}
+
+// writeResponse ワーカーが計算したレスポンスをResponseWriterへ書き込みます
+func (s *ConcurrentHTTPServer) writeResponse(w http.ResponseWriter, response *HTTPResponse) {
+	for key, value := range response.Headers {
+		w.Header().Set(key, value)
+	}
+
+	w.WriteHeader(response.StatusCode)
+
+	if response.Body != nil {
+		if _, err := w.Write(response.Body); err != nil {
+			log.Printf("Failed to write response body: %v", err)
+		}
 	}
 }
 
 // Start サーバーを開始します
 func (s *ConcurrentHTTPServer) Start() error {
-	if !atomic.CompareAndSwapInt32(&s.isRunning, 0, 1) {
-		return fmt.Errorf("server is already running")
+	if !s.isRunning.CompareAndSwap(false, true) {
+		return errors.New("server is already running")
 	}
 
 	s.startTime = time.Now()
@@ -287,28 +355,22 @@ func (s *ConcurrentHTTPServer) Start() error {
 
 	// ワーカーを開始
 	for _, worker := range s.workerPool {
-		s.wg.Add(1)
-		go worker.run()
+		s.wg.Go(worker.run)
 	}
 
 	// レスポンス処理を開始
-	s.wg.Add(1)
-	go s.handleResponses()
+	s.wg.Go(s.handleResponses)
 
 	// メトリクス監視を開始
-	s.wg.Add(1)
-	go s.monitorMetrics()
+	s.wg.Go(s.monitorMetrics)
 
 	// HTTPサーバーを開始
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-
+	s.wg.Go(func() {
 		log.Printf("HTTP server listening on %s", s.server.Addr)
-		if err := s.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := s.server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Printf("HTTP server error: %v", err)
 		}
-	}()
+	})
 
 	log.Printf("Concurrent HTTP server started successfully")
 	return nil
@@ -316,8 +378,6 @@ func (s *ConcurrentHTTPServer) Start() error {
 
 // run ワーカーのメインループです
 func (w *HTTPWorker) run() {
-	defer w.server.wg.Done()
-
 	log.Printf("HTTP worker %d started", w.ID)
 
 	for {
@@ -343,7 +403,7 @@ func (w *HTTPWorker) processRequest(requestCtx *HTTPRequestContext) {
 
 	// アクティブリクエスト数を減少
 	defer func() {
-		atomic.AddInt64(&w.server.stats.activeRequests, -1)
+		w.server.stats.activeRequests.Add(-1)
 	}()
 
 	// 適切なハンドラーを見つける
@@ -356,30 +416,31 @@ func (w *HTTPWorker) processRequest(requestCtx *HTTPRequestContext) {
 	// ミドルウェアを適用
 	finalHandler := w.server.middleware.apply(handler)
 
+	// サーバー停止時にハンドラーも中断できるようにする
+	ctx, cancel := context.WithCancel(requestCtx.Context)
+	stop := context.AfterFunc(w.server.ctx, cancel)
+	defer stop()
+
 	// ハンドラーを実行
-	response, err := finalHandler(requestCtx.Context, requestCtx.Request)
+	response, err := finalHandler(ctx, requestCtx.Request)
 	if err != nil {
 		w.sendErrorResponse(requestCtx, http.StatusInternalServerError, err.Error())
 		return
 	}
 
-	// レスポンスを送信
-	w.sendResponse(requestCtx, response)
-
-	// 統計更新
+	// 統計更新。ServeHTTP側がresultを受け取る前に確定させる。
 	processingTime := time.Since(start)
-	atomic.AddInt64(&w.stats.ProcessedRequests, 1)
-	w.stats.TotalProcessTime += processingTime
-
-	if w.stats.ProcessedRequests > 0 {
-		w.stats.AverageProcessTime = w.stats.TotalProcessTime / time.Duration(w.stats.ProcessedRequests)
-	}
+	w.stats.ProcessedRequests.Add(1)
+	w.stats.TotalProcessTime.Add(int64(processingTime))
 
 	if response != nil && response.Success {
-		atomic.AddInt64(&w.stats.SuccessRequests, 1)
+		w.stats.SuccessRequests.Add(1)
 	} else {
-		atomic.AddInt64(&w.stats.ErrorRequests, 1)
+		w.stats.ErrorRequests.Add(1)
 	}
+
+	// レスポンスを送信
+	w.sendResponse(requestCtx, response)
 }
 
 // findHandler 適切なハンドラーを見つけます
@@ -393,37 +454,26 @@ func (w *HTTPWorker) findHandler(method, path string) HandlerFunc {
 	return w.server.getDefaultHandler(method, path)
 }
 
-// sendResponse レスポンスを送信します
+// sendResponse レスポンスを結果チャネルへ届けます。ResponseWriterはここでは触りません。
 func (w *HTTPWorker) sendResponse(requestCtx *HTTPRequestContext, response *HTTPResponse) {
-	responseWriter := requestCtx.ResponseWriter
-
-	// ヘッダーを設定
-	for key, value := range response.Headers {
-		responseWriter.Header().Set(key, value)
-	}
-
-	// ステータスコードを設定
-	responseWriter.WriteHeader(response.StatusCode)
-
-	// ボディを書き込み
-	if response.Body != nil {
-		if _, err := responseWriter.Write(response.Body); err != nil {
-			log.Printf("Failed to write response body: %v", err)
-		}
-	}
-
 	// 統計更新
-	atomic.AddInt64(&w.server.stats.completedRequests, 1)
+	w.server.stats.completedRequests.Add(1)
 	w.server.stats.mu.Lock()
 	w.server.stats.statusCodeCounts[response.StatusCode]++
 	w.server.stats.pathCounts[requestCtx.Request.Path]++
 	w.server.stats.mu.Unlock()
 
-	// レスポンスを結果キューに送信
 	response.RequestID = requestCtx.Request.ID
 	response.ProcessTime = time.Since(requestCtx.StartTime)
 	response.CompletedAt = time.Now()
 
+	// ServeHTTP側が待っていれば届ける。クライアント切断等で離脱済みなら破棄する。
+	select {
+	case requestCtx.result <- response:
+	default:
+	}
+
+	// レスポンスを監視用キューへ送信
 	select {
 	case w.server.responseQueue <- response:
 	case <-w.server.ctx.Done():
@@ -439,14 +489,15 @@ func (w *HTTPWorker) sendErrorResponse(requestCtx *HTTPRequestContext, statusCod
 		Headers:     map[string]string{"Content-Type": "text/plain"},
 		Body:        []byte(message),
 		Success:     false,
-		Error:       fmt.Errorf("%s", message),
+		Error:       errors.New(message),
 		HandlerName: "error_handler",
 	}
 
 	w.sendResponse(requestCtx, response)
 }
 
-// RegisterHandler ハンドラーを登録します
+// RegisterHandler ハンドラーを登録します。呼び出しはStart前だけにしてください
+// （workerPool[].handlersはロックなしで共有されるためです）。
 func (s *ConcurrentHTTPServer) RegisterHandler(method, path string, handler HandlerFunc) {
 	handlerKey := method + " " + path
 
@@ -466,10 +517,10 @@ func (s *ConcurrentHTTPServer) getDefaultHandler(method, path string) HandlerFun
 
 		// メソッドに基づいてレスポンスを調整
 		switch method {
-		case "GET", "HEAD":
+		case http.MethodGet, http.MethodHead:
 			statusCode = http.StatusNotFound
 			message = fmt.Sprintf("Resource not found: %s %s", method, path)
-		case "POST", "PUT", "PATCH", "DELETE":
+		case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
 			statusCode = http.StatusMethodNotAllowed
 			message = fmt.Sprintf("Method %s not allowed for path: %s", method, path)
 		default:
@@ -506,8 +557,8 @@ func (mm *MiddlewareManager) apply(handler HandlerFunc) HandlerFunc {
 	result := handler
 
 	// ミドルウェアを逆順で適用
-	for i := len(mm.middlewares) - 1; i >= 0; i-- {
-		result = mm.middlewares[i](result)
+	for _, v := range slices.Backward(mm.middlewares) {
+		result = v(result)
 	}
 
 	return result
@@ -515,8 +566,6 @@ func (mm *MiddlewareManager) apply(handler HandlerFunc) HandlerFunc {
 
 // handleResponses レスポンスを処理します
 func (s *ConcurrentHTTPServer) handleResponses() {
-	defer s.wg.Done()
-
 	log.Println("Response handler started")
 
 	for {
@@ -539,7 +588,7 @@ func (s *ConcurrentHTTPServer) handleResponses() {
 // processResponse レスポンスを処理します
 func (s *ConcurrentHTTPServer) processResponse(response *HTTPResponse) {
 	// 平均レスポンス時間を更新
-	completed := atomic.LoadInt64(&s.stats.completedRequests)
+	completed := s.stats.completedRequests.Load()
 	if completed > 0 {
 		s.stats.mu.Lock()
 		s.stats.averageResponseTime = time.Duration(
@@ -556,10 +605,8 @@ func (s *ConcurrentHTTPServer) processResponse(response *HTTPResponse) {
 
 // monitorMetrics メトリクスを監視します
 func (s *ConcurrentHTTPServer) monitorMetrics() {
-	defer s.wg.Done()
-
-	ticker := time.NewTicker(15 * time.Second)
-	defer ticker.Stop()
+	// フィールドに保持せずStop/Resetも使わないため、Go 1.23以降はGCが回収できるtime.Tickでよい
+	tick := time.Tick(15 * time.Second)
 
 	log.Println("Metrics monitor started")
 
@@ -568,7 +615,7 @@ func (s *ConcurrentHTTPServer) monitorMetrics() {
 		case <-s.ctx.Done():
 			log.Println("Metrics monitor stopping")
 			return
-		case <-ticker.C:
+		case <-tick:
 			s.reportMetrics()
 		}
 	}
@@ -579,10 +626,10 @@ func (s *ConcurrentHTTPServer) reportMetrics() {
 	s.stats.mu.RLock()
 	defer s.stats.mu.RUnlock()
 
-	totalRequests := atomic.LoadInt64(&s.stats.totalRequests)
-	activeRequests := atomic.LoadInt64(&s.stats.activeRequests)
-	completedRequests := atomic.LoadInt64(&s.stats.completedRequests)
-	errorRequests := atomic.LoadInt64(&s.stats.errorRequests)
+	totalRequests := s.stats.totalRequests.Load()
+	activeRequests := s.stats.activeRequests.Load()
+	completedRequests := s.stats.completedRequests.Load()
+	errorRequests := s.stats.errorRequests.Load()
 
 	uptime := time.Since(s.stats.startTime)
 	var rps float64
@@ -601,14 +648,12 @@ func (s *ConcurrentHTTPServer) reportMetrics() {
 
 	// ワーカー別統計
 	for _, worker := range s.workerPool {
-		processed := atomic.LoadInt64(&worker.stats.ProcessedRequests)
-		success := atomic.LoadInt64(&worker.stats.SuccessRequests)
-		errors := atomic.LoadInt64(&worker.stats.ErrorRequests)
+		snap := worker.stats.Snapshot()
 
-		if processed > 0 {
-			successRate := float64(success) / float64(processed) * 100
+		if snap.ProcessedRequests > 0 {
+			successRate := float64(snap.SuccessRequests) / float64(snap.ProcessedRequests) * 100
 			log.Printf("Worker %d: Processed=%d, Success=%.1f%%, Errors=%d, AvgTime=%v",
-				worker.ID, processed, successRate, errors, worker.stats.AverageProcessTime)
+				snap.WorkerID, snap.ProcessedRequests, successRate, snap.ErrorRequests, snap.AverageProcessTime)
 		}
 	}
 }
@@ -617,7 +662,7 @@ func (s *ConcurrentHTTPServer) reportMetrics() {
 
 // healthCheckHandler ヘルスチェックハンドラーです
 func (s *ConcurrentHTTPServer) healthCheckHandler(ctx context.Context, req *HTTPRequest) (*HTTPResponse, error) {
-	healthData := map[string]interface{}{
+	healthData := map[string]any{
 		"status":    "healthy",
 		"timestamp": time.Now().Unix(),
 		"uptime":    time.Since(s.startTime).String(),
@@ -643,11 +688,11 @@ func (s *ConcurrentHTTPServer) metricsHandler(ctx context.Context, req *HTTPRequ
 	s.stats.mu.RLock()
 	defer s.stats.mu.RUnlock()
 
-	metrics := map[string]interface{}{
-		"total_requests":        atomic.LoadInt64(&s.stats.totalRequests),
-		"active_requests":       atomic.LoadInt64(&s.stats.activeRequests),
-		"completed_requests":    atomic.LoadInt64(&s.stats.completedRequests),
-		"error_requests":        atomic.LoadInt64(&s.stats.errorRequests),
+	metrics := map[string]any{
+		"total_requests":        s.stats.totalRequests.Load(),
+		"active_requests":       s.stats.activeRequests.Load(),
+		"completed_requests":    s.stats.completedRequests.Load(),
+		"error_requests":        s.stats.errorRequests.Load(),
 		"average_response_time": s.stats.averageResponseTime.String(),
 		"uptime":                time.Since(s.stats.startTime).String(),
 		"status_codes":          s.stats.statusCodeCounts,
@@ -670,22 +715,23 @@ func (s *ConcurrentHTTPServer) metricsHandler(ctx context.Context, req *HTTPRequ
 
 // statusHandler ステータスハンドラーです
 func (s *ConcurrentHTTPServer) statusHandler(ctx context.Context, req *HTTPRequest) (*HTTPResponse, error) {
-	workerStats := make([]map[string]interface{}, len(s.workerPool))
+	workerStats := make([]map[string]any, len(s.workerPool))
 
 	for i, worker := range s.workerPool {
-		workerStats[i] = map[string]interface{}{
-			"worker_id":            worker.ID,
-			"processed_requests":   atomic.LoadInt64(&worker.stats.ProcessedRequests),
-			"success_requests":     atomic.LoadInt64(&worker.stats.SuccessRequests),
-			"error_requests":       atomic.LoadInt64(&worker.stats.ErrorRequests),
-			"average_process_time": worker.stats.AverageProcessTime.String(),
+		snap := worker.stats.Snapshot()
+		workerStats[i] = map[string]any{
+			"worker_id":            snap.WorkerID,
+			"processed_requests":   snap.ProcessedRequests,
+			"success_requests":     snap.SuccessRequests,
+			"error_requests":       snap.ErrorRequests,
+			"average_process_time": snap.AverageProcessTime.String(),
 		}
 	}
 
-	status := map[string]interface{}{
+	status := map[string]any{
 		"server_status": "running",
 		"workers":       workerStats,
-		"queue_status": map[string]interface{}{
+		"queue_status": map[string]any{
 			"request_queue_length":  len(s.requestQueue),
 			"response_queue_length": len(s.responseQueue),
 		},
@@ -707,7 +753,7 @@ func (s *ConcurrentHTTPServer) statusHandler(ctx context.Context, req *HTTPReque
 
 // echoHandler エコーハンドラーです
 func (s *ConcurrentHTTPServer) echoHandler(ctx context.Context, req *HTTPRequest) (*HTTPResponse, error) {
-	echoData := map[string]interface{}{
+	echoData := map[string]any{
 		"method":     req.Method,
 		"path":       req.Path,
 		"headers":    req.Headers,
@@ -733,8 +779,8 @@ func (s *ConcurrentHTTPServer) echoHandler(ctx context.Context, req *HTTPRequest
 
 // slowHandler 遅延ハンドラーです
 func (s *ConcurrentHTTPServer) slowHandler(ctx context.Context, req *HTTPRequest) (*HTTPResponse, error) {
-	// 遅延をシミュレート
-	delay := time.Duration(rand.Intn(2000)+1000) * time.Millisecond
+	// 遅延をシミュレート（1〜3秒）
+	delay := time.Second + rand.N(2*time.Second)
 
 	select {
 	case <-time.After(delay):
@@ -743,7 +789,7 @@ func (s *ConcurrentHTTPServer) slowHandler(ctx context.Context, req *HTTPRequest
 		return nil, ctx.Err()
 	}
 
-	result := map[string]interface{}{
+	result := map[string]any{
 		"message":   "Slow operation completed",
 		"delay":     delay.String(),
 		"timestamp": time.Now().Unix(),
@@ -766,10 +812,10 @@ func (s *ConcurrentHTTPServer) slowHandler(ctx context.Context, req *HTTPRequest
 // cpuIntensiveHandler CPU集約的ハンドラーです
 func (s *ConcurrentHTTPServer) cpuIntensiveHandler(ctx context.Context, req *HTTPRequest) (*HTTPResponse, error) {
 	// CPU集約的処理をシミュレート
-	iterations := rand.Intn(1000000) + 500000
+	iterations := rand.IntN(1000000) + 500000
 	result := 0
 
-	for i := 0; i < iterations; i++ {
+	for i := range iterations {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -787,7 +833,7 @@ func (s *ConcurrentHTTPServer) cpuIntensiveHandler(ctx context.Context, req *HTT
 		}
 	}
 
-	responseData := map[string]interface{}{
+	responseData := map[string]any{
 		"message":    "CPU intensive operation completed",
 		"iterations": iterations,
 		"result":     result,
@@ -812,7 +858,7 @@ func (s *ConcurrentHTTPServer) cpuIntensiveHandler(ctx context.Context, req *HTT
 
 // generateRequestID リクエストIDを生成します
 func (s *ConcurrentHTTPServer) generateRequestID() string {
-	return fmt.Sprintf("req_%d_%d", time.Now().UnixNano(), rand.Int63())
+	return fmt.Sprintf("req_%d_%d", time.Now().UnixNano(), rand.Int64())
 }
 
 // extractHeaders ヘッダーを抽出します
@@ -844,8 +890,8 @@ func (s *ConcurrentHTTPServer) getClientIP(r *http.Request) string {
 
 // Shutdown サーバーを停止します
 func (s *ConcurrentHTTPServer) Shutdown(timeout time.Duration) error {
-	if !atomic.CompareAndSwapInt32(&s.isRunning, 1, 0) {
-		return fmt.Errorf("server is not running")
+	if !s.isRunning.CompareAndSwap(true, false) {
+		return errors.New("server is not running")
 	}
 
 	log.Println("Shutting down concurrent HTTP server...")
@@ -858,8 +904,10 @@ func (s *ConcurrentHTTPServer) Shutdown(timeout time.Duration) error {
 		log.Printf("HTTP server shutdown error: %v", err)
 	}
 
-	// 2. リクエストキューを閉じる
-	close(s.requestQueue)
+	// 2. ワーカー・監視ループを止める。requestQueue closeしない。
+	// ServeHTTPからの投入とcloseが競合すると送信側がpanicするため、
+	// 停止はctx.Done()だけに頼り、投入側はServeHTTP冒頭のs.ctx.Err()チェックで弾く。
+	s.cancel()
 
 	// 3. ワーカーの終了を待機
 	done := make(chan struct{})
@@ -872,19 +920,17 @@ func (s *ConcurrentHTTPServer) Shutdown(timeout time.Duration) error {
 	case <-done:
 		log.Println("All workers stopped gracefully")
 	case <-time.After(timeout):
-		log.Println("Timeout reached, forcing shutdown...")
-		s.cancel()
-
-		// 追加の待機時間
+		log.Println("Timeout reached waiting for workers")
 		select {
 		case <-done:
-			log.Println("Workers stopped after cancellation")
+			log.Println("Workers stopped after extra wait")
 		case <-time.After(2 * time.Second):
-			log.Println("Some workers may not have stopped properly")
+			// ワーカーがまだresponseQueueへ送信中かもしれないのでcloseしない
+			return errors.New("shutdown timed out waiting for workers to stop")
 		}
 	}
 
-	// 4. レスポンスキューを閉じる
+	// 4. すべてのワーカーが終わっているのでレスポンスキューを閉じる
 	close(s.responseQueue)
 
 	log.Println("Concurrent HTTP server shutdown completed")
@@ -892,14 +938,14 @@ func (s *ConcurrentHTTPServer) Shutdown(timeout time.Duration) error {
 }
 
 // GetStats 統計情報を取得します
-func (s *ConcurrentHTTPServer) GetStats() map[string]interface{} {
+func (s *ConcurrentHTTPServer) GetStats() map[string]any {
 	s.stats.mu.RLock()
 	defer s.stats.mu.RUnlock()
 
-	totalRequests := atomic.LoadInt64(&s.stats.totalRequests)
-	activeRequests := atomic.LoadInt64(&s.stats.activeRequests)
-	completedRequests := atomic.LoadInt64(&s.stats.completedRequests)
-	errorRequests := atomic.LoadInt64(&s.stats.errorRequests)
+	totalRequests := s.stats.totalRequests.Load()
+	activeRequests := s.stats.activeRequests.Load()
+	completedRequests := s.stats.completedRequests.Load()
+	errorRequests := s.stats.errorRequests.Load()
 
 	uptime := time.Since(s.stats.startTime)
 	var rps float64
@@ -907,17 +953,18 @@ func (s *ConcurrentHTTPServer) GetStats() map[string]interface{} {
 		rps = float64(totalRequests) / uptime.Seconds()
 	}
 
-	workerStats := make(map[string]interface{})
+	workerStats := make(map[string]any)
 	for i, worker := range s.workerPool {
-		workerStats[fmt.Sprintf("worker_%d", i)] = map[string]interface{}{
-			"processed_requests":   atomic.LoadInt64(&worker.stats.ProcessedRequests),
-			"success_requests":     atomic.LoadInt64(&worker.stats.SuccessRequests),
-			"error_requests":       atomic.LoadInt64(&worker.stats.ErrorRequests),
-			"average_process_time": worker.stats.AverageProcessTime,
+		snap := worker.stats.Snapshot()
+		workerStats[fmt.Sprintf("worker_%d", i)] = map[string]any{
+			"processed_requests":   snap.ProcessedRequests,
+			"success_requests":     snap.SuccessRequests,
+			"error_requests":       snap.ErrorRequests,
+			"average_process_time": snap.AverageProcessTime,
 		}
 	}
 
-	return map[string]interface{}{
+	return map[string]any{
 		"total_requests":        totalRequests,
 		"active_requests":       activeRequests,
 		"completed_requests":    completedRequests,
@@ -947,8 +994,8 @@ func main() {
 	server.AddMiddleware(CORSMiddleware)
 
 	// カスタムハンドラーを登録
-	server.RegisterHandler("GET", "/api/test", TestHandler)
-	server.RegisterHandler("POST", "/api/data", DataHandler)
+	server.RegisterHandler(http.MethodGet, "/api/test", TestHandler)
+	server.RegisterHandler(http.MethodPost, "/api/data", DataHandler)
 
 	// サーバー開始
 	if err := server.Start(); err != nil {
@@ -1011,7 +1058,7 @@ func CORSMiddleware(next HandlerFunc) HandlerFunc {
 
 // TestHandler テストハンドラーです
 func TestHandler(ctx context.Context, req *HTTPRequest) (*HTTPResponse, error) {
-	data := map[string]interface{}{
+	data := map[string]any{
 		"message":    "Test handler response",
 		"request_id": req.ID,
 		"timestamp":  time.Now().Unix(),
@@ -1034,7 +1081,7 @@ func TestHandler(ctx context.Context, req *HTTPRequest) (*HTTPResponse, error) {
 // DataHandler データハンドラーです
 func DataHandler(ctx context.Context, req *HTTPRequest) (*HTTPResponse, error) {
 	// リクエストボディを解析
-	var requestData map[string]interface{}
+	var requestData map[string]any
 	if len(req.Body) > 0 {
 		if err := json.Unmarshal(req.Body, &requestData); err != nil {
 			return &HTTPResponse{
@@ -1048,7 +1095,7 @@ func DataHandler(ctx context.Context, req *HTTPRequest) (*HTTPResponse, error) {
 	}
 
 	// レスポンスデータを作成
-	responseData := map[string]interface{}{
+	responseData := map[string]any{
 		"message":       "Data processed successfully",
 		"received_data": requestData,
 		"processed_at":  time.Now().Unix(),

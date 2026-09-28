@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-// ScrapingTaskはスクレイピングタスクを表現します
+// ScrapingTask スクレイピングタスクを表現します
 type ScrapingTask struct {
 	URL        string
 	Headers    map[string]string
@@ -19,7 +19,7 @@ type ScrapingTask struct {
 	Timeout    time.Duration
 }
 
-// ScrapingResultはスクレイピング結果を表現します
+// ScrapingResult スクレイピング結果を表現します
 type ScrapingResult struct {
 	URL           string
 	StatusCode    int
@@ -30,7 +30,7 @@ type ScrapingResult struct {
 	RetryCount    int
 }
 
-// WebScraperはWebスクレイピング専用のワーカープールです
+// WebScraper Webスクレイピング専用のワーカープールです
 type WebScraper struct {
 	// HTTP設定
 	client        *http.Client
@@ -54,18 +54,18 @@ type WebScraper struct {
 	requestDelay time.Duration
 }
 
-// ScrapingStatsはスクレイピング統計を管理します
+// ScrapingStats スクレイピング統計を管理します
 type ScrapingStats struct {
 	mu              sync.RWMutex
-	totalRequests   int64
-	successRequests int64
-	failedRequests  int64
-	retryRequests   int64
+	totalRequests   atomic.Int64
+	successRequests atomic.Int64
+	failedRequests  atomic.Int64
+	retryRequests   atomic.Int64
 	averageLatency  time.Duration
 	statusCodes     map[int]int64
 }
 
-// NewWebScraperは新しいWebスクレイパーを作成します
+// NewWebScraper 新しいWebスクレイパーを作成します
 func NewWebScraper(maxConcurrent int, requestsPerSecond float64) *WebScraper {
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -98,29 +98,24 @@ func NewWebScraper(maxConcurrent int, requestsPerSecond float64) *WebScraper {
 	}
 }
 
-// Startはスクレイパーを開始します
+// Start スクレイパーを開始します
 func (ws *WebScraper) Start() {
 	// ワーカーを開始
-	for i := 0; i < ws.maxConcurrent; i++ {
-		ws.wg.Add(1)
-		go ws.worker(i)
+	for i := range ws.maxConcurrent {
+		ws.wg.Go(func() { ws.worker(i) })
 	}
 
 	// 結果処理を開始
-	ws.wg.Add(1)
-	go ws.resultHandler()
+	ws.wg.Go(ws.resultHandler)
 
 	// 統計レポートを開始
-	ws.wg.Add(1)
-	go ws.statsReporter()
+	ws.wg.Go(ws.statsReporter)
 
 	log.Printf("Web scraper started with %d workers", ws.maxConcurrent)
 }
 
-// workerはスクレイピングを実行するワーカーです
+// worker スクレイピングを実行するワーカーです
 func (ws *WebScraper) worker(workerID int) {
-	defer ws.wg.Done()
-
 	for {
 		select {
 		case <-ws.ctx.Done():
@@ -130,8 +125,12 @@ func (ws *WebScraper) worker(workerID int) {
 				return
 			}
 
-			// レート制限を適用
-			<-ws.rateLimiter.C
+			// レート制限を適用する。Shutdownはtickerを止めるので、ctxのキャンセルも待つ
+			select {
+			case <-ws.rateLimiter.C:
+			case <-ws.ctx.Done():
+				return
+			}
 
 			result := ws.scrapeURL(task, workerID)
 
@@ -145,7 +144,7 @@ func (ws *WebScraper) worker(workerID int) {
 	}
 }
 
-// scrapeURLは指定されたURLをスクレイピングします
+// scrapeURL 指定されたURLをスクレイピングします
 func (ws *WebScraper) scrapeURL(task ScrapingTask, workerID int) ScrapingResult {
 	start := time.Now()
 
@@ -155,9 +154,9 @@ func (ws *WebScraper) scrapeURL(task ScrapingTask, workerID int) ScrapingResult 
 	}
 
 	// HTTPリクエストを作成
-	req, err := http.NewRequestWithContext(ws.ctx, "GET", task.URL, nil)
+	req, err := http.NewRequestWithContext(ws.ctx, http.MethodGet, task.URL, nil)
 	if err != nil {
-		result.Error = fmt.Errorf("failed to create request: %v", err)
+		result.Error = fmt.Errorf("failed to create request: %w", err)
 		result.Duration = time.Since(start)
 		return result
 	}
@@ -178,12 +177,12 @@ func (ws *WebScraper) scrapeURL(task ScrapingTask, workerID int) ScrapingResult 
 	// リクエストを実行
 	resp, err := ws.client.Do(req)
 	if err != nil {
-		result.Error = fmt.Errorf("request failed: %v", err)
+		result.Error = fmt.Errorf("request failed: %w", err)
 		result.Duration = time.Since(start)
 
 		// リトライ判定
 		if task.RetryCount < task.MaxRetries {
-			atomic.AddInt64(&ws.stats.retryRequests, 1)
+			ws.stats.retryRequests.Add(1)
 			ws.scheduleRetry(task, workerID)
 		}
 		return result
@@ -205,7 +204,7 @@ func (ws *WebScraper) scrapeURL(task ScrapingTask, workerID int) ScrapingResult 
 
 		// 5xx系エラーはリトライ
 		if resp.StatusCode >= 500 && task.RetryCount < task.MaxRetries {
-			atomic.AddInt64(&ws.stats.retryRequests, 1)
+			ws.stats.retryRequests.Add(1)
 			ws.scheduleRetry(task, workerID)
 		}
 	}
@@ -214,13 +213,13 @@ func (ws *WebScraper) scrapeURL(task ScrapingTask, workerID int) ScrapingResult 
 	return result
 }
 
-// scheduleRetryはリトライをスケジュールします
+// scheduleRetry リトライをスケジュールします
 func (ws *WebScraper) scheduleRetry(task ScrapingTask, workerID int) {
 	retryTask := task
 	retryTask.RetryCount++
 
 	// 指数バックオフでリトライ
-	backoffDelay := time.Duration(1<<uint(retryTask.RetryCount)) * time.Second
+	backoffDelay := time.Second << retryTask.RetryCount
 
 	go func() {
 		select {
@@ -236,10 +235,8 @@ func (ws *WebScraper) scheduleRetry(task ScrapingTask, workerID int) {
 	}()
 }
 
-// resultHandlerは結果を処理します
+// resultHandler 結果を処理します
 func (ws *WebScraper) resultHandler() {
-	defer ws.wg.Done()
-
 	for {
 		select {
 		case <-ws.ctx.Done():
@@ -254,17 +251,17 @@ func (ws *WebScraper) resultHandler() {
 	}
 }
 
-// updateStatsは統計を更新します
+// updateStats 統計を更新します
 func (ws *WebScraper) updateStats(result ScrapingResult) {
 	ws.stats.mu.Lock()
 	defer ws.stats.mu.Unlock()
 
-	atomic.AddInt64(&ws.stats.totalRequests, 1)
+	ws.stats.totalRequests.Add(1)
 
 	if result.Success {
-		atomic.AddInt64(&ws.stats.successRequests, 1)
+		ws.stats.successRequests.Add(1)
 	} else {
-		atomic.AddInt64(&ws.stats.failedRequests, 1)
+		ws.stats.failedRequests.Add(1)
 	}
 
 	if result.StatusCode > 0 {
@@ -272,37 +269,34 @@ func (ws *WebScraper) updateStats(result ScrapingResult) {
 	}
 
 	// 平均レイテンシを更新（簡易版）
-	totalRequests := atomic.LoadInt64(&ws.stats.totalRequests)
+	totalRequests := ws.stats.totalRequests.Load()
 	ws.stats.averageLatency = time.Duration(
 		(int64(ws.stats.averageLatency)*totalRequests + int64(result.Duration)) / (totalRequests + 1))
 }
 
 // statsReporter 統計を定期的に報告します
 func (ws *WebScraper) statsReporter() {
-	defer ws.wg.Done()
-
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
+	tick := time.Tick(10 * time.Second)
 
 	for {
 		select {
 		case <-ws.ctx.Done():
 			return
-		case <-ticker.C:
+		case <-tick:
 			ws.printStats()
 		}
 	}
 }
 
-// printStat 統計を出力します
+// printStats 統計を出力します
 func (ws *WebScraper) printStats() {
 	ws.stats.mu.RLock()
 	defer ws.stats.mu.RUnlock()
 
-	total := atomic.LoadInt64(&ws.stats.totalRequests)
-	success := atomic.LoadInt64(&ws.stats.successRequests)
-	failed := atomic.LoadInt64(&ws.stats.failedRequests)
-	retries := atomic.LoadInt64(&ws.stats.retryRequests)
+	total := ws.stats.totalRequests.Load()
+	success := ws.stats.successRequests.Load()
+	failed := ws.stats.failedRequests.Load()
+	retries := ws.stats.retryRequests.Load()
 
 	successRate := float64(0)
 	if total > 0 {
@@ -318,8 +312,12 @@ func (ws *WebScraper) printStats() {
 	}
 }
 
-// SubmitURLはスクレイピング対象URLを追加します
+// SubmitURL スクレイピング対象URLを追加します
 func (ws *WebScraper) SubmitURL(url string, maxRetries int) error {
+	// 停止後の投入を拒否する。キューはcloseせず、読む側はctxのキャンセルで止める
+	if ws.ctx.Err() != nil {
+		return fmt.Errorf("scraper is shutting down")
+	}
 	task := ScrapingTask{
 		URL:        url,
 		Headers:    make(map[string]string),
@@ -337,12 +335,9 @@ func (ws *WebScraper) SubmitURL(url string, maxRetries int) error {
 	}
 }
 
-// Shutdownはスクレイパーを停止します
+// Shutdown スクレイパーを停止します
 func (ws *WebScraper) Shutdown(timeout time.Duration) error {
 	log.Println("Starting web scraper shutdown...")
-
-	// 新しいタスクの受付を停止
-	close(ws.taskQueue)
 
 	// ワーカーに停止シグナルを送信
 	ws.cancel()
@@ -366,11 +361,11 @@ func (ws *WebScraper) Shutdown(timeout time.Duration) error {
 	}
 }
 
-// GetStatsは現在の統計を取得します
+// GetStats 現在の統計を取得します
 func (ws *WebScraper) GetStats() (int64, int64, int64, float64) {
-	total := atomic.LoadInt64(&ws.stats.totalRequests)
-	success := atomic.LoadInt64(&ws.stats.successRequests)
-	failed := atomic.LoadInt64(&ws.stats.failedRequests)
+	total := ws.stats.totalRequests.Load()
+	success := ws.stats.successRequests.Load()
+	failed := ws.stats.failedRequests.Load()
 
 	successRate := float64(0)
 	if total > 0 {
@@ -402,7 +397,7 @@ func main() {
 	// URLを送信
 	go func() {
 		for i, url := range testURLs {
-			for j := 0; j < 3; j++ { // 各URLを3回
+			for j := range 3 { // 各URLを3回
 				finalURL := fmt.Sprintf("%s?request=%d", url, i*3+j+1)
 				if err := scraper.SubmitURL(finalURL, 2); err != nil {
 					log.Printf("Failed to submit URL %s: %v", finalURL, err)

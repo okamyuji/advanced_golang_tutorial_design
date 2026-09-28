@@ -1,9 +1,11 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"sync"
@@ -76,7 +78,7 @@ type AdvancedCircuitBreaker struct {
 	windowFull    bool
 
 	// 並行制御
-	activeRequests int64
+	activeRequests atomic.Int64
 	mutex          sync.RWMutex
 
 	// 状態管理
@@ -100,30 +102,14 @@ var (
 // NewAdvancedCircuitBreaker 新しい高度なサーキットブレーカーを作成します
 func NewAdvancedCircuitBreaker(config AdvancedCircuitBreakerConfig) *AdvancedCircuitBreaker {
 	// デフォルト値設定
-	if config.FailureThreshold == 0 {
-		config.FailureThreshold = 3
-	}
-	if config.FailureRateThreshold == 0 {
-		config.FailureRateThreshold = 0.5
-	}
-	if config.SlowCallThreshold == 0 {
-		config.SlowCallThreshold = 5 * time.Second
-	}
-	if config.SlowCallRateThreshold == 0 {
-		config.SlowCallRateThreshold = 0.5
-	}
-	if config.MinimumRequestCount == 0 {
-		config.MinimumRequestCount = 10
-	}
-	if config.OpenTimeout == 0 {
-		config.OpenTimeout = 30 * time.Second
-	}
-	if config.MaxConcurrentRequests == 0 {
-		config.MaxConcurrentRequests = 100
-	}
-	if config.SlidingWindowSize == 0 {
-		config.SlidingWindowSize = 100
-	}
+	config.FailureThreshold = cmp.Or(config.FailureThreshold, 3)
+	config.FailureRateThreshold = cmp.Or(config.FailureRateThreshold, 0.5)
+	config.SlowCallThreshold = cmp.Or(config.SlowCallThreshold, 5*time.Second)
+	config.SlowCallRateThreshold = cmp.Or(config.SlowCallRateThreshold, 0.5)
+	config.MinimumRequestCount = cmp.Or(config.MinimumRequestCount, 10)
+	config.OpenTimeout = cmp.Or(config.OpenTimeout, 30*time.Second)
+	config.MaxConcurrentRequests = cmp.Or(config.MaxConcurrentRequests, 100)
+	config.SlidingWindowSize = cmp.Or(config.SlidingWindowSize, 100)
 
 	return &AdvancedCircuitBreaker{
 		config:        config,
@@ -143,7 +129,7 @@ func (acb *AdvancedCircuitBreaker) Execute(request func() error) error {
 	}
 
 	// アクティブリクエスト数をインクリメント
-	defer atomic.AddInt64(&acb.activeRequests, -1)
+	defer acb.activeRequests.Add(-1)
 
 	start := time.Now()
 	var requestErr error
@@ -169,7 +155,7 @@ func (acb *AdvancedCircuitBreaker) ExecuteWithTimeout(ctx context.Context, timeo
 		return err
 	}
 
-	defer atomic.AddInt64(&acb.activeRequests, -1)
+	defer acb.activeRequests.Add(-1)
 
 	type result struct {
 		err      error
@@ -228,20 +214,20 @@ func (acb *AdvancedCircuitBreaker) beforeRequest() error {
 	}
 
 	// 並行リクエスト数チェック
-	if atomic.LoadInt64(&acb.activeRequests) >= int64(acb.config.MaxConcurrentRequests) {
+	if acb.activeRequests.Load() >= int64(acb.config.MaxConcurrentRequests) {
 		return ErrTooManyRequests
 	}
 
 	// ハーフオープン状態での制限
 	if acb.state == HalfOpen {
 		// ハーフオープン時は1つのリクエストのみ許可
-		if atomic.LoadInt64(&acb.activeRequests) > 0 {
+		if acb.activeRequests.Load() > 0 {
 			return ErrTooManyRequests
 		}
 	}
 
-	atomic.AddInt64(&acb.activeRequests, 1)
-	atomic.AddUint64(&acb.metrics.TotalRequests, 1)
+	acb.activeRequests.Add(1)
+	acb.metrics.TotalRequests++
 
 	return nil
 }
@@ -281,26 +267,26 @@ func (acb *AdvancedCircuitBreaker) afterRequest(success bool, duration time.Dura
 }
 
 // updateMetrics メトリクスを更新します
+// metrics はすべて acb.mutex の下で読み書きするので、個々のフィールドに atomic は使いません。
 func (acb *AdvancedCircuitBreaker) updateMetrics(success bool, duration time.Duration, timestamp time.Time) {
 	acb.metrics.TotalResponseTime += duration
 
 	if success {
-		atomic.AddUint64(&acb.metrics.SuccessfulRequests, 1)
-		atomic.StoreUint64(&acb.metrics.ConsecutiveFailures, 0)
+		acb.metrics.SuccessfulRequests++
+		acb.metrics.ConsecutiveFailures = 0
 		acb.metrics.LastSuccessTime = timestamp
 	} else {
-		atomic.AddUint64(&acb.metrics.FailedRequests, 1)
-		atomic.AddUint64(&acb.metrics.ConsecutiveFailures, 1)
+		acb.metrics.FailedRequests++
+		acb.metrics.ConsecutiveFailures++
 		acb.metrics.LastFailureTime = timestamp
 	}
 
 	if duration > acb.config.SlowCallThreshold {
-		atomic.AddUint64(&acb.metrics.SlowRequestCount, 1)
+		acb.metrics.SlowRequestCount++
 	}
 
 	// 平均応答時間の更新
-	totalRequests := atomic.LoadUint64(&acb.metrics.TotalRequests)
-	if totalRequests > 0 {
+	if totalRequests := acb.metrics.TotalRequests; totalRequests > 0 {
 		acb.metrics.AverageResponseTime = acb.metrics.TotalResponseTime / time.Duration(totalRequests)
 	}
 }
@@ -366,7 +352,7 @@ func (acb *AdvancedCircuitBreaker) calculateFailureRate() float64 {
 	}
 
 	failures := 0
-	for i := 0; i < windowSize; i++ {
+	for i := range windowSize {
 		if !acb.requestWindow[i].Success {
 			failures++
 		}
@@ -383,7 +369,7 @@ func (acb *AdvancedCircuitBreaker) calculateSlowCallRate() float64 {
 	}
 
 	slowCalls := 0
-	for i := 0; i < windowSize; i++ {
+	for i := range windowSize {
 		if acb.requestWindow[i].IsSlowCall {
 			slowCalls++
 		}
@@ -422,13 +408,13 @@ func (acb *AdvancedCircuitBreaker) transitionTo(newState CircuitBreakerState) {
 	switch newState {
 	case Open:
 		acb.stateExpiry = time.Now().Add(acb.config.OpenTimeout)
-		atomic.AddUint64(&acb.metrics.CircuitOpenCount, 1)
+		acb.metrics.CircuitOpenCount++
 	case HalfOpen:
 		acb.stateExpiry = time.Time{}
 	case Closed:
 		acb.stateExpiry = time.Time{}
 		// 連続失敗カウンターをリセット
-		atomic.StoreUint64(&acb.metrics.ConsecutiveFailures, 0)
+		acb.metrics.ConsecutiveFailures = 0
 	}
 
 	log.Printf("Circuit Breaker [%s]: %s -> %s", acb.config.Name, oldState, newState)
@@ -440,9 +426,10 @@ func (acb *AdvancedCircuitBreaker) transitionTo(newState CircuitBreakerState) {
 }
 
 // GetState 現在の状態を取得します
+// updateState が OPEN から HALF_OPEN へ遷移させることがあるので、読み取りでも書き込みロックを取ります。
 func (acb *AdvancedCircuitBreaker) GetState() CircuitBreakerState {
-	acb.mutex.RLock()
-	defer acb.mutex.RUnlock()
+	acb.mutex.Lock()
+	defer acb.mutex.Unlock()
 
 	acb.updateState()
 	return acb.state
@@ -470,7 +457,7 @@ func (acb *AdvancedCircuitBreaker) Reset() {
 	acb.requestWindow = make([]RequestResult, acb.config.SlidingWindowSize)
 	acb.windowIndex = 0
 	acb.windowFull = false
-	atomic.StoreInt64(&acb.activeRequests, 0)
+	// activeRequests は実行中のリクエストが終わるときに自分で減らすので、ここでは触らない
 }
 
 // HTTPClientWithCircuitBreaker サーキットブレーカー付きHTTPクライアントです
@@ -507,13 +494,12 @@ func (hc *HTTPClientWithCircuitBreaker) Get(url string) (*http.Response, error) 
 }
 
 // Post サーキットブレーカー付きのPOSTリクエストを実行します
-func (hc *HTTPClientWithCircuitBreaker) Post(url, contentType string, body interface{}) (*http.Response, error) {
+func (hc *HTTPClientWithCircuitBreaker) Post(url, contentType string, body io.Reader) (*http.Response, error) {
 	var resp *http.Response
 
 	err := hc.circuitBreaker.Execute(func() error {
 		var err error
-		// body処理は簡略化
-		resp, err = hc.client.Post(url, contentType, nil)
+		resp, err = hc.client.Post(url, contentType, body)
 		return err
 	})
 
@@ -567,7 +553,7 @@ func main() {
 	}
 
 	// テスト実行
-	for i := 0; i < 20; i++ {
+	for i := range 20 {
 		url := testURLs[i%len(testURLs)]
 
 		log.Printf("\n--- Request %d: %s ---", i+1, url)

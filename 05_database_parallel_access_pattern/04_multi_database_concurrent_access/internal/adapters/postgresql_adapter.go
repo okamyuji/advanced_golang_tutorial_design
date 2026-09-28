@@ -3,7 +3,10 @@ package adapters
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"log"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -51,14 +54,12 @@ func (p *PostgreSQLAdapter) Connect(ctx context.Context, cfg config.DatabaseConf
 	defer cancel()
 
 	if err := db.PingContext(ctxTimeout); err != nil {
-		db.Close()
-		return fmt.Errorf("PostgreSQL接続テストエラー: %w", err)
+		return fmt.Errorf("PostgreSQL接続テストエラー: %w", errors.Join(err, db.Close()))
 	}
 
 	// PostgreSQL固有の設定を実行
 	if err := p.configurePostgreSQLSession(ctx, db); err != nil {
-		db.Close()
-		return fmt.Errorf("PostgreSQLセッション設定エラー: %w", err)
+		return fmt.Errorf("PostgreSQLセッション設定エラー: %w", errors.Join(err, db.Close()))
 	}
 
 	p.db = db
@@ -91,7 +92,7 @@ func (p *PostgreSQLAdapter) configurePostgreSQLSession(ctx context.Context, db *
 }
 
 // Query データを取得
-func (p *PostgreSQLAdapter) Query(ctx context.Context, query string, args ...interface{}) (*QueryResult, error) {
+func (p *PostgreSQLAdapter) Query(ctx context.Context, query string, args ...any) (*QueryResult, error) {
 	start := time.Now()
 
 	p.mutex.RLock()
@@ -109,7 +110,7 @@ func (p *PostgreSQLAdapter) Query(ctx context.Context, query string, args ...int
 			DBType:  "PostgreSQL",
 		}, nil
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 
 	columns, err := rows.Columns()
 	if err != nil {
@@ -120,10 +121,10 @@ func (p *PostgreSQLAdapter) Query(ctx context.Context, query string, args ...int
 		}, nil
 	}
 
-	var results []map[string]interface{}
+	var results []map[string]any
 	for rows.Next() {
-		values := make([]interface{}, len(columns))
-		valuePtrs := make([]interface{}, len(columns))
+		values := make([]any, len(columns))
+		valuePtrs := make([]any, len(columns))
 		for i := range columns {
 			valuePtrs[i] = &values[i]
 		}
@@ -136,7 +137,7 @@ func (p *PostgreSQLAdapter) Query(ctx context.Context, query string, args ...int
 			}, nil
 		}
 
-		row := make(map[string]interface{})
+		row := make(map[string]any)
 		for i, col := range columns {
 			// PostgreSQL特有のデータ型変換
 			val := values[i]
@@ -172,7 +173,7 @@ func (p *PostgreSQLAdapter) Query(ctx context.Context, query string, args ...int
 }
 
 // Execute データを変更
-func (p *PostgreSQLAdapter) Execute(ctx context.Context, query string, args ...interface{}) (sql.Result, error) {
+func (p *PostgreSQLAdapter) Execute(ctx context.Context, query string, args ...any) (sql.Result, error) {
 	p.mutex.RLock()
 	defer p.mutex.RUnlock()
 
@@ -201,13 +202,17 @@ func (p *PostgreSQLAdapter) Transaction(ctx context.Context, fn func(*sql.Tx) er
 
 	defer func() {
 		if r := recover(); r != nil {
-			tx.Rollback()
+			if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+				log.Printf("ロールバックエラー: %v", err)
+			}
 			panic(r)
 		}
 	}()
 
 	if err := fn(tx); err != nil {
-		tx.Rollback()
+		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+			return errors.Join(err, fmt.Errorf("ロールバックエラー: %w", rbErr))
+		}
 		return err
 	}
 
@@ -260,15 +265,15 @@ func (p *PostgreSQLAdapter) CreateUser(ctx context.Context, user *models.User) (
 	var existingID int64
 	checkQuery := `SELECT id FROM users WHERE email = $1`
 	err := p.db.QueryRowContext(ctx, checkQuery, user.Email).Scan(&existingID)
-	
-	if err != nil && err != sql.ErrNoRows {
+
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("存在チェックエラー: %w", err)
 	}
 
 	var id int64
 	var createdAt, updatedAt time.Time
 
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		// レコードが存在しない場合はINSERT
 		insertQuery := `
 			INSERT INTO users (name, email, age) 
@@ -309,6 +314,9 @@ func (p *PostgreSQLAdapter) GetUsersByAgeRange(ctx context.Context, minAge, maxA
 	result, err := p.Query(ctx, query, minAge, maxAge)
 	if err != nil {
 		return nil, fmt.Errorf("年齢範囲クエリエラー: %w", err)
+	}
+	if result.Error != nil {
+		return nil, fmt.Errorf("年齢範囲クエリエラー: %w", result.Error)
 	}
 
 	var users []*models.User
@@ -352,15 +360,12 @@ func (p *PostgreSQLAdapter) BulkInsertUsers(ctx context.Context, users []*models
 	// PostgreSQL最適化: COPY文またはUNNESTを使用
 	// ここではパフォーマンスの良いVALUES文を使用
 	batchSize := 1000
-	for i := 0; i < len(users); i += batchSize {
-		end := i + batchSize
-		if end > len(users) {
-			end = len(users)
+	offset := 0
+	for batch := range slices.Chunk(users, batchSize) {
+		if err := p.insertBatch(ctx, batch); err != nil {
+			return fmt.Errorf("バッチ挿入エラー (batch %d-%d): %w", offset, offset+len(batch)-1, err)
 		}
-
-		if err := p.insertBatch(ctx, users[i:end]); err != nil {
-			return fmt.Errorf("バッチ挿入エラー (batch %d-%d): %w", i, end-1, err)
-		}
+		offset += len(batch)
 	}
 
 	return nil
@@ -373,7 +378,7 @@ func (p *PostgreSQLAdapter) insertBatch(ctx context.Context, users []*models.Use
 
 	// PostgreSQL用の効率的なバッチ挿入
 	var valueStrings []string
-	var valueArgs []interface{}
+	var valueArgs []any
 
 	for i, user := range users {
 		valueStrings = append(valueStrings, fmt.Sprintf("($%d, $%d, $%d)", i*3+1, i*3+2, i*3+3))
@@ -387,7 +392,7 @@ func (p *PostgreSQLAdapter) insertBatch(ctx context.Context, users []*models.Use
 }
 
 // GetExplainPlan 実行計画取得（PostgreSQL特有）
-func (p *PostgreSQLAdapter) GetExplainPlan(ctx context.Context, query string, args ...interface{}) (*QueryResult, error) {
+func (p *PostgreSQLAdapter) GetExplainPlan(ctx context.Context, query string, args ...any) (*QueryResult, error) {
 	start := time.Now()
 
 	// PostgreSQLのEXPLAIN ANALYZE実行

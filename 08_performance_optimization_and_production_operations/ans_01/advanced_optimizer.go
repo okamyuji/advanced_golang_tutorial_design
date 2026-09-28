@@ -5,7 +5,7 @@
 package main
 
 import (
-	"context"
+	"errors"
 	"fmt"
 	"log"
 	"runtime"
@@ -17,11 +17,11 @@ import (
 // AdvancedOptimizer Go 1.24最適化機能を活用した高度な性能最適化システム
 type AdvancedOptimizer struct {
 	// 新map実装の効果測定用
-	optimizedMaps  []map[string]interface{}
-	mapAccessCount int64
+	optimizedMaps  []map[string]any
+	mapAccessCount atomic.Int64
 	mapMutex       sync.RWMutex
 
-	// メモリアロケータ最適化活用
+	// サイズ別のオブジェクトプール（割り当ての回数を減らす）
 	smallObjectPool  sync.Pool
 	mediumObjectPool sync.Pool
 	largeObjectPool  sync.Pool
@@ -34,11 +34,22 @@ type AdvancedOptimizer struct {
 
 	// 性能監視
 	performanceMonitor *PerformanceMonitor
-	optimizationReport *OptimizationReport
+	optimizationReport atomic.Pointer[OptimizationReport]
 }
+
+var errPoolStopped = errors.New("ワーカープールは停止済みです")
 
 // AllocationStats アロケーション統計
 type AllocationStats struct {
+	SmallObjects  atomic.Int64
+	MediumObjects atomic.Int64
+	LargeObjects  atomic.Int64
+	PoolMisses    atomic.Int64 // プールが空で New が作り直した回数
+	TotalAllocs   atomic.Int64 // プールから取り出した回数
+}
+
+// AllocationStatsSnapshot レポート用に読み出したアロケーション統計
+type AllocationStatsSnapshot struct {
 	SmallObjects  int64 `json:"small_objects"`
 	MediumObjects int64 `json:"medium_objects"`
 	LargeObjects  int64 `json:"large_objects"`
@@ -47,14 +58,42 @@ type AllocationStats struct {
 	TotalAllocs   int64 `json:"total_allocs"`
 }
 
+// snapshot 現在の値を読み出す。ヒット数は取り出し回数から New の回数を引いて求める
+func (s *AllocationStats) snapshot() AllocationStatsSnapshot {
+	total := s.TotalAllocs.Load()
+	misses := s.PoolMisses.Load()
+	return AllocationStatsSnapshot{
+		SmallObjects:  s.SmallObjects.Load(),
+		MediumObjects: s.MediumObjects.Load(),
+		LargeObjects:  s.LargeObjects.Load(),
+		PoolHits:      total - misses,
+		PoolMisses:    misses,
+		TotalAllocs:   total,
+	}
+}
+
 // OptimizedWorkerPool 最適化されたワーカープール
 type OptimizedWorkerPool struct {
 	workers     []chan func()
 	workerCount int
-	taskCount   int64
+	taskCount   atomic.Int64
 	wg          sync.WaitGroup
-	ctx         context.Context
-	cancel      context.CancelFunc
+
+	// mu 投入中（RLock）とチャネルの close（Lock）を排他する
+	mu     sync.RWMutex
+	closed bool
+}
+
+// submit 指定したワーカーにタスクを投入する。停止後はエラーを返す
+func (p *OptimizedWorkerPool) submit(workerIndex int, task func()) error {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.closed {
+		return errPoolStopped
+	}
+	// ワーカーは close されるまで受信し続けるので、この送信は必ず終わる
+	p.workers[workerIndex] <- task
+	return nil
 }
 
 // TaskDistributor タスク分散器
@@ -65,8 +104,8 @@ type TaskDistributor struct {
 
 // ResultCollector 結果収集器
 type ResultCollector struct {
-	results     map[string]interface{}
-	resultCount int64
+	results     map[string]any
+	resultCount atomic.Int64
 	mutex       sync.RWMutex
 }
 
@@ -89,12 +128,12 @@ type PerformanceMeasurement struct {
 
 // OptimizationReport 最適化レポート
 type OptimizationReport struct {
-	SystemInfo      SystemInfo         `json:"system_info"`
-	AllocStats      *AllocationStats   `json:"allocation_stats"`
-	MapStats        MapStatistics      `json:"map_stats"`
-	WorkerPoolStats WorkerPoolStats    `json:"worker_pool_stats"`
-	Performance     PerformanceMetrics `json:"performance"`
-	Improvements    []string           `json:"improvements"`
+	SystemInfo      SystemInfo              `json:"system_info"`
+	AllocStats      AllocationStatsSnapshot `json:"allocation_stats"`
+	MapStats        MapStatistics           `json:"map_stats"`
+	WorkerPoolStats WorkerPoolStats         `json:"worker_pool_stats"`
+	Performance     PerformanceMetrics      `json:"performance"`
+	Improvements    []string                `json:"improvements"`
 }
 
 // SystemInfo システム情報
@@ -126,38 +165,34 @@ type WorkerPoolStats struct {
 type PerformanceMetrics struct {
 	TotalRuntime   time.Duration `json:"total_runtime"`
 	CPUUtilization float64       `json:"cpu_utilization"`
-	MemoryPeak     uint64        `json:"memory_peak"`
+	MemoryInUse    uint64        `json:"memory_in_use"` // レポート作成時点のヒープ使用量（runtime.MemStats.Alloc）
 	GCOverhead     float64       `json:"gc_overhead"`
 }
 
 // NewAdvancedOptimizer 新しい高度最適化システムを作成
 func NewAdvancedOptimizer(workerCount int) *AdvancedOptimizer {
-	ctx, cancel := context.WithCancel(context.Background())
-
 	ao := &AdvancedOptimizer{
-		optimizedMaps: make([]map[string]interface{}, 0, 1000),
+		optimizedMaps: make([]map[string]any, 0, 1000),
 		allocStats:    &AllocationStats{},
 		workerPool: &OptimizedWorkerPool{
 			workers:     make([]chan func(), workerCount),
 			workerCount: workerCount,
-			ctx:         ctx,
-			cancel:      cancel,
 		},
 		taskDistributor: &TaskDistributor{
 			hashRing:  make([]int, workerCount),
 			nodeCount: workerCount,
 		},
 		resultCollector: &ResultCollector{
-			results: make(map[string]interface{}),
+			results: make(map[string]any),
 		},
 		performanceMonitor: &PerformanceMonitor{
 			startTime:    time.Now(),
 			measurements: make([]PerformanceMeasurement, 0, 1000),
 		},
-		optimizationReport: &OptimizationReport{},
 	}
+	ao.optimizationReport.Store(&OptimizationReport{})
 
-	// オブジェクトプール初期化（Go 1.24のメモリアロケータ最適化活用）
+	// オブジェクトプール初期化（使い終えたバッファを再利用して割り当ての回数を減らす）
 	ao.initializeObjectPools()
 
 	// ワーカープール初期化
@@ -173,24 +208,27 @@ func NewAdvancedOptimizer(workerCount int) *AdvancedOptimizer {
 func (ao *AdvancedOptimizer) initializeObjectPools() {
 	// 小オブジェクトプール（64バイト以下）
 	ao.smallObjectPool = sync.Pool{
-		New: func() interface{} {
-			atomic.AddInt64(&ao.allocStats.SmallObjects, 1)
+		New: func() any {
+			ao.allocStats.SmallObjects.Add(1)
+			ao.allocStats.PoolMisses.Add(1)
 			return make([]byte, 64)
 		},
 	}
 
 	// 中オブジェクトプール（1KB以下）
 	ao.mediumObjectPool = sync.Pool{
-		New: func() interface{} {
-			atomic.AddInt64(&ao.allocStats.MediumObjects, 1)
+		New: func() any {
+			ao.allocStats.MediumObjects.Add(1)
+			ao.allocStats.PoolMisses.Add(1)
 			return make([]byte, 1024)
 		},
 	}
 
 	// 大オブジェクトプール（8KB以下）
 	ao.largeObjectPool = sync.Pool{
-		New: func() interface{} {
-			atomic.AddInt64(&ao.allocStats.LargeObjects, 1)
+		New: func() any {
+			ao.allocStats.LargeObjects.Add(1)
+			ao.allocStats.PoolMisses.Add(1)
 			return make([]byte, 8192)
 		},
 	}
@@ -198,43 +236,31 @@ func (ao *AdvancedOptimizer) initializeObjectPools() {
 
 // initializeWorkerPool ワーカープール初期化
 func (ao *AdvancedOptimizer) initializeWorkerPool() {
-	for i := 0; i < ao.workerPool.workerCount; i++ {
-		ao.workerPool.workers[i] = make(chan func(), 10)
-
-		ao.workerPool.wg.Add(1)
-		go ao.optimizedWorker(i, ao.workerPool.workers[i])
+	for i := range ao.workerPool.workerCount {
+		taskChan := make(chan func(), 10)
+		ao.workerPool.workers[i] = taskChan
+		ao.workerPool.wg.Go(func() { ao.optimizedWorker(taskChan) })
 	}
 }
 
 // initializeTaskDistributor タスク分散器初期化
 func (ao *AdvancedOptimizer) initializeTaskDistributor() {
-	for i := 0; i < ao.taskDistributor.nodeCount; i++ {
+	for i := range ao.taskDistributor.nodeCount {
 		ao.taskDistributor.hashRing[i] = i
 	}
 }
 
-// optimizedWorker 最適化されたワーカー
-func (ao *AdvancedOptimizer) optimizedWorker(id int, taskChan chan func()) {
-	defer ao.workerPool.wg.Done()
+// optimizedWorker 最適化されたワーカー。Stop がチャネルを close するまで、
+// 投入済みのタスクを最後まで実行する（投入側が完了を待って止まらないようにするため）
+func (ao *AdvancedOptimizer) optimizedWorker(taskChan chan func()) {
+	for task := range taskChan {
+		startTime := time.Now()
+		task()
+		ao.workerPool.taskCount.Add(1)
 
-	for {
-		select {
-		case task, ok := <-taskChan:
-			if !ok {
-				return
-			}
-
-			startTime := time.Now()
-			task()
-			atomic.AddInt64(&ao.workerPool.taskCount, 1)
-
-			// 性能測定
-			latency := time.Since(startTime)
-			ao.recordLatency(latency)
-
-		case <-ao.workerPool.ctx.Done():
-			return
-		}
+		// 性能測定
+		latency := time.Since(startTime)
+		ao.recordLatency(latency)
 	}
 }
 
@@ -243,7 +269,7 @@ func (ao *AdvancedOptimizer) ProcessHighLoadData(dataSize int) error {
 	fmt.Printf("高負荷データ処理開始: %d件\n", dataSize)
 
 	// 性能測定開始
-	ao.performanceMonitor.startTime = time.Now()
+	startTime := time.Now()
 
 	// Map処理最適化テスト
 	if err := ao.optimizedMapProcessing(dataSize); err != nil {
@@ -261,7 +287,7 @@ func (ao *AdvancedOptimizer) ProcessHighLoadData(dataSize int) error {
 	}
 
 	// 性能レポート生成
-	ao.generateOptimizationReport()
+	ao.generateOptimizationReport(startTime)
 
 	fmt.Println("高負荷データ処理完了")
 	return nil
@@ -271,30 +297,24 @@ func (ao *AdvancedOptimizer) ProcessHighLoadData(dataSize int) error {
 func (ao *AdvancedOptimizer) optimizedMapProcessing(dataSize int) error {
 	fmt.Println("最適化Map処理開始")
 
-	// Go 1.24の新map実装を活用した並行アクセス
-	mapCount := dataSize / 1000
-	if mapCount < 1 {
-		mapCount = 1
-	}
+	// 組み込みmapはGo 1.24からSwiss Tablesの実装になった。並行アクセスはmapMutexで守る
+	mapCount := max(dataSize/1000, 1)
 
 	ao.mapMutex.Lock()
-	for i := 0; i < mapCount; i++ {
+	for range mapCount {
 		// 新map実装の効果を最大化するための設計
-		optimizedMap := make(map[string]interface{}, 1000)
+		optimizedMap := make(map[string]any, 1000)
 		ao.optimizedMaps = append(ao.optimizedMaps, optimizedMap)
 	}
 	ao.mapMutex.Unlock()
 
 	// 並行Map操作
 	var wg sync.WaitGroup
-	concurrency := runtime.NumCPU()
+	concurrency := runtime.GOMAXPROCS(0)
 
-	for i := 0; i < concurrency; i++ {
-		wg.Add(1)
-		go func(workerID int) {
-			defer wg.Done()
-
-			for j := 0; j < dataSize/concurrency; j++ {
+	for workerID := range concurrency {
+		wg.Go(func() {
+			for j := range dataSize / concurrency {
 				mapIndex := (workerID*dataSize/concurrency + j) % len(ao.optimizedMaps)
 				key := fmt.Sprintf("worker_%d_key_%d", workerID, j)
 				value := fmt.Sprintf("value_%d", j)
@@ -306,20 +326,20 @@ func (ao *AdvancedOptimizer) optimizedMapProcessing(dataSize int) error {
 				// 書き込み
 				ao.mapMutex.Lock()
 				targetMap[key] = value
-				atomic.AddInt64(&ao.mapAccessCount, 1)
+				ao.mapAccessCount.Add(1)
 				ao.mapMutex.Unlock()
 
 				// 読み込み
 				ao.mapMutex.RLock()
 				_ = targetMap[key]
-				atomic.AddInt64(&ao.mapAccessCount, 1)
+				ao.mapAccessCount.Add(1)
 				ao.mapMutex.RUnlock()
 			}
-		}(i)
+		})
 	}
 
 	wg.Wait()
-	fmt.Printf("Map処理完了: %d回のアクセス\n", atomic.LoadInt64(&ao.mapAccessCount))
+	fmt.Printf("Map処理完了: %d回のアクセス\n", ao.mapAccessCount.Load())
 	return nil
 }
 
@@ -328,26 +348,22 @@ func (ao *AdvancedOptimizer) optimizedMemoryAllocation(dataSize int) error {
 	fmt.Println("最適化メモリアロケーション開始")
 
 	var wg sync.WaitGroup
-	concurrency := runtime.NumCPU()
+	concurrency := runtime.GOMAXPROCS(0)
 
-	for i := 0; i < concurrency; i++ {
-		wg.Add(1)
-		go func(workerID int) {
-			defer wg.Done()
-
-			for j := 0; j < dataSize/concurrency; j++ {
+	for range concurrency {
+		wg.Go(func() {
+			for j := range dataSize / concurrency {
 				// サイズに応じたプール選択
 				size := (j % 3) + 1
 
-				var objInterface interface{}
+				var objInterface any
 				var obj []byte
 				switch size {
 				case 1: // 小オブジェクト
 					objInterface = ao.smallObjectPool.Get()
 					obj = objInterface.([]byte)
-					atomic.AddInt64(&ao.allocStats.PoolHits, 1)
 					// 処理シミュレート
-					for k := 0; k < len(obj); k++ {
+					for k := range obj {
 						obj[k] = byte(j % 256)
 					}
 					ao.smallObjectPool.Put(objInterface)
@@ -355,7 +371,6 @@ func (ao *AdvancedOptimizer) optimizedMemoryAllocation(dataSize int) error {
 				case 2: // 中オブジェクト
 					objInterface = ao.mediumObjectPool.Get()
 					obj = objInterface.([]byte)
-					atomic.AddInt64(&ao.allocStats.PoolHits, 1)
 					// 処理シミュレート
 					for k := 0; k < len(obj); k += 64 {
 						obj[k] = byte(j % 256)
@@ -365,7 +380,6 @@ func (ao *AdvancedOptimizer) optimizedMemoryAllocation(dataSize int) error {
 				case 3: // 大オブジェクト
 					objInterface = ao.largeObjectPool.Get()
 					obj = objInterface.([]byte)
-					atomic.AddInt64(&ao.allocStats.PoolHits, 1)
 					// 処理シミュレート
 					for k := 0; k < len(obj); k += 1024 {
 						obj[k] = byte(j % 256)
@@ -373,13 +387,13 @@ func (ao *AdvancedOptimizer) optimizedMemoryAllocation(dataSize int) error {
 					ao.largeObjectPool.Put(objInterface)
 				}
 
-				atomic.AddInt64(&ao.allocStats.TotalAllocs, 1)
+				ao.allocStats.TotalAllocs.Add(1)
 			}
-		}(i)
+		})
 	}
 
 	wg.Wait()
-	fmt.Printf("メモリアロケーション完了: %d回の割り当て\n", atomic.LoadInt64(&ao.allocStats.TotalAllocs))
+	fmt.Printf("メモリアロケーション完了: %d回の割り当て\n", ao.allocStats.TotalAllocs.Load())
 	return nil
 }
 
@@ -387,58 +401,48 @@ func (ao *AdvancedOptimizer) optimizedMemoryAllocation(dataSize int) error {
 func (ao *AdvancedOptimizer) optimizedConcurrentProcessing(dataSize int) error {
 	fmt.Println("最適化並行処理開始")
 
-	taskCount := 0
-	var taskMutex sync.Mutex
+	var taskCount atomic.Int64
+	var tasks sync.WaitGroup
 
-	// タスク投入
-	for i := 0; i < dataSize; i++ {
+	// タスク投入。ワーカーのキューが満杯なら空くまで待つ（バックプレッシャー）
+	var submitErr error
+	for taskID := range dataSize {
 		// タスク分散
-		workerIndex := ao.distributeTask(i)
+		workerIndex := ao.distributeTask(taskID)
 
-		task := func(taskID int) func() {
-			return func() {
-				// CPU集約的処理をシミュレート
-				result := 0
-				for j := 0; j < 1000; j++ {
-					result += j * taskID
-				}
-
-				// 結果保存
-				key := fmt.Sprintf("task_%d", taskID)
-				ao.resultCollector.mutex.Lock()
-				ao.resultCollector.results[key] = result
-				atomic.AddInt64(&ao.resultCollector.resultCount, 1)
-				ao.resultCollector.mutex.Unlock()
-
-				taskMutex.Lock()
-				taskCount++
-				taskMutex.Unlock()
+		task := func() {
+			defer tasks.Done()
+			// CPU集約的処理をシミュレート
+			result := 0
+			for j := range 1000 {
+				result += j * taskID
 			}
-		}(i)
 
-		// ワーカーにタスク投入
-		select {
-		case ao.workerPool.workers[workerIndex] <- task:
-		default:
-			// バックプレッシャー対応
-			time.Sleep(time.Microsecond)
-			i-- // 再試行
+			// 結果保存
+			key := fmt.Sprintf("task_%d", taskID)
+			ao.resultCollector.mutex.Lock()
+			ao.resultCollector.results[key] = result
+			ao.resultCollector.resultCount.Add(1)
+			ao.resultCollector.mutex.Unlock()
+
+			taskCount.Add(1)
 		}
-	}
 
-	// 全タスク完了待機
-	for {
-		taskMutex.Lock()
-		completed := taskCount
-		taskMutex.Unlock()
-
-		if completed >= dataSize {
+		tasks.Add(1)
+		if err := ao.workerPool.submit(workerIndex, task); err != nil {
+			tasks.Done()
+			submitErr = err
 			break
 		}
-		time.Sleep(time.Millisecond)
 	}
 
-	fmt.Printf("並行処理完了: %d個のタスク処理\n", taskCount)
+	// 投入済みのタスクはワーカーが必ず実行するので、全件の完了を待つ
+	tasks.Wait()
+	if submitErr != nil {
+		return submitErr
+	}
+
+	fmt.Printf("並行処理完了: %d個のタスク処理\n", taskCount.Load())
 	return nil
 }
 
@@ -454,11 +458,15 @@ func (ao *AdvancedOptimizer) recordLatency(latency time.Duration) {
 }
 
 // generateOptimizationReport 最適化レポート生成
-func (ao *AdvancedOptimizer) generateOptimizationReport() {
+func (ao *AdvancedOptimizer) generateOptimizationReport(startTime time.Time) {
 	var memStats runtime.MemStats
 	runtime.ReadMemStats(&memStats)
 
-	ao.optimizationReport = &OptimizationReport{
+	ao.mapMutex.RLock()
+	totalMaps := len(ao.optimizedMaps)
+	ao.mapMutex.RUnlock()
+
+	ao.optimizationReport.Store(&OptimizationReport{
 		SystemInfo: SystemInfo{
 			GoVersion: runtime.Version(),
 			GOOS:      runtime.GOOS,
@@ -466,40 +474,46 @@ func (ao *AdvancedOptimizer) generateOptimizationReport() {
 			NumCPU:    runtime.NumCPU(),
 			MaxProcs:  runtime.GOMAXPROCS(0),
 		},
-		AllocStats: ao.allocStats,
+		AllocStats: ao.allocStats.snapshot(),
 		MapStats: MapStatistics{
-			TotalMaps:   len(ao.optimizedMaps),
-			AccessCount: atomic.LoadInt64(&ao.mapAccessCount),
+			TotalMaps:   totalMaps,
+			AccessCount: ao.mapAccessCount.Load(),
 		},
 		WorkerPoolStats: WorkerPoolStats{
 			WorkerCount:    ao.workerPool.workerCount,
-			TasksProcessed: atomic.LoadInt64(&ao.workerPool.taskCount),
+			TasksProcessed: ao.workerPool.taskCount.Load(),
 		},
 		Performance: PerformanceMetrics{
-			TotalRuntime: time.Since(ao.performanceMonitor.startTime),
-			MemoryPeak:   memStats.Alloc,
+			TotalRuntime: time.Since(startTime),
+			MemoryInUse:  memStats.Alloc,
 		},
 		Improvements: []string{
-			"Go 1.24新map実装による並行アクセス性能向上",
+			"Go 1.24の組み込みmapのSwiss Tables化",
 			"メモリアロケータ最適化による小オブジェクト処理改善",
 			"ランタイム内部mutex改善による高並行負荷安定性向上",
 		},
-	}
+	})
 }
 
 // GetOptimizationReport 最適化レポート取得
 func (ao *AdvancedOptimizer) GetOptimizationReport() *OptimizationReport {
-	return ao.optimizationReport
+	return ao.optimizationReport.Load()
 }
 
-// Stop システム停止
+// Stop システム停止。投入済みのタスクを実行し終えてからワーカーを止める。二度目以降の呼び出しは何もしない
 func (ao *AdvancedOptimizer) Stop() error {
-	ao.workerPool.cancel()
+	ao.workerPool.mu.Lock()
+	if ao.workerPool.closed {
+		ao.workerPool.mu.Unlock()
+		return nil
+	}
+	ao.workerPool.closed = true
 
 	// ワーカーチャンネル閉鎖
 	for _, worker := range ao.workerPool.workers {
 		close(worker)
 	}
+	ao.workerPool.mu.Unlock()
 
 	// ワーカー完了待機
 	ao.workerPool.wg.Wait()
@@ -510,7 +524,8 @@ func (ao *AdvancedOptimizer) Stop() error {
 
 func main() {
 	// Go 1.24最適化機能を活用した性能改善システム実行
-	optimizer := NewAdvancedOptimizer(runtime.NumCPU())
+	workerCount := runtime.GOMAXPROCS(0)
+	optimizer := NewAdvancedOptimizer(workerCount)
 	defer func() {
 		if err := optimizer.Stop(); err != nil {
 			log.Printf("Failed to stop optimizer: %v", err)
@@ -518,7 +533,7 @@ func main() {
 	}()
 
 	fmt.Println("Go 1.24 高度性能最適化システム開始")
-	fmt.Printf("CPU数: %d, ワーカー数: %d\n", runtime.NumCPU(), runtime.NumCPU())
+	fmt.Printf("CPU数: %d, ワーカー数: %d\n", runtime.NumCPU(), workerCount)
 
 	// 高負荷データ処理実行
 	dataSize := 100000
@@ -535,7 +550,7 @@ func main() {
 	fmt.Printf("メモリアロケーション数: %d\n", report.AllocStats.TotalAllocs)
 	fmt.Printf("プールヒット数: %d\n", report.AllocStats.PoolHits)
 	fmt.Printf("処理タスク数: %d\n", report.WorkerPoolStats.TasksProcessed)
-	fmt.Printf("メモリピーク: %d bytes\n", report.Performance.MemoryPeak)
+	fmt.Printf("メモリ使用量（レポート作成時点）: %d bytes\n", report.Performance.MemoryInUse)
 
 	fmt.Printf("\n=== 改善項目 ===\n")
 	for i, improvement := range report.Improvements {

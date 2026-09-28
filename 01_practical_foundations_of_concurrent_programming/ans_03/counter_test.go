@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -9,7 +8,7 @@ import (
 	"time"
 )
 
-// SafeCounter 安全なカウンターです
+// SafeCounter Mutexで保護したカウンターです
 type SafeCounter struct {
 	mu    sync.Mutex
 	value int64
@@ -29,29 +28,29 @@ func (sc *SafeCounter) Value() int64 {
 	return sc.value
 }
 
-// AtomicCounter 原子操作を使用するカウンターです
+// AtomicCounter 型付きatomicを使うカウンターです
 type AtomicCounter struct {
-	value int64
+	value atomic.Int64
 }
 
 // Increment カウンターを原子的にインクリメントします
 func (ac *AtomicCounter) Increment() {
-	atomic.AddInt64(&ac.value, 1)
+	ac.value.Add(1)
 }
 
 // Value 現在の値を取得します
 func (ac *AtomicCounter) Value() int64 {
-	return atomic.LoadInt64(&ac.value)
+	return ac.value.Load()
 }
 
-// UnsafeCounter 安全でないカウンターです（比較用）
+// UnsafeCounter 同期しないカウンターです（比較用）
 type UnsafeCounter struct {
 	value int64
 }
 
-// Increment カウンターを安全でないインクリメントします
+// Increment 同期せずにインクリメントします
 func (uc *UnsafeCounter) Increment() {
-	uc.value++ // レースコンディションが発生する可能性
+	uc.value++ // データレースになる
 }
 
 // Value 現在の値を取得します
@@ -59,222 +58,111 @@ func (uc *UnsafeCounter) Value() int64 {
 	return uc.value
 }
 
-// TestSafeCounter_WithSynctest Mutexを使った安全なカウンターをテストします
-func TestSafeCounter_WithSynctest(t *testing.T) {
-	synctest.Run(func() {
-		counter := &SafeCounter{}
-		const numGoroutines = 100
-		const incrementsPerGoroutine = 10
-
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-
-		var wg sync.WaitGroup
-
-		// 複数のGoroutineでカウンターを並行更新
-		for i := 0; i < numGoroutines; i++ {
-			wg.Add(1)
-			go func(goroutineID int) {
-				defer wg.Done()
-
-				for j := 0; j < incrementsPerGoroutine; j++ {
-					select {
-					case <-ctx.Done():
-						return
-					default:
-						counter.Increment()
-
-						// 他のGoroutineに処理を譲る機会を与える
-						time.Sleep(1 * time.Millisecond)
-					}
-				}
-			}(i)
-		}
-
-		// すべてのGoroutineの完了を待機
-		wg.Wait()
-
-		// 期待値と実際の値を比較
-		expected := int64(numGoroutines * incrementsPerGoroutine)
-		actual := counter.Value()
-
-		if actual != expected {
-			t.Errorf("Safe counter test failed: expected %d, got %d", expected, actual)
-		}
-
-		t.Logf("Safe counter test passed: %d increments completed correctly", actual)
-	})
+type counter interface {
+	Increment()
+	Value() int64
 }
 
-// TestAtomicCounter_WithSynctest 原子操作を使ったカウンターをテストします
-func TestAtomicCounter_WithSynctest(t *testing.T) {
-	synctest.Run(func() {
-		counter := &AtomicCounter{}
-		const numGoroutines = 100
-		const incrementsPerGoroutine = 10
-
-		var wg sync.WaitGroup
-
-		// 複数のGoroutineでカウンターを並行更新
-		for i := 0; i < numGoroutines; i++ {
-			wg.Add(1)
-			go func(goroutineID int) {
-				defer wg.Done()
-
-				for j := 0; j < incrementsPerGoroutine; j++ {
-					counter.Increment()
-
-					// 他のGoroutineに処理を譲る機会を与える
-					time.Sleep(1 * time.Millisecond)
-				}
-			}(i)
-		}
-
-		// すべてのGoroutineの完了を待機
-		wg.Wait()
-
-		// 期待値と実際の値を比較
-		expected := int64(numGoroutines * incrementsPerGoroutine)
-		actual := counter.Value()
-
-		if actual != expected {
-			t.Errorf("Atomic counter test failed: expected %d, got %d", expected, actual)
-		}
-
-		t.Logf("Atomic counter test passed: %d increments completed correctly", actual)
-	})
+// runIncrements goroutinesごとにincrements回インクリメントし、合計を返します
+func runIncrements(c counter, goroutines, increments int) int64 {
+	var wg sync.WaitGroup
+	for range goroutines {
+		wg.Go(func() {
+			for range increments {
+				c.Increment()
+				// 仮想時計の上で他のgoroutineと交互に進める
+				time.Sleep(time.Millisecond)
+			}
+		})
+	}
+	wg.Wait()
+	return c.Value()
 }
 
-// TestUnsafeCounter_DetectRaceCondition 安全でないカウンターでレースコンディションを検出します
+// TestCounters_WithSynctest Mutex版とatomic版が並行更新で値を失わないことを確かめます
+func TestCounters_WithSynctest(t *testing.T) {
+	tests := []struct {
+		name    string
+		counter counter
+	}{
+		{"mutex", &SafeCounter{}},
+		{"atomic", &AtomicCounter{}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				const goroutines, increments = 100, 10
+				start := time.Now()
+
+				got := runIncrements(tt.counter, goroutines, increments)
+
+				if want := int64(goroutines * increments); got != want {
+					t.Errorf("expected %d, got %d", want, got)
+				}
+				// 1msのSleepを10回重ねても、仮想時計はちょうど10ms進むだけで実時間は待たない
+				if elapsed := time.Since(start); elapsed != 10*time.Millisecond {
+					t.Errorf("expected virtual elapsed 10ms, got %v", elapsed)
+				}
+			})
+		})
+	}
+}
+
+// TestUnsafeCounter_DetectRaceCondition 同期しないカウンターの結果を記録します
+// go test -race ではレース検出器がこの競合を報告してテストを失敗させるため、raceビルドではスキップします
 func TestUnsafeCounter_DetectRaceCondition(t *testing.T) {
-	// このテストは通常の環境では間欠的に失敗する可能性があります
-	// synctestでは決定的な結果が得られます
-
-	synctest.Run(func() {
-		counter := &UnsafeCounter{}
-		const numGoroutines = 50
-		const incrementsPerGoroutine = 20
-
-		var wg sync.WaitGroup
-
-		// 複数のGoroutineでカウンターを並行更新
-		for i := 0; i < numGoroutines; i++ {
-			wg.Add(1)
-			go func(goroutineID int) {
-				defer wg.Done()
-
-				for j := 0; j < incrementsPerGoroutine; j++ {
-					counter.Increment() // レースコンディションが発生する可能性
-
-					// 他のGoroutineに処理を譲る機会を与える
-					time.Sleep(1 * time.Millisecond)
-				}
-			}(i)
-		}
-
-		// すべてのGoroutineの完了を待機
-		wg.Wait()
-
-		expected := int64(numGoroutines * incrementsPerGoroutine)
-		actual := counter.Value()
-
-		// レースコンディションにより期待値と異なる可能性があることを記録
-		if actual != expected {
-			t.Logf("Race condition detected: expected %d, got %d (difference: %d)",
-				expected, actual, expected-actual)
-		} else {
-			t.Logf("Unsafe counter got lucky: %d increments completed (but this is not guaranteed)", actual)
-		}
-
-		// 安全でないカウンターのテストでは失敗を期待しない
-		// （レースコンディションは必ず発生するわけではないため）
+	if raceEnabled {
+		t.Skip("UnsafeCounterは意図的なデータレースを含むため、-raceでは実行しない")
+	}
+	synctest.Test(t, func(t *testing.T) {
+		const goroutines, increments = 50, 20
+		got := runIncrements(&UnsafeCounter{}, goroutines, increments)
+		want := int64(goroutines * increments)
+		t.Logf("unsafe counter: expected %d, got %d (一致しても正しさは保証されない)", want, got)
 	})
 }
 
-// TestConcurrentCounterOperations 複数の操作を同時に実行するテストです
-func TestConcurrentCounterOperations(t *testing.T) {
-	synctest.Run(func() {
+// TestConcurrentReadWrite 読み取りと書き込みを同時に行っても最終値が一致することを確かめます
+func TestConcurrentReadWrite(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
 		safeCounter := &SafeCounter{}
 		atomicCounter := &AtomicCounter{}
-
-		const numReaders = 10
-		const numWriters = 10
-		const operationsPerGoroutine = 5
+		const readers, writers, ops = 10, 10, 5
 
 		var wg sync.WaitGroup
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-
-		// 書き込みGoroutineを開始
-		for i := 0; i < numWriters; i++ {
-			wg.Add(1)
-			go func(writerID int) {
-				defer wg.Done()
-
-				for j := 0; j < operationsPerGoroutine; j++ {
-					select {
-					case <-ctx.Done():
-						return
-					default:
-						safeCounter.Increment()
-						atomicCounter.Increment()
-						time.Sleep(1 * time.Millisecond)
-					}
+		for range writers {
+			wg.Go(func() {
+				for range ops {
+					safeCounter.Increment()
+					atomicCounter.Increment()
+					time.Sleep(time.Millisecond)
 				}
-			}(i)
+			})
 		}
-
-		// 読み込みGoroutineを開始
-		for i := 0; i < numReaders; i++ {
-			wg.Add(1)
-			go func(readerID int) {
-				defer wg.Done()
-
-				for j := 0; j < operationsPerGoroutine; j++ {
-					select {
-					case <-ctx.Done():
-						return
-					default:
-						safeValue := safeCounter.Value()
-						atomicValue := atomicCounter.Value()
-
-						// 値の一貫性をチェック
-						if safeValue < 0 || atomicValue < 0 {
-							t.Errorf("Reader %d: negative value detected: safe=%d, atomic=%d",
-								readerID, safeValue, atomicValue)
-						}
-
-						time.Sleep(1 * time.Millisecond)
+		for id := range readers {
+			wg.Go(func() {
+				for range ops {
+					if s, a := safeCounter.Value(), atomicCounter.Value(); s < 0 || a < 0 {
+						t.Errorf("reader %d: negative value: safe=%d atomic=%d", id, s, a)
 					}
+					time.Sleep(time.Millisecond)
 				}
-			}(i)
+			})
 		}
-
-		// すべてのGoroutineの完了を待機
 		wg.Wait()
 
-		// 最終的な値をチェック
-		expectedWrites := int64(numWriters * operationsPerGoroutine)
-		safeValue := safeCounter.Value()
-		atomicValue := atomicCounter.Value()
-
-		if safeValue != expectedWrites {
-			t.Errorf("Safe counter final value incorrect: expected %d, got %d", expectedWrites, safeValue)
+		want := int64(writers * ops)
+		if got := safeCounter.Value(); got != want {
+			t.Errorf("safe counter: expected %d, got %d", want, got)
 		}
-
-		if atomicValue != expectedWrites {
-			t.Errorf("Atomic counter final value incorrect: expected %d, got %d", expectedWrites, atomicValue)
+		if got := atomicCounter.Value(); got != want {
+			t.Errorf("atomic counter: expected %d, got %d", want, got)
 		}
-
-		t.Logf("Concurrent operations test passed: %d writes, %d reads completed",
-			expectedWrites, numReaders*operationsPerGoroutine)
 	})
 }
 
-// ベンチマーク用の実装
 func BenchmarkSafeCounter(b *testing.B) {
 	counter := &SafeCounter{}
-
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			counter.Increment()
@@ -284,7 +172,6 @@ func BenchmarkSafeCounter(b *testing.B) {
 
 func BenchmarkAtomicCounter(b *testing.B) {
 	counter := &AtomicCounter{}
-
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			counter.Increment()

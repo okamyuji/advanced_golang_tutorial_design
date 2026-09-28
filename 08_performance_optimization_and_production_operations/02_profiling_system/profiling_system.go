@@ -3,15 +3,26 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"maps"
+	"net"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
 	"runtime"
+	"runtime/metrics"
 	"runtime/pprof"
+	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
+)
+
+var (
+	errAlreadyRunning = errors.New("プロファイリングは実行中です")
+	errStopped        = errors.New("プロファイリングは停止済みです")
 )
 
 // ProfilingSystem 継続的性能監視システム
@@ -21,36 +32,50 @@ type ProfilingSystem struct {
 	dataRetention   time.Duration
 	profiles        map[string]*ProfileData
 	mutex           sync.RWMutex
-	running         bool
+	running         atomic.Bool
 	stopChan        chan struct{}
+
+	// stateMu 開始と停止の多重呼び出しを排他する
+	stateMu sync.Mutex
+	stopped bool
+	addr    net.Addr // 実際に待ち受けているアドレス（ポート0を指定した場合に確定したポートを知るため）
+	wg      sync.WaitGroup
 }
 
 // ProfileData プロファイルデータ構造
 type ProfileData struct {
-	Timestamp     time.Time              `json:"timestamp"`
-	CPUProfile    string                 `json:"cpu_profile,omitempty"`
-	MemProfile    string                 `json:"mem_profile,omitempty"`
-	GoroutineInfo *GoroutineInfo         `json:"goroutine_info"`
-	MemStats      *runtime.MemStats      `json:"mem_stats"`
-	Metrics       map[string]interface{} `json:"metrics"`
+	Timestamp     time.Time         `json:"timestamp"`
+	CPUProfile    string            `json:"cpu_profile,omitempty"`
+	MemProfile    string            `json:"mem_profile,omitempty"`
+	GoroutineInfo *GoroutineInfo    `json:"goroutine_info"`
+	MemStats      *runtime.MemStats `json:"mem_stats"`
+	Metrics       map[string]any    `json:"metrics"`
 }
 
-// GoroutineInfo Goroutine情報
+// GoroutineInfo Goroutine情報。状態別の数は runtime/metrics の近似値で、合計は Count と一致するとは限らない
 type GoroutineInfo struct {
 	Count    int `json:"count"`
 	Running  int `json:"running"`
+	Runnable int `json:"runnable"`
 	Waiting  int `json:"waiting"`
-	Sleeping int `json:"sleeping"`
-	Blocked  int `json:"blocked"`
 	Syscall  int `json:"syscall"`
+}
+
+// goroutineMetricNames collectGoroutineInfo が読むメトリクス（Go 1.26 以降）
+var goroutineMetricNames = []string{
+	"/sched/goroutines:goroutines",
+	"/sched/goroutines/running:goroutines",
+	"/sched/goroutines/runnable:goroutines",
+	"/sched/goroutines/waiting:goroutines",
+	"/sched/goroutines/not-in-go:goroutines",
 }
 
 // PerformanceAlert パフォーマンスアラート
 type PerformanceAlert struct {
-	Level     string                 `json:"level"`
-	Message   string                 `json:"message"`
-	Timestamp time.Time              `json:"timestamp"`
-	Metrics   map[string]interface{} `json:"metrics"`
+	Level     string         `json:"level"`
+	Message   string         `json:"message"`
+	Timestamp time.Time      `json:"timestamp"`
+	Metrics   map[string]any `json:"metrics"`
 }
 
 // NewProfilingSystem 新しいプロファイリングシステムを作成
@@ -77,46 +102,78 @@ func NewProfilingSystem(port int, profileInterval, dataRetention time.Duration) 
 	return ps
 }
 
-// Start プロファイリング開始
+// StartProfiling プロファイリング開始。ポートを確保できなければエラーを返す
 func (ps *ProfilingSystem) StartProfiling(ctx context.Context) error {
-	ps.running = true
+	ps.stateMu.Lock()
+	defer ps.stateMu.Unlock()
+	// http.Server と stopChan は停止後に再利用できないので、停止後の再開は受け付けない
+	if ps.stopped {
+		return errStopped
+	}
+	if ps.running.Load() {
+		return errAlreadyRunning
+	}
+
+	listener, err := net.Listen("tcp", ps.httpServer.Addr)
+	if err != nil {
+		return fmt.Errorf("プロファイリングサーバー起動エラー: %w", err)
+	}
+	ps.addr = listener.Addr()
+	ps.running.Store(true)
 
 	// HTTP pprofエンドポイント起動
-	go func() {
-		fmt.Printf("プロファイリングサーバー開始: %s\n", ps.httpServer.Addr)
-		if err := ps.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	fmt.Printf("プロファイリングサーバー開始: %s\n", listener.Addr())
+	ps.wg.Go(func() {
+		if err := ps.httpServer.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			fmt.Printf("プロファイリングサーバーエラー: %v\n", err)
 		}
-	}()
+	})
 
 	// 定期プロファイル収集
-	go ps.profileCollectionLoop(ctx)
+	ps.wg.Go(func() { ps.profileCollectionLoop(ctx) })
 
 	// データクリーンアップ
-	go ps.dataCleanupLoop(ctx)
+	ps.wg.Go(func() { ps.dataCleanupLoop(ctx) })
 
 	return nil
 }
 
-// Stop プロファイリング停止
+// listenAddr 待ち受け中のアドレスを返す。開始前は空文字列
+func (ps *ProfilingSystem) listenAddr() string {
+	ps.stateMu.Lock()
+	defer ps.stateMu.Unlock()
+	if ps.addr == nil {
+		return ""
+	}
+	return ps.addr.String()
+}
+
+// Stop プロファイリング停止。二度目以降の呼び出しや開始前の呼び出しは何もしない
 func (ps *ProfilingSystem) Stop() error {
-	ps.running = false
+	ps.stateMu.Lock()
+	defer ps.stateMu.Unlock()
+	if !ps.running.Load() {
+		return nil
+	}
+	ps.running.Store(false)
+	ps.stopped = true
 	close(ps.stopChan)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	return ps.httpServer.Shutdown(ctx)
+	err := ps.httpServer.Shutdown(ctx)
+	ps.wg.Wait()
+	return err
 }
 
 // profileCollectionLoop プロファイル収集ループ
 func (ps *ProfilingSystem) profileCollectionLoop(ctx context.Context) {
-	ticker := time.NewTicker(ps.profileInterval)
-	defer ticker.Stop()
+	tick := time.Tick(ps.profileInterval)
 
 	for {
 		select {
-		case <-ticker.C:
+		case <-tick:
 			ps.collectProfiles()
 		case <-ctx.Done():
 			return
@@ -158,22 +215,32 @@ func (ps *ProfilingSystem) collectProfiles() {
 
 // collectGoroutineInfo Goroutine情報収集
 func (ps *ProfilingSystem) collectGoroutineInfo() *GoroutineInfo {
-	count := runtime.NumGoroutine()
+	samples := make([]metrics.Sample, len(goroutineMetricNames))
+	for i, name := range goroutineMetricNames {
+		samples[i].Name = name
+	}
+	metrics.Read(samples)
 
-	// 詳細なGoroutine情報は実装簡略化のため基本情報のみ
+	values := make([]int, len(samples))
+	for i, sample := range samples {
+		// 古いランタイムなど、メトリクスが存在しない場合は KindBad になるので 0 のままにする
+		if sample.Value.Kind() == metrics.KindUint64 {
+			values[i] = int(sample.Value.Uint64())
+		}
+	}
+
 	return &GoroutineInfo{
-		Count:    count,
-		Running:  count / 4, // 簡略化した推定値
-		Waiting:  count / 4,
-		Sleeping: count / 4,
-		Blocked:  count / 8,
-		Syscall:  count / 8,
+		Count:    values[0],
+		Running:  values[1],
+		Runnable: values[2],
+		Waiting:  values[3],
+		Syscall:  values[4],
 	}
 }
 
 // collectCustomMetrics カスタムメトリクス収集
-func (ps *ProfilingSystem) collectCustomMetrics() map[string]interface{} {
-	return map[string]interface{}{
+func (ps *ProfilingSystem) collectCustomMetrics() map[string]any {
+	return map[string]any{
 		"timestamp":       time.Now().Unix(),
 		"cpu_count":       runtime.NumCPU(),
 		"goroutine_count": runtime.NumGoroutine(),
@@ -181,8 +248,8 @@ func (ps *ProfilingSystem) collectCustomMetrics() map[string]interface{} {
 	}
 }
 
-// checkPerformanceAlerts パフォーマンスアラート判定
-func (ps *ProfilingSystem) checkPerformanceAlerts(data *ProfileData) {
+// checkPerformanceAlerts パフォーマンスアラート判定。発生したアラートを返す
+func (ps *ProfilingSystem) checkPerformanceAlerts(data *ProfileData) []PerformanceAlert {
 	alerts := []PerformanceAlert{}
 
 	// メモリ使用量アラート
@@ -191,7 +258,7 @@ func (ps *ProfilingSystem) checkPerformanceAlerts(data *ProfileData) {
 			Level:     "WARNING",
 			Message:   "メモリ使用量が閾値を超過しています",
 			Timestamp: data.Timestamp,
-			Metrics: map[string]interface{}{
+			Metrics: map[string]any{
 				"memory_alloc": data.MemStats.Alloc,
 				"threshold":    100 * 1024 * 1024,
 			},
@@ -204,7 +271,7 @@ func (ps *ProfilingSystem) checkPerformanceAlerts(data *ProfileData) {
 			Level:     "WARNING",
 			Message:   "Goroutine数が閾値を超過しています",
 			Timestamp: data.Timestamp,
-			Metrics: map[string]interface{}{
+			Metrics: map[string]any{
 				"goroutine_count": data.GoroutineInfo.Count,
 				"threshold":       1000,
 			},
@@ -215,16 +282,16 @@ func (ps *ProfilingSystem) checkPerformanceAlerts(data *ProfileData) {
 	for _, alert := range alerts {
 		fmt.Printf("ALERT [%s] %s: %s\n", alert.Level, alert.Timestamp.Format(time.RFC3339), alert.Message)
 	}
+	return alerts
 }
 
 // dataCleanupLoop データクリーンアップループ
 func (ps *ProfilingSystem) dataCleanupLoop(ctx context.Context) {
-	ticker := time.NewTicker(time.Hour)
-	defer ticker.Stop()
+	tick := time.Tick(time.Hour)
 
 	for {
 		select {
-		case <-ticker.C:
+		case <-tick:
 			ps.cleanupOldData()
 		case <-ctx.Done():
 			return
@@ -252,10 +319,10 @@ func (ps *ProfilingSystem) cleanupOldData() {
 
 // healthHandler ヘルスチェックハンドラー
 func (ps *ProfilingSystem) healthHandler(w http.ResponseWriter, r *http.Request) {
-	status := map[string]interface{}{
+	status := map[string]any{
 		"status":    "healthy",
 		"timestamp": time.Now().Unix(),
-		"running":   ps.running,
+		"running":   ps.running.Load(),
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -269,7 +336,7 @@ func (ps *ProfilingSystem) metricsHandler(w http.ResponseWriter, r *http.Request
 	var memStats runtime.MemStats
 	runtime.ReadMemStats(&memStats)
 
-	metrics := map[string]interface{}{
+	metrics := map[string]any{
 		"goroutine_count": runtime.NumGoroutine(),
 		"memory_alloc":    memStats.Alloc,
 		"memory_sys":      memStats.Sys,
@@ -285,20 +352,13 @@ func (ps *ProfilingSystem) metricsHandler(w http.ResponseWriter, r *http.Request
 
 // profilesHandler プロファイルデータハンドラー
 func (ps *ProfilingSystem) profilesHandler(w http.ResponseWriter, r *http.Request) {
+	// 最新の10件のプロファイルを新しい順に返す（map の走査順は不定なので並べ替える）
 	ps.mutex.RLock()
-	defer ps.mutex.RUnlock()
-
-	// 最新の10件のプロファイルを返す
-	profiles := make([]*ProfileData, 0, 10)
-	count := 0
-
-	for _, profile := range ps.profiles {
-		if count >= 10 {
-			break
-		}
-		profiles = append(profiles, profile)
-		count++
-	}
+	profiles := slices.SortedFunc(maps.Values(ps.profiles), func(a, b *ProfileData) int {
+		return b.Timestamp.Compare(a.Timestamp)
+	})
+	ps.mutex.RUnlock()
+	profiles = profiles[:min(len(profiles), 10)]
 
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(profiles); err != nil {
@@ -319,7 +379,7 @@ func (ps *ProfilingSystem) alertsHandler(w http.ResponseWriter, r *http.Request)
 			Level:     "WARNING",
 			Message:   "メモリ使用量が閾値を超過",
 			Timestamp: time.Now(),
-			Metrics: map[string]interface{}{
+			Metrics: map[string]any{
 				"memory_alloc": memStats.Alloc,
 			},
 		})

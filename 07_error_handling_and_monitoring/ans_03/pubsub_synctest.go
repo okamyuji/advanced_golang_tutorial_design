@@ -1,22 +1,28 @@
 package main
 
 import (
+	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"log"
+	"maps"
+	"slices"
 	"sync"
 	"sync/atomic"
-	"testing"
 	"time"
 )
 
+// ErrStopped 停止後のシステムに対する操作で返します
+var ErrStopped = errors.New("pubsub system is stopped")
+
 // Message パブリッシュ・サブスクライブシステムのメッセージです
 type Message struct {
-	ID        string      `json:"id"`
-	Topic     string      `json:"topic"`
-	Payload   interface{} `json:"payload"`
-	Timestamp time.Time   `json:"timestamp"`
-	Sequence  uint64      `json:"sequence"`
+	ID        string    `json:"id"`
+	Topic     string    `json:"topic"`
+	Payload   any       `json:"payload"`
+	Timestamp time.Time `json:"timestamp"`
+	Sequence  uint64    `json:"sequence"`
 }
 
 // MessageHandler メッセージハンドラーのインターフェースです
@@ -37,24 +43,25 @@ type PubSubConfig struct {
 
 // PubSubSystem パブリッシュ・サブスクライブシステムです
 type PubSubSystem struct {
-	config        PubSubConfig
-	topics        map[string]*Topic
-	subscribers   map[string]map[string]*Subscriber
-	messageSeq    uint64
-	publishedMsgs map[string]Message // 配信保証用
-	mutex         sync.RWMutex
-	isRunning     int64
-	ctx           context.Context
-	cancel        context.CancelFunc
+	config      PubSubConfig
+	topics      map[string]*Topic
+	subscribers map[string]map[string]*Subscriber
+	messageSeq  atomic.Uint64
+	mutex       sync.RWMutex
+	isRunning   atomic.Bool
+	ctx         context.Context
+	cancel      context.CancelFunc
+	// wg トピック処理と配信の goroutine を数え、Stop がその終了を待てるようにします
+	wg sync.WaitGroup
 }
 
 // Topic トピックを表します
 type Topic struct {
-	name         string
-	messageChan  chan Message
-	subscribers  map[string]*Subscriber
-	messageQueue []Message // 順序保証用
-	mutex        sync.RWMutex
+	name        string
+	messageChan chan Message
+	subscribers map[string]*Subscriber
+	// mutex subscribers を守ります。Publish は採番とチャネル投入をこのロック内で行い、チャネル内の順序をシーケンス順にそろえます
+	mutex sync.RWMutex
 }
 
 // Subscriber サブスクライバーを表します
@@ -64,43 +71,41 @@ type Subscriber struct {
 	handler         MessageHandler
 	messageChan     chan Message
 	processedMsgs   map[string]bool    // 重複排除用
-	lastSequence    uint64             // 順序保証用
 	ackChan         chan string        // 配信確認用
 	pendingMessages map[string]Message // 配信保証用
-	isRunning       int64
+	maxRetries      int
+	retryDelay      time.Duration
+	isRunning       atomic.Bool
 	ctx             context.Context
 	cancel          context.CancelFunc
 	mutex           sync.RWMutex
+	wg              sync.WaitGroup
 }
 
 // NewPubSubSystem 新しいパブリッシュ・サブスクライブシステムを作成します
 func NewPubSubSystem(config PubSubConfig) *PubSubSystem {
-	if config.BufferSize == 0 {
-		config.BufferSize = 1000
-	}
-	if config.MaxRetries == 0 {
-		config.MaxRetries = 3
-	}
-	if config.RetryDelay == 0 {
-		config.RetryDelay = 100 * time.Millisecond
-	}
+	config.BufferSize = cmp.Or(config.BufferSize, 1000)
+	config.MaxRetries = cmp.Or(config.MaxRetries, 3)
+	config.RetryDelay = cmp.Or(config.RetryDelay, 100*time.Millisecond)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &PubSubSystem{
-		config:        config,
-		topics:        make(map[string]*Topic),
-		subscribers:   make(map[string]map[string]*Subscriber),
-		publishedMsgs: make(map[string]Message),
-		ctx:           ctx,
-		cancel:        cancel,
+		config:      config,
+		topics:      make(map[string]*Topic),
+		subscribers: make(map[string]map[string]*Subscriber),
+		ctx:         ctx,
+		cancel:      cancel,
 	}
 }
 
 // Start システムを開始します
 func (ps *PubSubSystem) Start() error {
-	if !atomic.CompareAndSwapInt64(&ps.isRunning, 0, 1) {
-		return fmt.Errorf("pubsub system is already running")
+	if ps.ctx.Err() != nil {
+		return ErrStopped
+	}
+	if !ps.isRunning.CompareAndSwap(false, true) {
+		return errors.New("pubsub system is already running")
 	}
 
 	log.Println("Starting PubSub System...")
@@ -109,23 +114,30 @@ func (ps *PubSubSystem) Start() error {
 
 // Stop システムを停止します
 func (ps *PubSubSystem) Stop() error {
-	if !atomic.CompareAndSwapInt64(&ps.isRunning, 1, 0) {
-		return fmt.Errorf("pubsub system is not running")
+	if !ps.isRunning.CompareAndSwap(true, false) {
+		return errors.New("pubsub system is not running")
 	}
 
 	log.Println("Stopping PubSub System...")
+
+	// キャンセルと購読者の収集を ps.mutex 内で行う。CreateTopic と Subscribe は同じロック内で ctx を確かめるので、
+	// ここより後に goroutine が増えることはない
+	ps.mutex.Lock()
 	ps.cancel()
+	var subs []*Subscriber
+	for _, topicSubs := range ps.subscribers {
+		subs = slices.AppendSeq(subs, maps.Values(topicSubs))
+	}
+	ps.mutex.Unlock()
+
+	ps.wg.Wait()
 
 	// 全サブスクライバーを停止
-	ps.mutex.RLock()
-	for _, topicSubs := range ps.subscribers {
-		for _, sub := range topicSubs {
-			if err := sub.Stop(); err != nil {
-				log.Printf("Failed to stop subscriber: %v", err)
-			}
+	for _, sub := range subs {
+		if err := sub.Stop(); err != nil {
+			log.Printf("Failed to stop subscriber: %v", err)
 		}
 	}
-	ps.mutex.RUnlock()
 
 	return nil
 }
@@ -135,22 +147,25 @@ func (ps *PubSubSystem) CreateTopic(topicName string) error {
 	ps.mutex.Lock()
 	defer ps.mutex.Unlock()
 
+	if ps.ctx.Err() != nil {
+		return ErrStopped
+	}
+
 	if _, exists := ps.topics[topicName]; exists {
 		return fmt.Errorf("topic %s already exists", topicName)
 	}
 
 	topic := &Topic{
-		name:         topicName,
-		messageChan:  make(chan Message, ps.config.BufferSize),
-		subscribers:  make(map[string]*Subscriber),
-		messageQueue: make([]Message, 0),
+		name:        topicName,
+		messageChan: make(chan Message, ps.config.BufferSize),
+		subscribers: make(map[string]*Subscriber),
 	}
 
 	ps.topics[topicName] = topic
 	ps.subscribers[topicName] = make(map[string]*Subscriber)
 
 	// トピック処理ゴルーチンを開始
-	go ps.processTopicMessages(topic)
+	ps.wg.Go(func() { ps.processTopicMessages(topic) })
 
 	return nil
 }
@@ -159,6 +174,10 @@ func (ps *PubSubSystem) CreateTopic(topicName string) error {
 func (ps *PubSubSystem) Subscribe(topicName, subscriberID string, handler MessageHandler) (*Subscriber, error) {
 	ps.mutex.Lock()
 	defer ps.mutex.Unlock()
+
+	if ps.ctx.Err() != nil {
+		return nil, ErrStopped
+	}
 
 	topic, exists := ps.topics[topicName]
 	if !exists {
@@ -179,11 +198,16 @@ func (ps *PubSubSystem) Subscribe(topicName, subscriberID string, handler Messag
 		processedMsgs:   make(map[string]bool),
 		ackChan:         make(chan string, ps.config.BufferSize),
 		pendingMessages: make(map[string]Message),
+		maxRetries:      ps.config.MaxRetries,
+		retryDelay:      ps.config.RetryDelay,
 		ctx:             ctx,
 		cancel:          cancel,
 	}
 
+	// topic.subscribers はトピック処理 goroutine が topic.mutex の下で読む
+	topic.mutex.Lock()
 	topic.subscribers[subscriberID] = subscriber
+	topic.mutex.Unlock()
 	ps.subscribers[topicName][subscriberID] = subscriber
 
 	// サブスクライバー処理ゴルーチンを開始
@@ -195,7 +219,11 @@ func (ps *PubSubSystem) Subscribe(topicName, subscriberID string, handler Messag
 }
 
 // Publish メッセージをパブリッシュします
-func (ps *PubSubSystem) Publish(topicName string, payload interface{}) error {
+func (ps *PubSubSystem) Publish(topicName string, payload any) error {
+	if ps.ctx.Err() != nil {
+		return ErrStopped
+	}
+
 	ps.mutex.RLock()
 	topic, exists := ps.topics[topicName]
 	ps.mutex.RUnlock()
@@ -204,27 +232,30 @@ func (ps *PubSubSystem) Publish(topicName string, payload interface{}) error {
 		return fmt.Errorf("topic %s does not exist", topicName)
 	}
 
-	sequence := atomic.AddUint64(&ps.messageSeq, 1)
-	message := Message{
-		ID:        fmt.Sprintf("msg-%d", sequence),
-		Topic:     topicName,
-		Payload:   payload,
-		Timestamp: time.Now(),
-		Sequence:  sequence,
-	}
+	_, err := topic.enqueue(func() Message {
+		sequence := ps.messageSeq.Add(1)
+		return Message{
+			ID:        fmt.Sprintf("msg-%d", sequence),
+			Topic:     topicName,
+			Payload:   payload,
+			Timestamp: time.Now(),
+			Sequence:  sequence,
+		}
+	})
+	return err
+}
 
-	// 配信保証のためにメッセージを保存
-	if ps.config.EnableDeliveryGuarantee {
-		ps.mutex.Lock()
-		ps.publishedMsgs[message.ID] = message
-		ps.mutex.Unlock()
-	}
+// enqueue 採番とチャネルへの投入を同じロック内で行い、並行に Publish されてもチャネル内がシーケンス順になるようにします
+func (t *Topic) enqueue(newMessage func() Message) (Message, error) {
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
 
+	message := newMessage()
 	select {
-	case topic.messageChan <- message:
-		return nil
+	case t.messageChan <- message:
+		return message, nil
 	default:
-		return fmt.Errorf("topic %s message channel is full", topicName)
+		return Message{}, fmt.Errorf("topic %s message channel is full", t.name)
 	}
 }
 
@@ -243,51 +274,21 @@ func (ps *PubSubSystem) processTopicMessages(topic *Topic) {
 // distributeMessage メッセージを配信します
 func (ps *PubSubSystem) distributeMessage(topic *Topic, message Message) {
 	topic.mutex.RLock()
-	subscribers := make([]*Subscriber, 0, len(topic.subscribers))
-	for _, sub := range topic.subscribers {
-		subscribers = append(subscribers, sub)
-	}
+	subscribers := slices.Collect(maps.Values(topic.subscribers))
 	topic.mutex.RUnlock()
 
 	if ps.config.EnableOrdering {
-		// 順序保証：キューに追加して順次処理
-		topic.mutex.Lock()
-		topic.messageQueue = append(topic.messageQueue, message)
-		ps.processOrderedMessages(topic, subscribers)
-		topic.mutex.Unlock()
-	} else {
-		// 並列配信
-		for _, subscriber := range subscribers {
-			go ps.deliverToSubscriber(subscriber, message)
-		}
-	}
-}
-
-// processOrderedMessages 順序保証付きでメッセージを処理します
-func (ps *PubSubSystem) processOrderedMessages(topic *Topic, subscribers []*Subscriber) {
-	for len(topic.messageQueue) > 0 {
-		message := topic.messageQueue[0]
-
-		// 全サブスクライバーが前のメッセージを処理完了しているかチェック
-		allReady := true
-		for _, sub := range subscribers {
-			if sub.lastSequence+1 != message.Sequence {
-				allReady = false
-				break
-			}
-		}
-
-		if !allReady {
-			break // まだ準備できていない
-		}
-
-		// メッセージ配信
+		// 順序保証：トピックのチャネルはシーケンス順なので、この goroutine から順に各サブスクライバーのキューへ積む。
+		// サブスクライバーは自分のキューを1件ずつ処理するので、受け取る順序もシーケンス順になる
 		for _, subscriber := range subscribers {
 			ps.deliverToSubscriber(subscriber, message)
 		}
+		return
+	}
 
-		// キューから削除
-		topic.messageQueue = topic.messageQueue[1:]
+	// 並列配信
+	for _, subscriber := range subscribers {
+		ps.wg.Go(func() { ps.deliverToSubscriber(subscriber, message) })
 	}
 }
 
@@ -303,38 +304,46 @@ func (ps *PubSubSystem) deliverToSubscriber(subscriber *Subscriber, message Mess
 		subscriber.mutex.RUnlock()
 	}
 
+	// 配信保証：送信より先にペンディングへ追加する。送信後に追加すると、先に届いた ACK の削除と入れ違いになり、
+	// 処理済みのメッセージがペンディングに残る
+	if ps.config.EnableDeliveryGuarantee {
+		subscriber.mutex.Lock()
+		subscriber.pendingMessages[message.ID] = message
+		subscriber.mutex.Unlock()
+	}
+
 	select {
 	case subscriber.messageChan <- message:
-		// 配信保証：ペンディングメッセージに追加
-		if ps.config.EnableDeliveryGuarantee {
-			subscriber.mutex.Lock()
-			subscriber.pendingMessages[message.ID] = message
-			subscriber.mutex.Unlock()
-		}
 	default:
 		log.Printf("Subscriber %s message channel is full", subscriber.id)
+		if ps.config.EnableDeliveryGuarantee {
+			subscriber.mutex.Lock()
+			delete(subscriber.pendingMessages, message.ID)
+			subscriber.mutex.Unlock()
+		}
 	}
 }
 
 // Start サブスクライバーを開始します
 func (s *Subscriber) Start() error {
-	if !atomic.CompareAndSwapInt64(&s.isRunning, 0, 1) {
+	if !s.isRunning.CompareAndSwap(false, true) {
 		return fmt.Errorf("subscriber %s is already running", s.id)
 	}
 
-	go s.processMessages()
-	go s.processAcknowledgments()
+	s.wg.Go(s.processMessages)
+	s.wg.Go(s.processAcknowledgments)
 
 	return nil
 }
 
-// Stop サブスクライバーを停止します
+// Stop サブスクライバーを停止し、処理中の goroutine が終わるまで待ちます
 func (s *Subscriber) Stop() error {
-	if !atomic.CompareAndSwapInt64(&s.isRunning, 1, 0) {
+	if !s.isRunning.CompareAndSwap(true, false) {
 		return fmt.Errorf("subscriber %s is not running", s.id)
 	}
 
 	s.cancel()
+	s.wg.Wait()
 	return nil
 }
 
@@ -361,14 +370,25 @@ func (s *Subscriber) handleMessage(message Message) {
 	s.processedMsgs[message.ID] = true
 	s.mutex.Unlock()
 
-	// ハンドラー実行
-	if err := s.handler.Handle(message); err != nil {
-		log.Printf("Error handling message %s: %v", message.ID, err)
+	// ハンドラー実行。失敗したら retryDelay 空けて maxRetries 回まで再試行する
+	var err error
+	for attempt := range s.maxRetries + 1 {
+		if attempt > 0 {
+			select {
+			case <-s.ctx.Done():
+				return
+			case <-time.After(s.retryDelay):
+			}
+		}
+		if err = s.handler.Handle(message); err == nil {
+			break
+		}
+		log.Printf("Error handling message %s (attempt %d/%d): %v", message.ID, attempt+1, s.maxRetries+1, err)
+	}
+	if err != nil {
+		// ACK を返さないので、メッセージはペンディングに残る
 		return
 	}
-
-	// 順序保証：シーケンス更新
-	s.lastSequence = message.Sequence
 
 	// 配信確認
 	select {
@@ -397,11 +417,7 @@ func (s *Subscriber) GetProcessedMessages() []string {
 	s.mutex.RLock()
 	defer s.mutex.RUnlock()
 
-	messages := make([]string, 0, len(s.processedMsgs))
-	for msgID := range s.processedMsgs {
-		messages = append(messages, msgID)
-	}
-	return messages
+	return slices.Collect(maps.Keys(s.processedMsgs))
 }
 
 // GetPendingMessages ペンディングメッセージを取得します
@@ -409,11 +425,7 @@ func (s *Subscriber) GetPendingMessages() []Message {
 	s.mutex.RLock()
 	defer s.mutex.RUnlock()
 
-	messages := make([]Message, 0, len(s.pendingMessages))
-	for _, msg := range s.pendingMessages {
-		messages = append(messages, msg)
-	}
-	return messages
+	return slices.Collect(maps.Values(s.pendingMessages))
 }
 
 // TestMessageHandler テスト用のメッセージハンドラーです
@@ -421,7 +433,7 @@ type TestMessageHandler struct {
 	name            string
 	processedMsgs   []Message
 	processingDelay time.Duration
-	shouldFail      bool
+	shouldFail      atomic.Bool
 	mutex           sync.Mutex
 }
 
@@ -438,19 +450,19 @@ func (tmh *TestMessageHandler) Name() string {
 }
 
 func (tmh *TestMessageHandler) Handle(msg Message) error {
-	tmh.mutex.Lock()
-	defer tmh.mutex.Unlock()
-
-	// 処理遅延をシミュレート
+	// 処理遅延をシミュレート。ロックを持ったまま眠ると、synctest ではロック待ちの goroutine が
+	// 「durably blocked」とみなされず、偽の時計が進まなくなる
 	if tmh.processingDelay > 0 {
 		time.Sleep(tmh.processingDelay)
 	}
 
 	// 失敗をシミュレート
-	if tmh.shouldFail {
-		return fmt.Errorf("simulated failure")
+	if tmh.shouldFail.Load() {
+		return errors.New("simulated failure")
 	}
 
+	tmh.mutex.Lock()
+	defer tmh.mutex.Unlock()
 	tmh.processedMsgs = append(tmh.processedMsgs, msg)
 	return nil
 }
@@ -459,367 +471,11 @@ func (tmh *TestMessageHandler) GetProcessedMessages() []Message {
 	tmh.mutex.Lock()
 	defer tmh.mutex.Unlock()
 
-	result := make([]Message, len(tmh.processedMsgs))
-	copy(result, tmh.processedMsgs)
-	return result
+	return slices.Clone(tmh.processedMsgs)
 }
 
 func (tmh *TestMessageHandler) SetShouldFail(shouldFail bool) {
-	tmh.mutex.Lock()
-	defer tmh.mutex.Unlock()
-	tmh.shouldFail = shouldFail
-}
-
-// testing/synctestを使った並行テスト
-func TestPubSubSystem_BasicFunctionality(t *testing.T) {
-	config := PubSubConfig{
-		BufferSize:              100,
-		MaxRetries:              3,
-		RetryDelay:              10 * time.Millisecond,
-		EnableDuplication:       true,
-		EnableOrdering:          false,
-		EnableDeliveryGuarantee: true,
-	}
-
-	pubsub := NewPubSubSystem(config)
-	defer func() {
-		if err := pubsub.Stop(); err != nil {
-			t.Errorf("Failed to stop pubsub: %v", err)
-		}
-	}()
-
-	if err := pubsub.Start(); err != nil {
-		t.Fatalf("Failed to start pubsub system: %v", err)
-	}
-
-	// トピック作成
-	topicName := "test-topic"
-	if err := pubsub.CreateTopic(topicName); err != nil {
-		t.Fatalf("Failed to create topic: %v", err)
-	}
-
-	// サブスクライバー作成
-	handler1 := NewTestMessageHandler("handler-1", 1*time.Millisecond)
-	handler2 := NewTestMessageHandler("handler-2", 1*time.Millisecond)
-
-	sub1, err := pubsub.Subscribe(topicName, "subscriber-1", handler1)
-	if err != nil {
-		t.Fatalf("Failed to subscribe: %v", err)
-	}
-
-	sub2, err := pubsub.Subscribe(topicName, "subscriber-2", handler2)
-	if err != nil {
-		t.Fatalf("Failed to subscribe: %v", err)
-	}
-
-	// メッセージ送信
-	const numMessages = 10
-	for i := 0; i < numMessages; i++ {
-		payload := fmt.Sprintf("message-%d", i)
-		if err := pubsub.Publish(topicName, payload); err != nil {
-			t.Errorf("Failed to publish message %d: %v", i, err)
-		}
-	}
-
-	// メッセージ処理を待機
-	time.Sleep(100 * time.Millisecond)
-
-	// 結果検証
-	processed1 := handler1.GetProcessedMessages()
-	processed2 := handler2.GetProcessedMessages()
-
-	if len(processed1) != numMessages {
-		t.Errorf("Handler1 expected %d messages, got %d", numMessages, len(processed1))
-	}
-
-	if len(processed2) != numMessages {
-		t.Errorf("Handler2 expected %d messages, got %d", numMessages, len(processed2))
-	}
-
-	// 重複チェック
-	processedIDs1 := sub1.GetProcessedMessages()
-	if len(processedIDs1) != numMessages {
-		t.Errorf("Subscriber1 expected %d processed messages, got %d", numMessages, len(processedIDs1))
-	}
-
-	// ペンディングメッセージチェック（配信保証）
-	pending1 := sub1.GetPendingMessages()
-	if len(pending1) > 0 {
-		t.Errorf("Subscriber1 should have no pending messages, got %d", len(pending1))
-	}
-
-	pending2 := sub2.GetPendingMessages()
-	if len(pending2) > 0 {
-		t.Errorf("Subscriber2 should have no pending messages, got %d", len(pending2))
-	}
-}
-
-func TestPubSubSystem_MessageOrdering(t *testing.T) {
-	config := PubSubConfig{
-		BufferSize:              100,
-		EnableDuplication:       true,
-		EnableOrdering:          true, // 順序保証を有効
-		EnableDeliveryGuarantee: true,
-	}
-
-	pubsub := NewPubSubSystem(config)
-	defer func() {
-		if err := pubsub.Stop(); err != nil {
-			t.Errorf("Failed to stop pubsub: %v", err)
-		}
-	}()
-
-	if err := pubsub.Start(); err != nil {
-		t.Fatalf("Failed to start pubsub system: %v", err)
-	}
-
-	topicName := "ordered-topic"
-	if err := pubsub.CreateTopic(topicName); err != nil {
-		t.Fatalf("Failed to create topic: %v", err)
-	}
-
-	handler := NewTestMessageHandler("ordered-handler", 2*time.Millisecond)
-	_, err := pubsub.Subscribe(topicName, "ordered-subscriber", handler)
-	if err != nil {
-		t.Fatalf("Failed to subscribe: %v", err)
-	}
-
-	// 並行でメッセージを送信
-	const numMessages = 20
-	var wg sync.WaitGroup
-
-	for i := 0; i < numMessages; i++ {
-		wg.Add(1)
-		go func(msgNum int) {
-			defer wg.Done()
-			payload := fmt.Sprintf("ordered-message-%d", msgNum)
-			if err := pubsub.Publish(topicName, payload); err != nil {
-				t.Errorf("Failed to publish message: %v", err)
-			}
-		}(i)
-	}
-
-	wg.Wait()
-
-	// メッセージ処理を待機
-	time.Sleep(200 * time.Millisecond)
-
-	// 順序確認
-	processedMsgs := handler.GetProcessedMessages()
-	if len(processedMsgs) != numMessages {
-		t.Errorf("Expected %d messages, got %d", numMessages, len(processedMsgs))
-	}
-
-	// シーケンス番号が連続しているかチェック
-	for i := 1; i < len(processedMsgs); i++ {
-		if processedMsgs[i].Sequence != processedMsgs[i-1].Sequence+1 {
-			t.Errorf("Message order violation: seq %d followed by seq %d",
-				processedMsgs[i-1].Sequence, processedMsgs[i].Sequence)
-		}
-	}
-}
-
-func TestPubSubSystem_DuplicateElimination(t *testing.T) {
-	config := PubSubConfig{
-		BufferSize:              100,
-		EnableDuplication:       true, // 重複排除を有効
-		EnableOrdering:          false,
-		EnableDeliveryGuarantee: true,
-	}
-
-	pubsub := NewPubSubSystem(config)
-	defer func() {
-		if err := pubsub.Stop(); err != nil {
-			t.Errorf("Failed to stop pubsub: %v", err)
-		}
-	}()
-
-	if err := pubsub.Start(); err != nil {
-		t.Fatalf("Failed to start pubsub system: %v", err)
-	}
-
-	topicName := "dedup-topic"
-	if err := pubsub.CreateTopic(topicName); err != nil {
-		t.Fatalf("Failed to create topic: %v", err)
-	}
-
-	handler := NewTestMessageHandler("dedup-handler", 1*time.Millisecond)
-	subscriber, err := pubsub.Subscribe(topicName, "dedup-subscriber", handler)
-	if err != nil {
-		t.Fatalf("Failed to subscribe: %v", err)
-	}
-
-	// 同じメッセージを複数回送信（重複シミュレート）
-	payload := "duplicate-message"
-	const duplicates = 5
-
-	for i := 0; i < duplicates; i++ {
-		if err := pubsub.Publish(topicName, payload); err != nil {
-			t.Errorf("Failed to publish duplicate %d: %v", i, err)
-		}
-	}
-
-	// 処理待機
-	time.Sleep(50 * time.Millisecond)
-
-	// 重複排除確認
-	processedMsgs := handler.GetProcessedMessages()
-	if len(processedMsgs) != duplicates {
-		t.Errorf("Expected %d messages (before deduplication), got %d", duplicates, len(processedMsgs))
-	}
-
-	// サブスクライバーレベルでの重複排除確認
-	processedIDs := subscriber.GetProcessedMessages()
-	uniqueIDs := make(map[string]bool)
-	for _, id := range processedIDs {
-		if uniqueIDs[id] {
-			t.Errorf("Duplicate message ID found: %s", id)
-		}
-		uniqueIDs[id] = true
-	}
-}
-
-func TestPubSubSystem_DeliveryGuarantee(t *testing.T) {
-	config := PubSubConfig{
-		BufferSize:              100,
-		EnableDuplication:       true,
-		EnableOrdering:          false,
-		EnableDeliveryGuarantee: true, // 配信保証を有効
-	}
-
-	pubsub := NewPubSubSystem(config)
-	defer func() {
-		if err := pubsub.Stop(); err != nil {
-			t.Errorf("Failed to stop pubsub: %v", err)
-		}
-	}()
-
-	if err := pubsub.Start(); err != nil {
-		t.Fatalf("Failed to start pubsub system: %v", err)
-	}
-
-	topicName := "delivery-topic"
-	if err := pubsub.CreateTopic(topicName); err != nil {
-		t.Fatalf("Failed to create topic: %v", err)
-	}
-
-	// 失敗するハンドラーを作成
-	failingHandler := NewTestMessageHandler("failing-handler", 1*time.Millisecond)
-	failingHandler.SetShouldFail(true)
-
-	subscriber, err := pubsub.Subscribe(topicName, "delivery-subscriber", failingHandler)
-	if err != nil {
-		t.Fatalf("Failed to subscribe: %v", err)
-	}
-
-	// メッセージ送信
-	const numMessages = 5
-	for i := 0; i < numMessages; i++ {
-		payload := fmt.Sprintf("delivery-message-%d", i)
-		if err := pubsub.Publish(topicName, payload); err != nil {
-			t.Errorf("Failed to publish message %d: %v", i, err)
-		}
-	}
-
-	// 失敗処理を待機
-	time.Sleep(50 * time.Millisecond)
-
-	// ペンディングメッセージの確認（失敗したため確認されていない）
-	pendingBefore := subscriber.GetPendingMessages()
-	if len(pendingBefore) != numMessages {
-		t.Errorf("Expected %d pending messages, got %d", numMessages, len(pendingBefore))
-	}
-
-	// ハンドラーを成功するように変更
-	failingHandler.SetShouldFail(false)
-
-	// 再処理のため少し待機
-	time.Sleep(50 * time.Millisecond)
-
-	// ペンディングメッセージが減ることを確認（実際の再送実装は簡略化）
-	pendingAfter := subscriber.GetPendingMessages()
-	if len(pendingAfter) >= len(pendingBefore) {
-		// 注意：実際の配信保証実装では再送機構が必要
-		t.Logf("Pending messages: before=%d, after=%d", len(pendingBefore), len(pendingAfter))
-	}
-}
-
-func TestPubSubSystem_ConcurrentPublishSubscribe(t *testing.T) {
-	config := PubSubConfig{
-		BufferSize:              1000,
-		EnableDuplication:       true,
-		EnableOrdering:          false,
-		EnableDeliveryGuarantee: true,
-	}
-
-	pubsub := NewPubSubSystem(config)
-	defer func() {
-		if err := pubsub.Stop(); err != nil {
-			t.Errorf("Failed to stop pubsub: %v", err)
-		}
-	}()
-
-	if err := pubsub.Start(); err != nil {
-		t.Fatalf("Failed to start pubsub system: %v", err)
-	}
-
-	topicName := "concurrent-topic"
-	if err := pubsub.CreateTopic(topicName); err != nil {
-		t.Fatalf("Failed to create topic: %v", err)
-	}
-
-	// 複数のサブスクライバーを作成
-	const numSubscribers = 5
-	const numMessages = 100
-
-	handlers := make([]*TestMessageHandler, numSubscribers)
-	subscribers := make([]*Subscriber, numSubscribers)
-
-	for i := 0; i < numSubscribers; i++ {
-		handler := NewTestMessageHandler(fmt.Sprintf("handler-%d", i), 1*time.Millisecond)
-		subscriber, err := pubsub.Subscribe(topicName, fmt.Sprintf("subscriber-%d", i), handler)
-		if err != nil {
-			t.Fatalf("Failed to create subscriber %d: %v", i, err)
-		}
-		handlers[i] = handler
-		subscribers[i] = subscriber
-	}
-
-	// 並行パブリッシュ
-	var publishWg sync.WaitGroup
-	for i := 0; i < numMessages; i++ {
-		publishWg.Add(1)
-		go func(msgNum int) {
-			defer publishWg.Done()
-			payload := fmt.Sprintf("concurrent-message-%d", msgNum)
-			if err := pubsub.Publish(topicName, payload); err != nil {
-				t.Errorf("Failed to publish message %d: %v", msgNum, err)
-			}
-		}(i)
-	}
-
-	publishWg.Wait()
-
-	// 処理完了を待機
-	time.Sleep(500 * time.Millisecond)
-
-	// 全サブスクライバーが全メッセージを受信したことを確認
-	for i, handler := range handlers {
-		processed := handler.GetProcessedMessages()
-		if len(processed) != numMessages {
-			t.Errorf("Subscriber %d expected %d messages, got %d", i, numMessages, len(processed))
-		}
-
-		// 重複チェック
-		processedIDs := subscribers[i].GetProcessedMessages()
-		uniqueIDs := make(map[string]bool)
-		for _, id := range processedIDs {
-			if uniqueIDs[id] {
-				t.Errorf("Subscriber %d found duplicate message ID: %s", i, id)
-			}
-			uniqueIDs[id] = true
-		}
-	}
+	tmh.shouldFail.Store(shouldFail)
 }
 
 // main関数（テスト実行用）
@@ -865,7 +521,7 @@ func main() {
 	}
 
 	// デモメッセージ送信
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		payload := fmt.Sprintf("demo-message-%d", i)
 		if err := pubsub.Publish(topicName, payload); err != nil {
 			log.Printf("Failed to publish message %d: %v", i, err)

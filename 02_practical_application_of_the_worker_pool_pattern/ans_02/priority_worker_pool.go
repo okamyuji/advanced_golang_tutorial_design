@@ -10,24 +10,25 @@ import (
 	"time"
 )
 
-// PriorityTaskは優先度付きタスクです
+// PriorityTask 優先度付きタスクです
 type PriorityTask struct {
 	ID        int
 	Priority  int // 0が最高優先度
-	Data      interface{}
-	Execute   func(interface{}) error
+	Data      any
+	Execute   func(any) error
 	CreatedAt time.Time
 	Urgent    bool // 緊急タスク（他を中断）
 }
 
-// PriorityTaskQueueは優先度付きタスクキューです
+// PriorityTaskQueue 優先度付きタスクキューです
 type PriorityTaskQueue struct {
 	tasks  []*PriorityTask
 	mu     sync.RWMutex
+	cond   *sync.Cond // タスクの追加とCloseを待ち手に知らせる
 	closed bool
 }
 
-// PriorityWorkerPoolは優先度付きワーカープールです
+// PriorityWorkerPool 優先度付きワーカープールです
 type PriorityWorkerPool struct {
 	// 基本設定
 	workerCount int
@@ -49,7 +50,7 @@ type PriorityWorkerPool struct {
 	stats *PriorityStats
 }
 
-// PriorityWorkerは優先度対応ワーカーです
+// PriorityWorker 優先度対応ワーカーです
 type PriorityWorker struct {
 	ID            int
 	pool          *PriorityWorkerPool
@@ -58,7 +59,7 @@ type PriorityWorker struct {
 	interruptChan chan struct{}
 }
 
-// PriorityResultは実行結果です
+// PriorityResult 実行結果です
 type PriorityResult struct {
 	TaskID      int
 	Priority    int
@@ -69,30 +70,31 @@ type PriorityResult struct {
 	Interrupted bool
 }
 
-// PriorityStatsは統計情報です
+// PriorityStats 統計情報です
 type PriorityStats struct {
 	mu               sync.RWMutex
-	totalTasks       int64
-	completedTasks   int64
-	interruptedTasks int64
+	totalTasks       atomic.Int64
+	completedTasks   atomic.Int64
+	interruptedTasks atomic.Int64
 	tasksByPriority  map[int]int64
 	averageWaitTime  map[int]time.Duration
 }
 
-// NewPriorityTaskQueueは新しい優先度付きキューを作成します
+// NewPriorityTaskQueue 新しい優先度付きキューを作成します
 func NewPriorityTaskQueue() *PriorityTaskQueue {
 	q := &PriorityTaskQueue{
 		tasks: make([]*PriorityTask, 0),
 	}
+	q.cond = sync.NewCond(&q.mu)
 	return q
 }
 
-// Lenはheap.Interfaceの実装です
+// Len heap.Interfaceの実装です
 func (pq *PriorityTaskQueue) Len() int {
 	return len(pq.tasks)
 }
 
-// Lessはheap.Interfaceの実装です（優先度が低いほど、作成時間が古いほど優先）
+// Less heap.Interfaceの実装です（優先度が低いほど、作成時間が古いほど優先）
 func (pq *PriorityTaskQueue) Less(i, j int) bool {
 	if pq.tasks[i].Priority != pq.tasks[j].Priority {
 		return pq.tasks[i].Priority < pq.tasks[j].Priority
@@ -100,18 +102,18 @@ func (pq *PriorityTaskQueue) Less(i, j int) bool {
 	return pq.tasks[i].CreatedAt.Before(pq.tasks[j].CreatedAt)
 }
 
-// Swapはheap.Interfaceの実装です
+// Swap heap.Interfaceの実装です
 func (pq *PriorityTaskQueue) Swap(i, j int) {
 	pq.tasks[i], pq.tasks[j] = pq.tasks[j], pq.tasks[i]
 }
 
-// Pushはheap.Interfaceの実装です
-func (pq *PriorityTaskQueue) Push(x interface{}) {
+// Push heap.Interfaceの実装です
+func (pq *PriorityTaskQueue) Push(x any) {
 	pq.tasks = append(pq.tasks, x.(*PriorityTask))
 }
 
-// Popはheap.Interfaceの実装です
-func (pq *PriorityTaskQueue) Pop() interface{} {
+// Pop heap.Interfaceの実装です
+func (pq *PriorityTaskQueue) Pop() any {
 	old := pq.tasks
 	n := len(old)
 	task := old[n-1]
@@ -129,54 +131,48 @@ func (pq *PriorityTaskQueue) Enqueue(task *PriorityTask) {
 	}
 
 	heap.Push(pq, task)
+	pq.cond.Signal()
 }
 
-// Dequeueはタスクをキューから取得します
+// Dequeue タスクをキューから取得します
+// タスクが届くか、キューが閉じられるか、ctxがキャンセルされるまで待ちます
 func (pq *PriorityTaskQueue) Dequeue(ctx context.Context) (*PriorityTask, bool) {
-	for {
+	// sync.Cond.Wait ctxを直接待てないので、キャンセル時にBroadcastして起こす
+	stop := context.AfterFunc(ctx, func() {
 		pq.mu.Lock()
+		defer pq.mu.Unlock()
+		pq.cond.Broadcast()
+	})
+	defer stop()
 
-		// キューにタスクがある場合は取得
-		if pq.Len() > 0 {
-			task := heap.Pop(pq).(*PriorityTask)
-			pq.mu.Unlock()
-			return task, true
-		}
-
-		// キューが閉じられている場合は終了
-		if pq.closed {
-			pq.mu.Unlock()
-			return nil, false
-		}
-
-		pq.mu.Unlock()
-
-		// 短時間待機してからリトライ
-		select {
-		case <-ctx.Done():
-			return nil, false
-		case <-time.After(10 * time.Millisecond):
-			// 継続
-		}
+	pq.mu.Lock()
+	defer pq.mu.Unlock()
+	for pq.Len() == 0 && !pq.closed && ctx.Err() == nil {
+		pq.cond.Wait()
 	}
+	if pq.Len() > 0 {
+		return heap.Pop(pq).(*PriorityTask), true
+	}
+	return nil, false
 }
 
-// Closeはキューを閉じます
+// Close キューを閉じます
 func (pq *PriorityTaskQueue) Close() {
 	pq.mu.Lock()
 	defer pq.mu.Unlock()
 
 	pq.closed = true
+	pq.cond.Broadcast()
 }
 
-// Sizeは現在のキューサイズを返します
+// Size 現在のキューサイズを返します
 func (pq *PriorityTaskQueue) Size() int {
 	pq.mu.RLock()
 	defer pq.mu.RUnlock()
 	return pq.Len()
 }
 
-// NewPriorityWorkerPoolは新しい優先度付きワーカープールを作成します
+// NewPriorityWorkerPool 新しい優先度付きワーカープールを作成します
 func NewPriorityWorkerPool(workerCount int) *PriorityWorkerPool {
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -195,10 +191,10 @@ func NewPriorityWorkerPool(workerCount int) *PriorityWorkerPool {
 	}
 }
 
-// Startはワーカープールを開始します
+// Start ワーカープールを開始します
 func (pwp *PriorityWorkerPool) Start() error {
 	// ワーカーを開始
-	for i := 0; i < pwp.workerCount; i++ {
+	for i := range pwp.workerCount {
 		worker := &PriorityWorker{
 			ID:            i,
 			pool:          pwp,
@@ -206,26 +202,21 @@ func (pwp *PriorityWorkerPool) Start() error {
 		}
 		pwp.workers[i] = worker
 
-		pwp.wg.Add(1)
-		go worker.run()
+		pwp.wg.Go(worker.run)
 	}
 
 	// 結果処理を開始
-	pwp.wg.Add(1)
-	go pwp.resultHandler()
+	pwp.wg.Go(pwp.resultHandler)
 
 	// 統計レポートを開始
-	pwp.wg.Add(1)
-	go pwp.statsReporter()
+	pwp.wg.Go(pwp.statsReporter)
 
 	log.Printf("Priority worker pool started with %d workers", pwp.workerCount)
 	return nil
 }
 
-// runはワーカーのメインループです
+// run ワーカーのメインループです
 func (pw *PriorityWorker) run() {
-	defer pw.pool.wg.Done()
-
 	for {
 		select {
 		case <-pw.pool.ctx.Done():
@@ -253,7 +244,7 @@ func (pw *PriorityWorker) run() {
 	}
 }
 
-// handleUrgentTaskは緊急タスクを処理します
+// handleUrgentTask 緊急タスクを処理します
 func (pw *PriorityWorker) handleUrgentTask(urgentTask PriorityTask) {
 	// 現在のタスクを中断
 	pw.currentTaskMu.Lock()
@@ -278,7 +269,7 @@ func (pw *PriorityWorker) handleUrgentTask(urgentTask PriorityTask) {
 	}
 }
 
-// executeTaskはタスクを実行します
+// executeTask タスクを実行します
 func (pw *PriorityWorker) executeTask(task PriorityTask, isUrgent bool) PriorityResult {
 	start := time.Now()
 
@@ -355,15 +346,19 @@ func (pw *PriorityWorker) executeTask(task PriorityTask, isUrgent bool) Priority
 	return result
 }
 
-// SubmitTaskはタスクを追加します
+// SubmitTask タスクを追加します
 func (pwp *PriorityWorkerPool) SubmitTask(task PriorityTask) error {
+	// 停止後の投入を拒否する。キューはcloseせず、読む側はctxのキャンセルで止める
+	if pwp.ctx.Err() != nil {
+		return fmt.Errorf("pool is shutting down")
+	}
 	task.CreatedAt = time.Now()
 
 	if task.Urgent {
 		// 緊急タスクは専用キューに送信
 		select {
 		case pwp.urgentQueue <- task:
-			atomic.AddInt64(&pwp.stats.totalTasks, 1)
+			pwp.stats.totalTasks.Add(1)
 			return nil
 		case <-pwp.ctx.Done():
 			return fmt.Errorf("pool is shutting down")
@@ -373,22 +368,22 @@ func (pwp *PriorityWorkerPool) SubmitTask(task PriorityTask) error {
 	} else {
 		// 通常タスクは優先度付きキューに送信
 		pwp.taskQueue.Enqueue(&task)
-		atomic.AddInt64(&pwp.stats.totalTasks, 1)
+		pwp.stats.totalTasks.Add(1)
 		return nil
 	}
 }
 
-// updateStatsは統計を更新します
+// updateStats 統計を更新します
 func (pwp *PriorityWorkerPool) updateStats(result PriorityResult, waitTime time.Duration) {
 	pwp.stats.mu.Lock()
 	defer pwp.stats.mu.Unlock()
 
 	if result.Success {
-		atomic.AddInt64(&pwp.stats.completedTasks, 1)
+		pwp.stats.completedTasks.Add(1)
 	}
 
 	if result.Interrupted {
-		atomic.AddInt64(&pwp.stats.interruptedTasks, 1)
+		pwp.stats.interruptedTasks.Add(1)
 	}
 
 	// 優先度別統計を更新
@@ -404,10 +399,8 @@ func (pwp *PriorityWorkerPool) updateStats(result PriorityResult, waitTime time.
 	}
 }
 
-// resultHandlerは結果を処理します
+// resultHandler 結果を処理します
 func (pwp *PriorityWorkerPool) resultHandler() {
-	defer pwp.wg.Done()
-
 	for {
 		select {
 		case <-pwp.ctx.Done():
@@ -424,31 +417,28 @@ func (pwp *PriorityWorkerPool) resultHandler() {
 	}
 }
 
-// statsReporterは統計を定期的に報告します
+// statsReporter 統計を定期的に報告します
 func (pwp *PriorityWorkerPool) statsReporter() {
-	defer pwp.wg.Done()
-
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
+	tick := time.Tick(10 * time.Second)
 
 	for {
 		select {
 		case <-pwp.ctx.Done():
 			return
-		case <-ticker.C:
+		case <-tick:
 			pwp.printStats()
 		}
 	}
 }
 
-// printStatsは統計を出力します
+// printStats 統計を出力します
 func (pwp *PriorityWorkerPool) printStats() {
 	pwp.stats.mu.RLock()
 	defer pwp.stats.mu.RUnlock()
 
-	total := atomic.LoadInt64(&pwp.stats.totalTasks)
-	completed := atomic.LoadInt64(&pwp.stats.completedTasks)
-	interrupted := atomic.LoadInt64(&pwp.stats.interruptedTasks)
+	total := pwp.stats.totalTasks.Load()
+	completed := pwp.stats.completedTasks.Load()
+	interrupted := pwp.stats.interruptedTasks.Load()
 	queueSize := pwp.taskQueue.Size()
 	urgentQueueSize := len(pwp.urgentQueue)
 
@@ -462,12 +452,11 @@ func (pwp *PriorityWorkerPool) printStats() {
 	}
 }
 
-// Shutdownはプールを停止します
+// Shutdown プールを停止します
 func (pwp *PriorityWorkerPool) Shutdown(timeout time.Duration) error {
 	log.Println("Starting priority worker pool shutdown...")
 
 	pwp.taskQueue.Close()
-	close(pwp.urgentQueue)
 	pwp.cancel()
 
 	done := make(chan struct{})
@@ -485,11 +474,11 @@ func (pwp *PriorityWorkerPool) Shutdown(timeout time.Duration) error {
 	}
 }
 
-// GetStatsは統計を取得します
+// GetStats 統計を取得します
 func (pwp *PriorityWorkerPool) GetStats() (int64, int64, int64, int) {
-	total := atomic.LoadInt64(&pwp.stats.totalTasks)
-	completed := atomic.LoadInt64(&pwp.stats.completedTasks)
-	interrupted := atomic.LoadInt64(&pwp.stats.interruptedTasks)
+	total := pwp.stats.totalTasks.Load()
+	completed := pwp.stats.completedTasks.Load()
+	interrupted := pwp.stats.interruptedTasks.Load()
 	queueSize := pwp.taskQueue.Size()
 
 	return total, completed, interrupted, queueSize
@@ -508,12 +497,12 @@ func main() {
 		taskID := 1
 
 		// 低優先度タスクを大量に送信
-		for i := 0; i < 20; i++ {
+		for range 20 {
 			task := PriorityTask{
 				ID:       taskID,
 				Priority: 3, // 低優先度
 				Data:     fmt.Sprintf("low-priority-task-%d", taskID),
-				Execute: func(data interface{}) error {
+				Execute: func(data any) error {
 					time.Sleep(2 * time.Second) // 長時間実行
 					log.Printf("Completed low priority task: %s", data.(string))
 					return nil
@@ -531,13 +520,13 @@ func main() {
 	go func() {
 		time.Sleep(5 * time.Second)
 
-		for i := 0; i < 10; i++ {
+		for i := range 10 {
 			taskID := 100 + i
 			task := PriorityTask{
 				ID:       taskID,
 				Priority: 1, // 高優先度
 				Data:     fmt.Sprintf("high-priority-task-%d", taskID),
-				Execute: func(data interface{}) error {
+				Execute: func(data any) error {
 					time.Sleep(500 * time.Millisecond)
 					log.Printf("Completed high priority task: %s", data.(string))
 					return nil
@@ -554,14 +543,14 @@ func main() {
 	go func() {
 		time.Sleep(10 * time.Second)
 
-		for i := 0; i < 3; i++ {
+		for i := range 3 {
 			taskID := 200 + i
 			task := PriorityTask{
 				ID:       taskID,
 				Priority: 0, // 最高優先度
 				Data:     fmt.Sprintf("urgent-task-%d", taskID),
 				Urgent:   true, // 緊急フラグ
-				Execute: func(data interface{}) error {
+				Execute: func(data any) error {
 					time.Sleep(300 * time.Millisecond)
 					log.Printf("Completed URGENT task: %s", data.(string))
 					return nil

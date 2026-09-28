@@ -125,9 +125,7 @@ func TestEventSubmissionAndProcessing(t *testing.T) {
 	var results []*AggregationResult
 	var wg sync.WaitGroup
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		timeout := time.After(5 * time.Second)
 		for {
 			select {
@@ -143,11 +141,11 @@ func TestEventSubmissionAndProcessing(t *testing.T) {
 				return
 			}
 		}
-	}()
+	})
 
 	// テストイベントを送信
 	eventCount := 15 // MaxWindowSizeを超える数
-	for i := 0; i < eventCount; i++ {
+	for i := range eventCount {
 		event := StreamEvent{
 			ID:        int64(i),
 			EventType: "test_event",
@@ -155,7 +153,7 @@ func TestEventSubmissionAndProcessing(t *testing.T) {
 			UserID:    fmt.Sprintf("user_%d", i%3), // 3ユーザーでテスト
 			SessionID: fmt.Sprintf("session_%d", i%2),
 			Value:     float64(i + 1),
-			Data:      map[string]interface{}{"index": i},
+			Data:      map[string]any{"index": i},
 			Source:    "test",
 		}
 
@@ -237,7 +235,7 @@ func TestEventTypeAggregation(t *testing.T) {
 
 	// 異なるイベントタイプを送信
 	eventTypes := []string{"click", "view", "purchase"}
-	for i := 0; i < 21; i++ { // MaxWindowSizeを超える
+	for i := range 21 { // MaxWindowSizeを超える
 		event := StreamEvent{
 			ID:        int64(i),
 			EventType: eventTypes[i%len(eventTypes)],
@@ -337,7 +335,7 @@ func TestWindowManagement(t *testing.T) {
 	}()
 
 	// ウィンドウの作成と期限切れをテスト
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		event := StreamEvent{
 			ID:        int64(i),
 			EventType: "window_test",
@@ -609,9 +607,7 @@ func BenchmarkAggregatorEventProcessing(b *testing.B) {
 		}
 	}()
 
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
+	for i := 0; b.Loop(); i++ {
 		event := StreamEvent{
 			ID:        int64(i),
 			EventType: "bench_event",
@@ -624,6 +620,59 @@ func BenchmarkAggregatorEventProcessing(b *testing.B) {
 		err := aggregator.SubmitEvent(event)
 		if err != nil {
 			b.Errorf("Failed to submit event %d: %v", i, err)
+		}
+	}
+}
+
+// TestShutdownConcurrentWithSubmit SubmitEventとShutdownを並行させてもpanicせず、
+// 停止後の投入は必ずエラーになることを確かめる回帰テストです。
+func TestShutdownConcurrentWithSubmit(t *testing.T) {
+	for range 50 {
+		config := &AggregationConfig{
+			WindowSize:      1 * time.Second,
+			SlideInterval:   500 * time.Millisecond,
+			MaxWindowSize:   100,
+			WorkerCount:     2,
+			BufferSize:      4,
+			CleanupInterval: 10 * time.Second,
+			EnableMetrics:   false,
+			MetricsInterval: 10 * time.Second,
+		}
+
+		aggregator := NewStreamAggregator(config)
+		if err := aggregator.Start(); err != nil {
+			t.Fatalf("Failed to start aggregator: %v", err)
+		}
+
+		var submitWg sync.WaitGroup
+		stop := make(chan struct{})
+
+		const submitters = 8
+		for range submitters {
+			submitWg.Go(func() {
+				for {
+					select {
+					case <-stop:
+						return
+					default:
+						_ = aggregator.SubmitEvent(StreamEvent{ID: 1, EventType: "race_test", Value: 1})
+					}
+				}
+			})
+		}
+
+		time.Sleep(time.Millisecond)
+
+		if err := aggregator.Shutdown(1 * time.Second); err != nil {
+			t.Fatalf("Failed to shutdown aggregator: %v", err)
+		}
+
+		close(stop)
+		submitWg.Wait()
+
+		// 停止後の投入は必ずエラーになる
+		if err := aggregator.SubmitEvent(StreamEvent{ID: 2, EventType: "after_shutdown"}); err == nil {
+			t.Error("Expected error when submitting event after shutdown")
 		}
 	}
 }

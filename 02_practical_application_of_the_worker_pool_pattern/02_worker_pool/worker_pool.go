@@ -9,15 +9,15 @@ import (
 	"time"
 )
 
-// Taskはワーカーが処理するタスクを表現します
+// Task ワーカーが処理するタスクを表現します
 type Task struct {
 	ID       int
-	Data     interface{}
-	Execute  func(interface{}) error
+	Data     any
+	Execute  func(any) error
 	Priority int // 優先度（高いほど優先）
 }
 
-// WorkerPoolは動的なワーカープールを管理します
+// WorkerPool 動的なワーカープールを管理します
 type WorkerPool struct {
 	// 基本設定
 	minWorkers    int
@@ -30,7 +30,7 @@ type WorkerPool struct {
 
 	// ワーカー管理
 	workers  map[int]*Worker
-	workerID int64
+	workerID atomic.Int64
 	mu       sync.RWMutex
 
 	// 制御
@@ -45,16 +45,16 @@ type WorkerPool struct {
 	config *PoolConfig
 }
 
-// Workerは個別のワーカーを表現します
+// Worker 個別のワーカーを表現します
 type Worker struct {
 	ID           int
 	pool         *WorkerPool
 	lastActivity time.Time
-	taskCount    int64
-	errorCount   int64
+	taskCount    atomic.Int64
+	errorCount   atomic.Int64
 }
 
-// TaskResultはタスクの実行結果を表現します
+// TaskResult タスクの実行結果を表現します
 type TaskResult struct {
 	TaskID   int
 	Success  bool
@@ -63,19 +63,29 @@ type TaskResult struct {
 	WorkerID int
 }
 
-// PoolMetricsはプールの統計情報を管理します
+// PoolMetrics プールの統計情報を管理します
 type PoolMetrics struct {
 	mu               sync.RWMutex
-	activeWorkers    int64
-	totalTasks       int64
-	completedTasks   int64
-	failedTasks      int64
+	activeWorkers    atomic.Int64
+	totalTasks       atomic.Int64
+	completedTasks   atomic.Int64
+	failedTasks      atomic.Int64
 	averageTaskTime  time.Duration
 	queueUtilization float64
 	lastUpdateTime   time.Time
 }
 
-// PoolConfigはプールの設定を管理します
+// PoolMetricsSnapshot GetMetrics が返すプールの統計スナップショットです
+type PoolMetricsSnapshot struct {
+	activeWorkers    int64
+	totalTasks       int64
+	completedTasks   int64
+	failedTasks      int64
+	queueUtilization float64
+	lastUpdateTime   time.Time
+}
+
+// PoolConfig プールの設定を管理します
 type PoolConfig struct {
 	WorkerIdleTimeout  time.Duration
 	MetricsInterval    time.Duration
@@ -85,7 +95,7 @@ type PoolConfig struct {
 	TaskTimeout        time.Duration
 }
 
-// NewWorkerPoolは新しいワーカープールを作成します
+// NewWorkerPool 新しいワーカープールを作成します
 func NewWorkerPool(minWorkers, maxWorkers, queueSize int) *WorkerPool {
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -110,32 +120,29 @@ func NewWorkerPool(minWorkers, maxWorkers, queueSize int) *WorkerPool {
 	}
 }
 
-// Startはワーカープールを開始します
+// Start ワーカープールを開始します
 func (wp *WorkerPool) Start() error {
 	// 最小数のワーカーを開始
-	for i := 0; i < wp.minWorkers; i++ {
+	for range wp.minWorkers {
 		if err := wp.addWorker(); err != nil {
-			return fmt.Errorf("failed to start initial worker: %v", err)
+			return fmt.Errorf("failed to start initial worker: %w", err)
 		}
 	}
 
 	// 結果処理Goroutineを開始
-	wp.wg.Add(1)
-	go wp.resultHandler()
+	wp.wg.Go(wp.resultHandler)
 
 	// メトリクス収集Goroutineを開始
-	wp.wg.Add(1)
-	go wp.metricsCollector()
+	wp.wg.Go(wp.metricsCollector)
 
 	// 動的スケーリングGoroutineを開始
-	wp.wg.Add(1)
-	go wp.dynamicScaler()
+	wp.wg.Go(wp.dynamicScaler)
 
 	log.Printf("Worker pool started with %d workers", wp.minWorkers)
 	return nil
 }
 
-// addWorkerは新しいワーカーを追加します
+// addWorker 新しいワーカーを追加します
 func (wp *WorkerPool) addWorker() error {
 	wp.mu.Lock()
 	defer wp.mu.Unlock()
@@ -144,7 +151,7 @@ func (wp *WorkerPool) addWorker() error {
 		return fmt.Errorf("maximum workers limit reached")
 	}
 
-	workerID := int(atomic.AddInt64(&wp.workerID, 1))
+	workerID := int(wp.workerID.Add(1))
 	worker := &Worker{
 		ID:           workerID,
 		pool:         wp,
@@ -153,29 +160,32 @@ func (wp *WorkerPool) addWorker() error {
 
 	wp.workers[workerID] = worker
 
-	wp.wg.Add(1)
-	go worker.run()
+	wp.wg.Go(worker.run)
 
-	atomic.AddInt64(&wp.metrics.activeWorkers, 1)
+	wp.metrics.activeWorkers.Add(1)
 	return nil
 }
 
-// removeWorkerはワーカーを削除します
+// removeWorker ワーカーを削除します
 func (wp *WorkerPool) removeWorker(workerID int) {
 	wp.mu.Lock()
 	defer wp.mu.Unlock()
 
 	if _, exists := wp.workers[workerID]; exists {
 		delete(wp.workers, workerID)
-		atomic.AddInt64(&wp.metrics.activeWorkers, -1)
+		wp.metrics.activeWorkers.Add(-1)
 	}
 }
 
-// SubmitTaskはタスクをキューに追加します
+// SubmitTask タスクをキューに追加します
 func (wp *WorkerPool) SubmitTask(task Task) error {
+	// 停止後の投入を拒否する。キューはcloseせず、読む側はctxのキャンセルで止める
+	if wp.ctx.Err() != nil {
+		return fmt.Errorf("worker pool is shutting down")
+	}
 	select {
 	case wp.taskQueue <- task:
-		atomic.AddInt64(&wp.metrics.totalTasks, 1)
+		wp.metrics.totalTasks.Add(1)
 		return nil
 	case <-wp.ctx.Done():
 		return fmt.Errorf("worker pool is shutting down")
@@ -184,9 +194,8 @@ func (wp *WorkerPool) SubmitTask(task Task) error {
 	}
 }
 
-// runはワーカーのメインループです
+// run ワーカーのメインループです
 func (w *Worker) run() {
-	defer w.pool.wg.Done()
 	defer w.pool.removeWorker(w.ID)
 
 	idleTimer := time.NewTimer(w.pool.config.WorkerIdleTimeout)
@@ -219,21 +228,18 @@ func (w *Worker) run() {
 				return
 			}
 
-			// アイドルタイマーをリセット
-			if !idleTimer.Stop() {
-				<-idleTimer.C
-			}
+			// Go 1.23以降はStopと排出なしのResetで古い発火値が届かない
 			idleTimer.Reset(w.pool.config.WorkerIdleTimeout)
 		}
 	}
 }
 
-// executeTaskはタスクを実行します
+// executeTask タスクを実行します
 func (w *Worker) executeTask(task Task) TaskResult {
 	start := time.Now()
 
 	// タスクカウントを更新
-	atomic.AddInt64(&w.taskCount, 1)
+	w.taskCount.Add(1)
 
 	// タイムアウト付きでタスクを実行
 	ctx, cancel := context.WithTimeout(w.pool.ctx, w.pool.config.TaskTimeout)
@@ -251,7 +257,7 @@ func (w *Worker) executeTask(task Task) TaskResult {
 			log.Printf("Worker %d: Task %d panicked: %v", w.ID, task.ID, r)
 			result.Success = false
 			result.Error = fmt.Errorf("task panicked: %v", r)
-			atomic.AddInt64(&w.errorCount, 1)
+			w.errorCount.Add(1)
 		}
 		result.Duration = time.Since(start)
 	}()
@@ -260,7 +266,7 @@ func (w *Worker) executeTask(task Task) TaskResult {
 	if task.Execute == nil {
 		result.Success = false
 		result.Error = fmt.Errorf("task execute function is nil")
-		atomic.AddInt64(&w.errorCount, 1)
+		w.errorCount.Add(1)
 		return result
 	}
 
@@ -274,32 +280,30 @@ func (w *Worker) executeTask(task Task) TaskResult {
 		if err != nil {
 			result.Success = false
 			result.Error = err
-			atomic.AddInt64(&w.errorCount, 1)
+			w.errorCount.Add(1)
 		} else {
 			result.Success = true
 		}
 	case <-ctx.Done():
 		result.Success = false
 		result.Error = fmt.Errorf("task timeout")
-		atomic.AddInt64(&w.errorCount, 1)
+		w.errorCount.Add(1)
 	}
 
 	return result
 }
 
-// resultHandlerは結果を処理します
+// resultHandler 結果を処理します
 func (wp *WorkerPool) resultHandler() {
-	defer wp.wg.Done()
-
 	for {
 		select {
 		case <-wp.ctx.Done():
 			return
 		case result := <-wp.resultQueue:
 			if result.Success {
-				atomic.AddInt64(&wp.metrics.completedTasks, 1)
+				wp.metrics.completedTasks.Add(1)
 			} else {
-				atomic.AddInt64(&wp.metrics.failedTasks, 1)
+				wp.metrics.failedTasks.Add(1)
 				log.Printf("Task %d failed on worker %d: %v",
 					result.TaskID, result.WorkerID, result.Error)
 			}
@@ -310,12 +314,12 @@ func (wp *WorkerPool) resultHandler() {
 	}
 }
 
-// updateAverageTaskTimeは平均タスク実行時間を更新します
+// updateAverageTaskTime 平均タスク実行時間を更新します
 func (wp *WorkerPool) updateAverageTaskTime(duration time.Duration) {
 	wp.metrics.mu.Lock()
 	defer wp.metrics.mu.Unlock()
 
-	totalCompleted := atomic.LoadInt64(&wp.metrics.completedTasks) + atomic.LoadInt64(&wp.metrics.failedTasks)
+	totalCompleted := wp.metrics.completedTasks.Load() + wp.metrics.failedTasks.Load()
 	if totalCompleted > 0 {
 		// 累積平均を計算
 		wp.metrics.averageTaskTime = time.Duration(
@@ -323,24 +327,21 @@ func (wp *WorkerPool) updateAverageTaskTime(duration time.Duration) {
 	}
 }
 
-// metricsCollectorはメトリクスを定期的に収集します
+// metricsCollector メトリクスを定期的に収集します
 func (wp *WorkerPool) metricsCollector() {
-	defer wp.wg.Done()
-
-	ticker := time.NewTicker(wp.config.MetricsInterval)
-	defer ticker.Stop()
+	tick := time.Tick(wp.config.MetricsInterval)
 
 	for {
 		select {
 		case <-wp.ctx.Done():
 			return
-		case <-ticker.C:
+		case <-tick:
 			wp.updateMetrics()
 		}
 	}
 }
 
-// updateMetricsはメトリクスを更新します
+// updateMetrics メトリクスを更新します
 func (wp *WorkerPool) updateMetrics() {
 	wp.metrics.mu.Lock()
 	defer wp.metrics.mu.Unlock()
@@ -355,33 +356,30 @@ func (wp *WorkerPool) updateMetrics() {
 	workerCount := len(wp.workers)
 	wp.mu.RUnlock()
 
-	total := atomic.LoadInt64(&wp.metrics.totalTasks)
-	completed := atomic.LoadInt64(&wp.metrics.completedTasks)
-	failed := atomic.LoadInt64(&wp.metrics.failedTasks)
+	total := wp.metrics.totalTasks.Load()
+	completed := wp.metrics.completedTasks.Load()
+	failed := wp.metrics.failedTasks.Load()
 
 	log.Printf("Pool Stats: Workers=%d, Queue=%d/%d (%.1f%%), Total=%d, Completed=%d, Failed=%d",
 		workerCount, queueLength, wp.taskQueueSize, wp.metrics.queueUtilization*100,
 		total, completed, failed)
 }
 
-// dynamicScalerは動的スケーリングを実行します
+// dynamicScaler 動的スケーリングを実行します
 func (wp *WorkerPool) dynamicScaler() {
-	defer wp.wg.Done()
-
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
+	tick := time.Tick(10 * time.Second)
 
 	for {
 		select {
 		case <-wp.ctx.Done():
 			return
-		case <-ticker.C:
+		case <-tick:
 			wp.autoScale()
 		}
 	}
 }
 
-// autoScaleは自動スケーリングを実行します
+// autoScale 自動スケーリングを実行します
 func (wp *WorkerPool) autoScale() {
 	wp.metrics.mu.RLock()
 	queueUtil := wp.metrics.queueUtilization
@@ -402,12 +400,9 @@ func (wp *WorkerPool) autoScale() {
 	// スケールダウンは自然に発生（アイドルタイムアウト）
 }
 
-// Shutdownはワーカープールを適切に停止します
+// Shutdown ワーカープールを適切に停止します
 func (wp *WorkerPool) Shutdown(timeout time.Duration) error {
 	log.Println("Starting worker pool shutdown...")
-
-	// 新しいタスクの受付を停止
-	close(wp.taskQueue)
 
 	// ワーカーに停止シグナルを送信
 	wp.cancel()
@@ -428,17 +423,17 @@ func (wp *WorkerPool) Shutdown(timeout time.Duration) error {
 	}
 }
 
-// GetMetricsは現在のメトリクスを取得します
-func (wp *WorkerPool) GetMetrics() *PoolMetrics {
+// GetMetrics 現在のメトリクスを取得します
+func (wp *WorkerPool) GetMetrics() *PoolMetricsSnapshot {
 	wp.metrics.mu.RLock()
 	defer wp.metrics.mu.RUnlock()
 
-	// メトリクスのコピーを返す
-	return &PoolMetrics{
-		activeWorkers:    atomic.LoadInt64(&wp.metrics.activeWorkers),
-		totalTasks:       atomic.LoadInt64(&wp.metrics.totalTasks),
-		completedTasks:   atomic.LoadInt64(&wp.metrics.completedTasks),
-		failedTasks:      atomic.LoadInt64(&wp.metrics.failedTasks),
+	// メトリクスのスナップショットを返す
+	return &PoolMetricsSnapshot{
+		activeWorkers:    wp.metrics.activeWorkers.Load(),
+		totalTasks:       wp.metrics.totalTasks.Load(),
+		completedTasks:   wp.metrics.completedTasks.Load(),
+		failedTasks:      wp.metrics.failedTasks.Load(),
 		queueUtilization: wp.metrics.queueUtilization,
 		lastUpdateTime:   wp.metrics.lastUpdateTime,
 	}
@@ -455,12 +450,12 @@ func main() {
 
 	// サンプルタスクを送信
 	go func() {
-		for i := 1; i <= 100; i++ {
-			taskID := i
+		for i := range 100 {
+			taskID := i + 1
 			task := Task{
 				ID:   taskID,
 				Data: fmt.Sprintf("Task data %d", taskID),
-				Execute: func(data interface{}) error {
+				Execute: func(data any) error {
 					// シミュレーション処理
 					processingTime := time.Duration(100) * time.Millisecond
 					time.Sleep(processingTime)

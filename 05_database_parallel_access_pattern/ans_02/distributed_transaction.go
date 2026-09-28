@@ -26,9 +26,9 @@ type TransactionCoordinator struct {
 
 // ParticipantManager 分散トランザクション参加者
 type ParticipantManager interface {
-	Prepare(ctx context.Context, tx *sql.Tx, data interface{}) error
-	Commit(ctx context.Context, tx *sql.Tx, data interface{}) error
-	Rollback(ctx context.Context, tx *sql.Tx, data interface{}) error
+	Prepare(ctx context.Context, tx *sql.Tx, data any) error
+	Commit(ctx context.Context, tx *sql.Tx, data any) error
+	Rollback(ctx context.Context, tx *sql.Tx, data any) error
 	GetName() string
 }
 
@@ -180,7 +180,7 @@ func (tc *TransactionCoordinator) executeTwoPhaseCommit(ctx context.Context, txI
 
 		err = participant.Prepare(ctx, tx, data)
 		if err != nil {
-			if rollbackErr := tx.Rollback(); rollbackErr != nil {
+			if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
 				log.Printf("Failed to rollback transaction: %v", rollbackErr)
 			}
 			tc.rollbackAll(preparedTxs, data)
@@ -235,7 +235,7 @@ func (tc *TransactionCoordinator) rollbackAll(txs map[string]*sql.Tx, data *Orde
 			log.Printf("Failed to rollback participant %s: %v", name, err)
 		}
 
-		if err := tx.Rollback(); err != nil {
+		if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
 			log.Printf("Failed to rollback transaction for %s: %v", name, err)
 		}
 
@@ -254,7 +254,7 @@ type OrderManager struct{}
 
 func (om *OrderManager) GetName() string { return "order" }
 
-func (om *OrderManager) Prepare(ctx context.Context, tx *sql.Tx, data interface{}) error {
+func (om *OrderManager) Prepare(ctx context.Context, tx *sql.Tx, data any) error {
 	orderData := data.(*OrderData)
 
 	// 注文データの検証
@@ -281,7 +281,7 @@ func (om *OrderManager) Prepare(ctx context.Context, tx *sql.Tx, data interface{
 	return nil
 }
 
-func (om *OrderManager) Commit(ctx context.Context, tx *sql.Tx, data interface{}) error {
+func (om *OrderManager) Commit(ctx context.Context, tx *sql.Tx, data any) error {
 	orderData := data.(*OrderData)
 
 	query := `
@@ -299,7 +299,7 @@ func (om *OrderManager) Commit(ctx context.Context, tx *sql.Tx, data interface{}
 	return nil
 }
 
-func (om *OrderManager) Rollback(ctx context.Context, tx *sql.Tx, data interface{}) error {
+func (om *OrderManager) Rollback(ctx context.Context, tx *sql.Tx, data any) error {
 	// Rollback処理（必要に応じて補償処理を実装）
 	log.Printf("Order manager rollback executed")
 	return nil
@@ -310,14 +310,14 @@ type InventoryManager struct{}
 
 func (im *InventoryManager) GetName() string { return "inventory" }
 
-func (im *InventoryManager) Prepare(ctx context.Context, tx *sql.Tx, data interface{}) error {
+func (im *InventoryManager) Prepare(ctx context.Context, tx *sql.Tx, data any) error {
 	orderData := data.(*OrderData)
 
 	// 在庫の確認と予約
 	var currentQuantity int32
 	query := "SELECT quantity FROM inventory WHERE id = $1 FOR UPDATE"
 	err := tx.QueryRowContext(ctx, query, orderData.ItemID).Scan(&currentQuantity)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return errors.New("item not found")
 	}
 	if err != nil {
@@ -342,7 +342,7 @@ func (im *InventoryManager) Prepare(ctx context.Context, tx *sql.Tx, data interf
 	return nil
 }
 
-func (im *InventoryManager) Commit(ctx context.Context, tx *sql.Tx, data interface{}) error {
+func (im *InventoryManager) Commit(ctx context.Context, tx *sql.Tx, data any) error {
 	orderData := data.(*OrderData)
 
 	// 在庫を実際に減算
@@ -367,7 +367,7 @@ func (im *InventoryManager) Commit(ctx context.Context, tx *sql.Tx, data interfa
 	return nil
 }
 
-func (im *InventoryManager) Rollback(ctx context.Context, tx *sql.Tx, data interface{}) error {
+func (im *InventoryManager) Rollback(ctx context.Context, tx *sql.Tx, data any) error {
 	orderData := data.(*OrderData)
 
 	// 予約を解除
@@ -386,14 +386,14 @@ type PaymentManager struct{}
 
 func (pm *PaymentManager) GetName() string { return "payment" }
 
-func (pm *PaymentManager) Prepare(ctx context.Context, tx *sql.Tx, data interface{}) error {
+func (pm *PaymentManager) Prepare(ctx context.Context, tx *sql.Tx, data any) error {
 	orderData := data.(*OrderData)
 
 	// 顧客の支払い能力確認（残高チェック等）
 	var balance int64
 	query := "SELECT balance FROM customer_accounts WHERE customer_id = $1 FOR UPDATE"
 	err := tx.QueryRowContext(ctx, query, orderData.CustomerID).Scan(&balance)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return errors.New("customer account not found")
 	}
 	if err != nil {
@@ -418,7 +418,7 @@ func (pm *PaymentManager) Prepare(ctx context.Context, tx *sql.Tx, data interfac
 	return nil
 }
 
-func (pm *PaymentManager) Commit(ctx context.Context, tx *sql.Tx, data interface{}) error {
+func (pm *PaymentManager) Commit(ctx context.Context, tx *sql.Tx, data any) error {
 	orderData := data.(*OrderData)
 
 	// 残高から実際に減算
@@ -453,7 +453,7 @@ func (pm *PaymentManager) Commit(ctx context.Context, tx *sql.Tx, data interface
 	return nil
 }
 
-func (pm *PaymentManager) Rollback(ctx context.Context, tx *sql.Tx, data interface{}) error {
+func (pm *PaymentManager) Rollback(ctx context.Context, tx *sql.Tx, data any) error {
 	orderData := data.(*OrderData)
 
 	// 決済予約を解除

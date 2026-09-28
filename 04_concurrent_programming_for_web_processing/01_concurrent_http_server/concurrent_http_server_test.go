@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -60,9 +62,6 @@ func TestServerStartAndShutdown(t *testing.T) {
 		t.Fatalf("Failed to start server: %v", err)
 	}
 
-	// 少し待機
-	time.Sleep(100 * time.Millisecond)
-
 	// 二重開始はエラーになることを確認
 	err = server.Start()
 	if err == nil {
@@ -85,6 +84,7 @@ func TestServerStartAndShutdown(t *testing.T) {
 // TestRequestProcessing リクエスト処理をテストします
 func TestRequestProcessing(t *testing.T) {
 	config := NewServerConfig()
+	config.Port = 0
 	config.MaxWorkers = 2
 	config.RequestBuffer = 10
 
@@ -101,14 +101,15 @@ func TestRequestProcessing(t *testing.T) {
 	}()
 
 	// HTTPリクエストを作成
-	req := httptest.NewRequest("GET", "/health", nil)
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
 	w := httptest.NewRecorder()
 
-	// リクエストを処理
+	// リクエストを処理（ServeHTTPはワーカーの結果を受け取るまでブロックする）
 	server.ServeHTTP(w, req)
 
-	// 少し待機してワーカーが処理するのを待つ
-	time.Sleep(200 * time.Millisecond)
+	if w.Code != http.StatusOK {
+		t.Fatalf("Expected status 200, got %d", w.Code)
+	}
 
 	// 統計を確認
 	stats := server.GetStats()
@@ -125,12 +126,12 @@ func TestHealthCheckHandler(t *testing.T) {
 
 	req := &HTTPRequest{
 		ID:        "test-001",
-		Method:    "GET",
+		Method:    http.MethodGet,
 		Path:      "/health",
 		Timestamp: time.Now(),
 	}
 
-	response, err := server.healthCheckHandler(context.Background(), req)
+	response, err := server.healthCheckHandler(t.Context(), req)
 	if err != nil {
 		t.Fatalf("Health check failed: %v", err)
 	}
@@ -144,7 +145,7 @@ func TestHealthCheckHandler(t *testing.T) {
 	}
 
 	// JSONレスポンスを確認
-	var healthData map[string]interface{}
+	var healthData map[string]any
 	err = json.Unmarshal(response.Body, &healthData)
 	if err != nil {
 		t.Fatalf("Failed to parse health response: %v", err)
@@ -163,7 +164,7 @@ func TestEchoHandler(t *testing.T) {
 	testBody := "test request body"
 	req := &HTTPRequest{
 		ID:        "test-002",
-		Method:    "POST",
+		Method:    http.MethodPost,
 		Path:      "/api/echo",
 		Body:      []byte(testBody),
 		Headers:   map[string]string{"Content-Type": "application/json"},
@@ -172,7 +173,7 @@ func TestEchoHandler(t *testing.T) {
 		Timestamp: time.Now(),
 	}
 
-	response, err := server.echoHandler(context.Background(), req)
+	response, err := server.echoHandler(t.Context(), req)
 	if err != nil {
 		t.Fatalf("Echo handler failed: %v", err)
 	}
@@ -182,13 +183,13 @@ func TestEchoHandler(t *testing.T) {
 	}
 
 	// エコー内容を確認
-	var echoData map[string]interface{}
+	var echoData map[string]any
 	err = json.Unmarshal(response.Body, &echoData)
 	if err != nil {
 		t.Fatalf("Failed to parse echo response: %v", err)
 	}
 
-	if echoData["method"] != "POST" {
+	if echoData["method"] != http.MethodPost {
 		t.Errorf("Expected POST method, got %v", echoData["method"])
 	}
 	if echoData["body"] != testBody {
@@ -203,7 +204,7 @@ func TestSlowHandler(t *testing.T) {
 
 	req := &HTTPRequest{
 		ID:        "test-003",
-		Method:    "GET",
+		Method:    http.MethodGet,
 		Path:      "/api/slow",
 		Timestamp: time.Now(),
 	}
@@ -211,18 +212,18 @@ func TestSlowHandler(t *testing.T) {
 	start := time.Now()
 
 	// コンテキストでタイムアウトテスト
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	ctx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
 	defer cancel()
 
 	response, err := server.slowHandler(ctx, req)
 	elapsed := time.Since(start)
 
 	// タイムアウトまたは正常完了のどちらでも許可
-	if err != nil && err != context.DeadlineExceeded {
+	if err != nil && !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Unexpected error: %v", err)
 	}
 
-	if err == context.DeadlineExceeded {
+	if errors.Is(err, context.DeadlineExceeded) {
 		// タイムアウトした場合
 		if elapsed < 400*time.Millisecond {
 			t.Errorf("Expected timeout around 500ms, got %v", elapsed)
@@ -265,12 +266,12 @@ func TestMiddleware(t *testing.T) {
 
 	req := &HTTPRequest{
 		ID:        "test-004",
-		Method:    "GET",
+		Method:    http.MethodGet,
 		Path:      "/test",
 		Timestamp: time.Now(),
 	}
 
-	_, err := finalHandler(context.Background(), req)
+	_, err := finalHandler(t.Context(), req)
 	if err != nil {
 		t.Fatalf("Middleware test failed: %v", err)
 	}
@@ -283,6 +284,7 @@ func TestMiddleware(t *testing.T) {
 // TestConcurrentRequests 並行リクエストをテストします
 func TestConcurrentRequests(t *testing.T) {
 	config := NewServerConfig()
+	config.Port = 0
 	config.MaxWorkers = 3
 	config.RequestBuffer = 20
 
@@ -300,24 +302,21 @@ func TestConcurrentRequests(t *testing.T) {
 
 	const numRequests = 10
 	var wg sync.WaitGroup
-	wg.Add(numRequests)
 
-	// 複数のgoroutineで並行リクエスト
-	for i := 0; i < numRequests; i++ {
-		go func(id int) {
-			defer wg.Done()
-
-			req := httptest.NewRequest("GET", "/health", nil)
+	// 複数のgoroutineで並行リクエスト。ServeHTTPは結果を受け取るまでブロックするので、
+	// wg.Wait()が返った時点ですべてのリクエストが処理済みになっている。
+	for i := range numRequests {
+		wg.Go(func() {
+			req := httptest.NewRequest(http.MethodGet, "/health", nil)
 			w := httptest.NewRecorder()
-
 			server.ServeHTTP(w, req)
-		}(i)
+			if w.Code != http.StatusOK {
+				t.Errorf("request %d: expected status 200, got %d", i, w.Code)
+			}
+		})
 	}
 
 	wg.Wait()
-
-	// 処理時間を与える
-	time.Sleep(500 * time.Millisecond)
 
 	// 統計確認
 	stats := server.GetStats()
@@ -331,6 +330,7 @@ func TestConcurrentRequests(t *testing.T) {
 // TestWorkerStats ワーカー統計をテストします
 func TestWorkerStats(t *testing.T) {
 	config := NewServerConfig()
+	config.Port = 0
 	config.MaxWorkers = 2
 
 	server := NewConcurrentHTTPServer(config)
@@ -345,19 +345,16 @@ func TestWorkerStats(t *testing.T) {
 		}
 	}()
 
-	// いくつかのリクエストを送信
-	for i := 0; i < 5; i++ {
-		req := httptest.NewRequest("GET", "/health", nil)
+	// いくつかのリクエストを送信（ServeHTTPは同期的に完了する）
+	for range 5 {
+		req := httptest.NewRequest(http.MethodGet, "/health", nil)
 		w := httptest.NewRecorder()
 		server.ServeHTTP(w, req)
 	}
 
-	// 処理時間を与える
-	time.Sleep(300 * time.Millisecond)
-
 	// ワーカー統計を確認
 	stats := server.GetStats()
-	workerStats := stats["worker_stats"].(map[string]interface{})
+	workerStats := stats["worker_stats"].(map[string]any)
 
 	if len(workerStats) != 2 {
 		t.Errorf("Expected 2 workers in stats, got %d", len(workerStats))
@@ -366,7 +363,7 @@ func TestWorkerStats(t *testing.T) {
 	// 少なくとも1つのワーカーが処理していることを確認
 	foundActiveWorker := false
 	for _, workerStat := range workerStats {
-		workerData := workerStat.(map[string]interface{})
+		workerData := workerStat.(map[string]any)
 		processed := workerData["processed_requests"].(int64)
 		if processed > 0 {
 			foundActiveWorker = true
@@ -410,8 +407,8 @@ func TestDefaultHandler(t *testing.T) {
 		path           string
 		expectedStatus int
 	}{
-		{"GET", "/nonexistent", http.StatusNotFound},
-		{"POST", "/nonexistent", http.StatusMethodNotAllowed},
+		{http.MethodGet, "/nonexistent", http.StatusNotFound},
+		{http.MethodPost, "/nonexistent", http.StatusMethodNotAllowed},
 		{"UNKNOWN", "/nonexistent", http.StatusNotImplemented},
 	}
 
@@ -424,7 +421,7 @@ func TestDefaultHandler(t *testing.T) {
 			Timestamp: time.Now(),
 		}
 
-		response, err := handler(context.Background(), req)
+		response, err := handler(t.Context(), req)
 		if err != nil {
 			t.Fatalf("Default handler failed for %s %s: %v", test.method, test.path, err)
 		}
@@ -440,16 +437,30 @@ func TestDefaultHandler(t *testing.T) {
 	}
 }
 
-// TestRequestQueueFull リクエストキューが満杯の場合をテストします
+// TestRequestQueueFull リクエストキューが満杯の場合をテストします。
+// タイミング頼みを避けるため、1本目でワーカーを、2本目でバッファを確実に埋めてから
+// 残りを並行投入し、429が返ることを決定的に確認する。
 func TestRequestQueueFull(t *testing.T) {
 	config := NewServerConfig()
+	config.Port = 0
 	config.MaxWorkers = 1
 	config.RequestBuffer = 1 // 非常に小さなバッファ
 
 	server := NewConcurrentHTTPServer(config)
 
-	err := server.Start()
-	if err != nil {
+	release := make(chan struct{})
+	blockHandler := func(ctx context.Context, req *HTTPRequest) (*HTTPResponse, error) {
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		return &HTTPResponse{StatusCode: http.StatusOK, Success: true, HandlerName: "block"}, nil
+	}
+	// ハンドラー登録はStart前だけ行う（workerPool[].handlersはロックなしで共有されるため）。
+	server.RegisterHandler(http.MethodGet, "/block", blockHandler)
+
+	if err := server.Start(); err != nil {
 		t.Fatalf("Failed to start server: %v", err)
 	}
 	defer func() {
@@ -458,20 +469,89 @@ func TestRequestQueueFull(t *testing.T) {
 		}
 	}()
 
-	// キューを満杯にするため、複数のリクエストを即座に送信
-	for i := 0; i < 10; i++ {
-		req := httptest.NewRequest("GET", "/api/slow", nil)
+	// 1本目: 唯一のワーカーに掴ませてブロックさせる
+	firstDone := make(chan struct{})
+	go func() {
+		defer close(firstDone)
+		req := httptest.NewRequest(http.MethodGet, "/block", nil)
 		w := httptest.NewRecorder()
 		server.ServeHTTP(w, req)
-
-		// いくつかのリクエストでToo Many Requestsが返されることを期待
-		if w.Code == http.StatusTooManyRequests {
-			return // 期待通りのエラーが発生
-		}
+	}()
+	for server.stats.activeRequests.Load() < 1 {
+		time.Sleep(time.Millisecond)
 	}
 
-	// ここに到達した場合でもテストは通す（タイミング依存のため）
-	t.Log("Queue full scenario might not have been triggered due to timing")
+	// 2本目: バッファ(1)を埋める
+	secondDone := make(chan struct{})
+	go func() {
+		defer close(secondDone)
+		req := httptest.NewRequest(http.MethodGet, "/block", nil)
+		w := httptest.NewRecorder()
+		server.ServeHTTP(w, req)
+	}()
+	for len(server.requestQueue) < 1 {
+		time.Sleep(time.Millisecond)
+	}
+
+	// 3本目以降: ワーカーもバッファも埋まっているので429を期待する
+	const extra = 8
+	codes := make([]int, extra)
+	var wg sync.WaitGroup
+	for i := range extra {
+		wg.Go(func() {
+			req := httptest.NewRequest(http.MethodGet, "/block", nil)
+			w := httptest.NewRecorder()
+			server.ServeHTTP(w, req)
+			codes[i] = w.Code
+		})
+	}
+	wg.Wait()
+
+	close(release)
+	<-firstDone
+	<-secondDone
+
+	if !slices.Contains(codes, http.StatusTooManyRequests) {
+		t.Errorf("Expected at least one 429 Too Many Requests, got %v", codes)
+	}
+}
+
+// TestConcurrentSubmitAndShutdown 投入とShutdownを並行させてもpanicせず、
+// 停止後の投入がエラーになることを確認する回帰テスト。
+func TestConcurrentSubmitAndShutdown(t *testing.T) {
+	for iter := range 50 {
+		config := NewServerConfig()
+		config.Port = 0
+		config.MaxWorkers = 2
+		config.RequestBuffer = 4
+
+		server := NewConcurrentHTTPServer(config)
+		if err := server.Start(); err != nil {
+			t.Fatalf("iter %d: failed to start server: %v", iter, err)
+		}
+
+		var wg sync.WaitGroup
+		for range 20 {
+			wg.Go(func() {
+				req := httptest.NewRequest(http.MethodGet, "/health", nil)
+				w := httptest.NewRecorder()
+				server.ServeHTTP(w, req)
+			})
+		}
+
+		if err := server.Shutdown(2 * time.Second); err != nil {
+			t.Fatalf("iter %d: shutdown failed: %v", iter, err)
+		}
+		wg.Wait()
+
+		// 停止後の投入は503になる
+		req := httptest.NewRequest(http.MethodGet, "/health", nil)
+		w := httptest.NewRecorder()
+		server.ServeHTTP(w, req)
+		if w.Code != http.StatusServiceUnavailable {
+			t.Errorf("iter %d: expected 503 after shutdown, got %d", iter, w.Code)
+		}
+	}
 }
 
 // ベンチマークテスト
@@ -481,14 +561,13 @@ func BenchmarkHealthCheckHandler(b *testing.B) {
 
 	req := &HTTPRequest{
 		ID:        "bench-001",
-		Method:    "GET",
+		Method:    http.MethodGet,
 		Path:      "/health",
 		Timestamp: time.Now(),
 	}
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_, err := server.healthCheckHandler(context.Background(), req)
+	for b.Loop() {
+		_, err := server.healthCheckHandler(b.Context(), req)
 		if err != nil {
 			b.Fatalf("Benchmark failed: %v", err)
 		}

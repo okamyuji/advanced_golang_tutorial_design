@@ -1,8 +1,10 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -10,7 +12,6 @@ import (
 	"os/signal"
 	"runtime"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -73,13 +74,17 @@ func main() {
 
 	// DBマネージャー初期化
 	poolConfig := manager.WorkerPoolConfig{
-		MaxWorkers:      runtime.NumCPU() * 4,
+		MaxWorkers:      runtime.GOMAXPROCS(0) * 4,
 		QueueSize:       1000,
 		TimeoutDuration: 30 * time.Second,
 	}
 
 	dbManager = manager.NewConcurrentDBManager(poolConfig)
-	defer dbManager.Close()
+	defer func() {
+		if err := dbManager.Close(); err != nil {
+			log.Printf("DBマネージャー終了エラー: %v", err)
+		}
+	}()
 
 	// データベース接続設定
 	if err := setupDatabases(); err != nil {
@@ -103,7 +108,7 @@ func main() {
 	// サーバー起動
 	go func() {
 		log.Printf("HTTPサーバー起動: ポート %d", appConfig.Server.Port)
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("HTTPサーバーエラー: %v", err)
 		}
 	}()
@@ -115,7 +120,7 @@ func main() {
 			Handler: promhttp.Handler(),
 		}
 		log.Println("Prometheusメトリクスサーバー起動: ポート 8081")
-		if err := metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := metricsServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Printf("メトリクスサーバーエラー: %v", err)
 		}
 	}()
@@ -179,67 +184,79 @@ func setupDatabases() error {
 func setupRoutes() http.Handler {
 	mux := http.NewServeMux()
 
-	// API ルート（より具体的なパスを先に定義）
-	mux.HandleFunc("/api/v1/users/search", methodHandler("GET", corsAndLogging(searchUsersHandler)))
-	mux.HandleFunc("/api/v1/users/bulk", methodHandler("POST", corsAndLogging(bulkCreateUsersHandler)))
-	mux.HandleFunc("/api/v1/users/", userHandler) // /{id}パターンとPOSTの両方を処理
-	mux.HandleFunc("/api/v1/databases/query", methodHandler("POST", corsAndLogging(executeQueryHandler)))
-	mux.HandleFunc("/api/v1/databases/parallel", methodHandler("POST", corsAndLogging(executeParallelQueriesHandler)))
-	mux.HandleFunc("/api/v1/health", methodHandler("GET", corsAndLogging(healthCheckHandler)))
-	mux.HandleFunc("/api/v1/metrics", methodHandler("GET", corsAndLogging(getMetricsHandler)))
-	mux.HandleFunc("/api/v1/stats", methodHandler("GET", corsAndLogging(getDatabaseStatsHandler)))
-	mux.HandleFunc("/api/v1/loadtest", methodHandler("POST", corsAndLogging(loadTestHandler)))
+	// API ルート（メソッド違いは ServeMux が 405 を返す）
+	mux.HandleFunc("GET /api/v1/users/search", corsAndLogging(searchUsersHandler))
+	mux.HandleFunc("POST /api/v1/users/bulk", corsAndLogging(bulkCreateUsersHandler))
+	mux.HandleFunc("POST /api/v1/users/{$}", corsAndLogging(createUserHandler))
+	mux.HandleFunc("GET /api/v1/users/{id}", corsAndLogging(getUserHandler))
+	mux.HandleFunc("POST /api/v1/databases/query", corsAndLogging(executeQueryHandler))
+	mux.HandleFunc("POST /api/v1/databases/parallel", corsAndLogging(executeParallelQueriesHandler))
+	mux.HandleFunc("GET /api/v1/health", corsAndLogging(healthCheckHandler))
+	mux.HandleFunc("GET /api/v1/metrics", corsAndLogging(getMetricsHandler))
+	mux.HandleFunc("GET /api/v1/stats", corsAndLogging(getDatabaseStatsHandler))
+	mux.HandleFunc("POST /api/v1/loadtest", corsAndLogging(loadTestHandler))
+	// CORS のプリフライト。corsAndLogging が OPTIONS をヘッダーだけ付けて返す
+	mux.HandleFunc("OPTIONS /api/v1/", corsAndLogging(http.NotFound))
 
-	// 静的ファイル
-	mux.Handle("/", http.FileServer(http.Dir("./static/")))
+	// 静的ファイル。GET に限定しないと、API パスへの想定外メソッドが 405 でなく 404 になる
+	mux.Handle("GET /", http.FileServer(http.Dir("./static/")))
 
 	return mux
 }
 
-// ユーザー関連のハンドラー（POSTとGET /{id}を処理）
-func userHandler(w http.ResponseWriter, r *http.Request) {
-	// ログとCORS処理
-	handler := corsAndLogging(func(w http.ResponseWriter, r *http.Request) {
-		// パスから/api/v1/users/を除去
-		path := strings.TrimPrefix(r.URL.Path, "/api/v1/users/")
-		
-		if r.Method == "POST" && path == "" {
-			createUserHandler(w, r)
-		} else if r.Method == "GET" && path != "" {
-			// IDを抽出してgetUserHandlerを呼び出し
-			getUserHandlerWithID(w, r, path)
-		} else {
-			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
-		}
-	})
-	
-	handler(w, r)
+// resolveDBType クエリパラメータ db_type、なければ登録済みの先頭を返す。
+// 見つからないときはエラー応答を書いて false を返す
+func resolveDBType(w http.ResponseWriter, r *http.Request) (string, bool) {
+	if dbType := r.URL.Query().Get("db_type"); dbType != "" {
+		return dbType, true
+	}
+	availableDBs := dbManager.GetRegisteredDatabases()
+	if len(availableDBs) == 0 {
+		http.Error(w, "利用可能なデータベースがありません", http.StatusInternalServerError)
+		return "", false
+	}
+	return availableDBs[0], true
 }
 
-// getUserHandlerを修正してIDを外部から受け取る
-func getUserHandlerWithID(w http.ResponseWriter, r *http.Request, idStr string) {
-	id, err := strconv.ParseInt(idStr, 10, 64)
+// placeholder データベースごとの n 番目（1始まり）のバインド変数表記を返す
+func placeholder(dbType string, n int) string {
+	switch dbType {
+	// MSSQLアダプターは"mssql"ドライバーで開くので"?"を使う。"@pN"は"sqlserver"ドライバーの書き方で、ここでは通らない
+	case "MySQL", "MSSQL":
+		return "?"
+	case "Oracle":
+		return ":" + strconv.Itoa(n)
+	default:
+		return "$" + strconv.Itoa(n)
+	}
+}
+
+// writeJSON JSON を書き出し、失敗したらログに残す（ヘッダー送信後なので応答は変えられない）
+func writeJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		log.Printf("JSONエンコードエラー: %v", err)
+	}
+}
+
+// getUserHandler GET /api/v1/users/{id}
+func getUserHandler(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
 		http.Error(w, "無効なユーザーID", http.StatusBadRequest)
 		return
 	}
 
-	dbType := r.URL.Query().Get("db_type")
-	if dbType == "" {
-		// 有効なデータベースから最初のものを選択
-		availableDBs := dbManager.GetRegisteredDatabases()
-		if len(availableDBs) == 0 {
-			http.Error(w, "利用可能なデータベースがありません", http.StatusInternalServerError)
-			return
-		}
-		dbType = availableDBs[0]
+	dbType, ok := resolveDBType(w, r)
+	if !ok {
+		return
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
 	resultChan := dbManager.ExecuteQuery(ctx, dbType,
-		"SELECT id, name, email, age, created_at, updated_at FROM users WHERE id = $1", id)
+		"SELECT id, name, email, age, created_at, updated_at FROM users WHERE id = "+placeholder(dbType, 1), id)
 
 	result := <-resultChan
 	if result.Error != nil {
@@ -269,25 +286,11 @@ func getUserHandlerWithID(w http.ResponseWriter, r *http.Request, idStr string) 
 		user.Age = int(age)
 	}
 
-	response := models.UserResponse{
+	writeJSON(w, models.UserResponse{
 		User:    user,
 		Message: "ユーザーが見つかりました",
 		Success: true,
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
-}
-
-// HTTPメソッドチェック付きハンドラー
-func methodHandler(allowedMethod string, handler http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != allowedMethod {
-			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		handler(w, r)
-	}
+	})
 }
 
 // CORSとロギングの組み合わせミドルウェア
@@ -323,7 +326,6 @@ func corsAndLogging(handler http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-
 type loggingResponseWriter struct {
 	http.ResponseWriter
 	statusCode int
@@ -342,16 +344,9 @@ func createUserHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// データベースタイプをクエリパラメータから取得
-	dbType := r.URL.Query().Get("db_type")
-	if dbType == "" {
-		// 有効なデータベースから最初のものを選択
-		availableDBs := dbManager.GetRegisteredDatabases()
-		if len(availableDBs) == 0 {
-			http.Error(w, "利用可能なデータベースがありません", http.StatusInternalServerError)
-			return
-		}
-		dbType = availableDBs[0]
+	dbType, ok := resolveDBType(w, r)
+	if !ok {
+		return
 	}
 
 	user := req.ToUser()
@@ -384,35 +379,23 @@ func createUserHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	response := models.UserResponse{
+	writeJSON(w, models.UserResponse{
 		User:    user,
 		Message: "ユーザーが正常に作成されました",
 		Success: true,
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+	})
 }
 
-
 func searchUsersHandler(w http.ResponseWriter, r *http.Request) {
-	query := r.URL.Query()
-	dbType := query.Get("db_type")
-	if dbType == "" {
-		// 有効なデータベースから最初のものを選択
-		availableDBs := dbManager.GetRegisteredDatabases()
-		if len(availableDBs) == 0 {
-			http.Error(w, "利用可能なデータベースがありません", http.StatusInternalServerError)
-			return
-		}
-		dbType = availableDBs[0]
+	dbType, ok := resolveDBType(w, r)
+	if !ok {
+		return
 	}
 
+	query := r.URL.Query()
 	minAge, _ := strconv.Atoi(query.Get("min_age"))
 	maxAge, _ := strconv.Atoi(query.Get("max_age"))
-	if maxAge == 0 {
-		maxAge = 150
-	}
+	maxAge = cmp.Or(maxAge, 150)
 
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
@@ -426,33 +409,17 @@ func searchUsersHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	users := make([]*models.User, 0, len(result.Data))
-	for _, row := range result.Data {
-		user := &models.User{}
-		if id, ok := row["id"].(int64); ok {
-			user.ID = id
-		}
-		if name, ok := row["name"].(string); ok {
-			user.Name = name
-		}
-		if email, ok := row["email"].(string); ok {
-			user.Email = email
-		}
-		if age, ok := row["age"].(int64); ok {
-			user.Age = int(age)
-		}
-		users = append(users, user)
+	users := result.Users
+	if users == nil {
+		users = []*models.User{} // 0件でもJSONをnullでなく[]にする
 	}
 
-	response := models.UsersResponse{
+	writeJSON(w, models.UsersResponse{
 		Users:   users,
 		Total:   int64(len(users)),
 		Success: true,
 		Message: fmt.Sprintf("%d件のユーザーが見つかりました", len(users)),
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+	})
 }
 
 func bulkCreateUsersHandler(w http.ResponseWriter, r *http.Request) {
@@ -462,15 +429,9 @@ func bulkCreateUsersHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	dbType := r.URL.Query().Get("db_type")
-	if dbType == "" {
-		// 有効なデータベースから最初のものを選択
-		availableDBs := dbManager.GetRegisteredDatabases()
-		if len(availableDBs) == 0 {
-			http.Error(w, "利用可能なデータベースがありません", http.StatusInternalServerError)
-			return
-		}
-		dbType = availableDBs[0]
+	dbType, ok := resolveDBType(w, r)
+	if !ok {
+		return
 	}
 
 	// リクエストをUserモデルに変換
@@ -506,19 +467,18 @@ func bulkCreateUsersHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(bulkResult)
+	writeJSON(w, bulkResult)
 }
 
-// executeQueryHandler は任意の SQL をリクエストボディから受け取って実行する
-// エンドポイントでしたが、SQL インジェクションの温床となるため無効化しています。
-// 本番用途では GetUsersByAgeRange のようにパラメータ化された専用ハンドラを追加してください。
+// executeQueryHandler 任意の SQL をリクエストボディから受け取って実行するエンドポイント。
+// SQL インジェクションの温床となるため無効化している。
+// 本番用途では GetUsersByAgeRange のようにパラメータ化された専用ハンドラを追加する。
 func executeQueryHandler(w http.ResponseWriter, _ *http.Request) {
 	http.Error(w, "任意 SQL 実行エンドポイントは無効化されています", http.StatusGone)
 }
 
-// executeParallelQueriesHandler も同様に、任意 SQL をリクエストボディから受け取って
-// 並列実行するデモ用ハンドラでしたが、SQL インジェクションの温床となるため無効化しています。
+// executeParallelQueriesHandler 任意の SQL を受け取って並列実行するデモ用エンドポイント。
+// executeQueryHandler と同じ理由で無効化している。
 func executeParallelQueriesHandler(w http.ResponseWriter, _ *http.Request) {
 	http.Error(w, "任意 SQL 並列実行エンドポイントは無効化されています", http.StatusGone)
 }
@@ -554,22 +514,15 @@ func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+	writeJSON(w, response)
 }
 
-func getMetricsHandler(w http.ResponseWriter, r *http.Request) {
-	metrics := dbManager.GetMetrics()
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(metrics)
+func getMetricsHandler(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, dbManager.GetMetrics())
 }
 
-func getDatabaseStatsHandler(w http.ResponseWriter, r *http.Request) {
-	stats := dbManager.GetDatabaseStats()
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(stats)
+func getDatabaseStatsHandler(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, dbManager.GetDatabaseStats())
 }
 
 func loadTestHandler(w http.ResponseWriter, r *http.Request) {
@@ -586,12 +539,8 @@ func loadTestHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// デフォルト値設定
-	if req.ConcurrentClients == 0 {
-		req.ConcurrentClients = 10
-	}
-	if req.RequestsPerClient == 0 {
-		req.RequestsPerClient = 100
-	}
+	req.ConcurrentClients = cmp.Or(req.ConcurrentClients, 10)
+	req.RequestsPerClient = cmp.Or(req.RequestsPerClient, 100)
 
 	duration, err := time.ParseDuration(req.TestDuration)
 	if err != nil {
@@ -601,33 +550,29 @@ func loadTestHandler(w http.ResponseWriter, r *http.Request) {
 	// 負荷テスト実行
 	result := runLoadTest(req.DBType, req.ConcurrentClients, req.RequestsPerClient, duration)
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(result)
+	writeJSON(w, result)
 }
 
-func runLoadTest(dbType string, concurrentClients, requestsPerClient int, duration time.Duration) map[string]interface{} {
+func runLoadTest(dbType string, concurrentClients, requestsPerClient int, duration time.Duration) map[string]any {
 	ctx, cancel := context.WithTimeout(context.Background(), duration)
 	defer cancel()
 
 	var wg sync.WaitGroup
-	var totalRequests, successfulRequests int64
+	var totalRequests, successfulRequests atomic.Int64
 	start := time.Now()
+	query := "SELECT id, name, email FROM users WHERE id = " + placeholder(dbType, 1)
 
-	for i := 0; i < concurrentClients; i++ {
-		wg.Add(1)
-		go func(clientID int) {
-			defer wg.Done()
+	for range concurrentClients {
+		wg.Go(func() {
+			for j := range requestsPerClient {
+				totalRequests.Add(1)
 
-			for j := 0; j < requestsPerClient; j++ {
-				atomic.AddInt64(&totalRequests, 1)
-
-				resultChan := dbManager.ExecuteQuery(ctx, dbType,
-					"SELECT id, name, email FROM users WHERE id = $1", int64(j%1000+1))
+				resultChan := dbManager.ExecuteQuery(ctx, dbType, query, int64(j%1000+1))
 
 				select {
 				case result := <-resultChan:
 					if result.Error == nil {
-						atomic.AddInt64(&successfulRequests, 1)
+						successfulRequests.Add(1)
 					}
 				case <-ctx.Done():
 					return
@@ -636,29 +581,27 @@ func runLoadTest(dbType string, concurrentClients, requestsPerClient int, durati
 				// 短い間隔
 				time.Sleep(1 * time.Millisecond)
 			}
-		}(i)
+		})
 	}
 
 	wg.Wait()
 	elapsed := time.Since(start)
+	total, successful := totalRequests.Load(), successfulRequests.Load()
 
-	return map[string]interface{}{
-		"total_requests":      totalRequests,
-		"successful_requests": successfulRequests,
-		"failed_requests":     totalRequests - successfulRequests,
-		"success_rate":        float64(successfulRequests) / float64(totalRequests) * 100,
+	return map[string]any{
+		"total_requests":      total,
+		"successful_requests": successful,
+		"failed_requests":     total - successful,
+		"success_rate":        float64(successful) / float64(total) * 100,
 		"duration":            elapsed.String(),
-		"requests_per_second": float64(totalRequests) / elapsed.Seconds(),
+		"requests_per_second": float64(total) / elapsed.Seconds(),
 		"concurrent_clients":  concurrentClients,
 		"requests_per_client": requestsPerClient,
 	}
 }
 
 func startMetricsCollector() {
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-
-	for range ticker.C {
+	for range time.Tick(10 * time.Second) {
 		// データベース接続数更新
 		stats := dbManager.GetDatabaseStats()
 		for dbType, stat := range stats {

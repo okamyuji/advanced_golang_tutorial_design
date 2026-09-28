@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"sync"
 	"testing"
@@ -165,7 +166,7 @@ func TestMessageCreation(t *testing.T) {
 	message := &WebSocketMessage{
 		ID:        "test_msg_123",
 		Type:      MessageTypeChat,
-		Data:      map[string]interface{}{"text": "Hello"},
+		Data:      map[string]any{"text": "Hello"},
 		From:      "user1",
 		To:        "user2",
 		Channel:   "general",
@@ -255,7 +256,7 @@ func TestMessageTypes(t *testing.T) {
 	for _, msgType := range types {
 		message := &WebSocketMessage{
 			Type: msgType,
-			Data: map[string]interface{}{"test": "data"},
+			Data: map[string]any{"test": "data"},
 		}
 
 		if message.Type != msgType {
@@ -333,16 +334,13 @@ func TestConcurrentMapAccess(t *testing.T) {
 
 	const numGoroutines = 10
 	var wg sync.WaitGroup
-	wg.Add(numGoroutines)
 
 	// 複数のgoroutineで並行してマップにアクセス
-	for i := 0; i < numGoroutines; i++ {
-		go func(id int) {
-			defer wg.Done()
-
+	for i := range numGoroutines {
+		wg.Go(func() {
 			conn := &WebSocketConnection{
-				ID:       fmt.Sprintf("conn_%d", id),
-				UserID:   fmt.Sprintf("user_%d", id),
+				ID:       fmt.Sprintf("conn_%d", i),
+				UserID:   fmt.Sprintf("user_%d", i),
 				IsActive: true,
 				Channels: make(map[string]bool),
 			}
@@ -365,7 +363,7 @@ func TestConcurrentMapAccess(t *testing.T) {
 			handler.connectionsMu.Lock()
 			delete(handler.connections, conn.ID)
 			handler.connectionsMu.Unlock()
-		}(i)
+		})
 	}
 
 	wg.Wait()
@@ -447,14 +445,71 @@ func TestConfigValidation(t *testing.T) {
 	}
 }
 
+// TestConcurrentActivityAndShutdown 接続の送受信とShutdownを並行させてもpanicせず、
+// 停止後の送信がエラーになることを確認する回帰テスト。
+func TestConcurrentActivityAndShutdown(t *testing.T) {
+	for iter := range 50 {
+		config := NewHandlerConfig()
+		config.WorkerCount = 2
+		config.MessageBufferSize = 32
+		config.SendBufferSize = 8
+		config.ConnectionTimeout = time.Hour // ハートビート監視で閉じられないようにする
+
+		handler := NewWebSocketHandler(config)
+		if err := handler.Start(); err != nil {
+			t.Fatalf("iter %d: failed to start: %v", iter, err)
+		}
+
+		const numConns = 5
+		conns := make([]*WebSocketConnection, numConns)
+		for i := range numConns {
+			conn, err := handler.HandleConnection(fmt.Sprintf("user_%d", i), "127.0.0.1:0", "test")
+			if err != nil {
+				t.Fatalf("iter %d: failed to connect: %v", iter, err)
+			}
+			conns[i] = conn
+		}
+
+		var wg sync.WaitGroup
+		for _, conn := range conns {
+			wg.Go(func() {
+				msg := &WebSocketMessage{
+					Type: MessageTypeChat,
+					Data: map[string]any{"channel": "general", "text": "hi"},
+					From: conn.ID,
+				}
+				data, err := json.Marshal(msg)
+				if err != nil {
+					t.Errorf("iter %d: marshal failed: %v", iter, err)
+					return
+				}
+				select {
+				case conn.Connection.RecvBuffer <- data:
+				default:
+				}
+			})
+		}
+
+		if err := handler.Shutdown(2 * time.Second); err != nil {
+			t.Fatalf("iter %d: shutdown failed: %v", iter, err)
+		}
+		wg.Wait()
+
+		// 停止後の送信はエラーになる
+		if err := handler.SendMessage(&WebSocketMessage{Type: MessageTypeSystem}); err == nil {
+			t.Errorf("iter %d: expected error sending after shutdown", iter)
+		}
+	}
+}
+
 // ベンチマークテスト
 func BenchmarkMessageCreation(b *testing.B) {
 	var totalFields int
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		msg := &WebSocketMessage{
-			ID:        fmt.Sprintf("msg_%d", i),
+			ID:        fmt.Sprintf("msg_%d", totalFields),
 			Type:      MessageTypeChat,
-			Data:      map[string]interface{}{"text": "benchmark message"},
+			Data:      map[string]any{"text": "benchmark message"},
 			From:      "user1",
 			Timestamp: time.Now(),
 		}
@@ -476,7 +531,7 @@ func BenchmarkConnectionMapAccess(b *testing.B) {
 	handler := NewWebSocketHandler(config)
 
 	// テスト用接続を事前に作成
-	for i := 0; i < 1000; i++ {
+	for i := range 1000 {
 		conn := &WebSocketConnection{
 			ID:       fmt.Sprintf("conn_%d", i),
 			UserID:   fmt.Sprintf("user_%d", i),

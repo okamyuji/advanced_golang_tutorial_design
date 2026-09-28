@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-// MassiveConnectionServer 0万並行接続対応サーバー（Server-Sent Events使用）
+// MassiveConnectionServer 大量の同時接続を受けるServer-Sent Eventsサーバー（上限はServerConfig.MaxConnections）
 type MassiveConnectionServer struct {
 	clients       sync.Map // map[string]*SSEClient - goroutine safe
 	channels      sync.Map // map[string]*Channel - goroutine safe
@@ -22,6 +22,7 @@ type MassiveConnectionServer struct {
 	hub           *ConnectionHub
 	shutdown      chan struct{}
 	messageRouter *MessageRouter
+	mux           *http.ServeMux
 }
 
 // ServerConfig サーバー設定
@@ -44,21 +45,42 @@ type SSEClient struct {
 	writer    http.ResponseWriter
 	flusher   http.Flusher
 	send      chan []byte
-	channels  sync.Map // map[string]bool - goroutine safe
-	lastSeen  int64    // atomic access
-	bytesSent int64    // atomic access
+	channels  sync.Map     // map[string]bool - goroutine safe
+	lastSeen  atomic.Int64 // atomic access
+	bytesSent atomic.Int64 // atomic access
 	ctx       context.Context
 	cancel    context.CancelFunc
-	mu        sync.Mutex
+	// mu writeSSEでの書き込み直列化と、closedのRLock/Lock排他の両方に使う。
+	// closed sendが閉じられたかどうかを示し、trySendはRLock下で確認してから送る。
+	mu     sync.RWMutex
+	closed bool
+}
+
+// trySend closed状態でなければsendチャネルへ非ブロッキングで送ります。RLock保持中に
+// 送るため、close側のLockと排他になりclose済みチャネルへの送信を防ぐ。
+func (client *SSEClient) trySend(data []byte) error {
+	client.mu.RLock()
+	defer client.mu.RUnlock()
+
+	if client.closed {
+		return fmt.Errorf("client %s is closed", client.ID)
+	}
+
+	select {
+	case client.send <- data:
+		return nil
+	default:
+		return fmt.Errorf("send queue full")
+	}
 }
 
 // Channel チャンネル管理
 type Channel struct {
 	ID           string
-	clients      sync.Map // map[string]*SSEClient - goroutine safe
-	messageCount int64    // atomic access
+	clients      sync.Map     // map[string]*SSEClient - goroutine safe
+	messageCount atomic.Int64 // atomic access
 	created      time.Time
-	lastActivity int64 // atomic access - Unix timestamp
+	lastActivity atomic.Int64 // atomic access - Unix timestamp
 }
 
 // ConnectionHub 接続管理の中央ハブ
@@ -66,7 +88,7 @@ type ConnectionHub struct {
 	register      chan *SSEClient
 	unregister    chan *SSEClient
 	broadcast     chan *BroadcastMessage
-	activeClients int64 // atomic access
+	activeClients atomic.Int64 // atomic access
 }
 
 // BroadcastMessage ブロードキャスト用メッセージ
@@ -78,19 +100,19 @@ type BroadcastMessage struct {
 
 // ServerMetrics サーバーメトリクス
 type ServerMetrics struct {
-	totalConnections  int64 // atomic access
-	activeConnections int64 // atomic access
-	peakConnections   int64 // atomic access
-	totalMessages     int64 // atomic access
-	broadcastMessages int64 // atomic access
-	errorCount        int64 // atomic access
-	channelCount      int64 // atomic access
+	totalConnections  atomic.Int64 // atomic access
+	activeConnections atomic.Int64 // atomic access
+	peakConnections   atomic.Int64 // atomic access
+	totalMessages     atomic.Int64 // atomic access
+	broadcastMessages atomic.Int64 // atomic access
+	errorCount        atomic.Int64 // atomic access
+	channelCount      atomic.Int64 // atomic access
 	startTime         time.Time
 }
 
 // MessageRouter メッセージルーティング
 type MessageRouter struct {
-	routes map[string]func(*SSEClient, map[string]interface{})
+	routes map[string]func(*SSEClient, map[string]any)
 	mu     sync.RWMutex
 }
 
@@ -110,7 +132,7 @@ func NewMassiveConnectionServer(config *ServerConfig) *MassiveConnectionServer {
 			startTime: time.Now(),
 		},
 		messageRouter: &MessageRouter{
-			routes: make(map[string]func(*SSEClient, map[string]interface{})),
+			routes: make(map[string]func(*SSEClient, map[string]any)),
 		},
 	}
 
@@ -147,17 +169,20 @@ func (mcs *MassiveConnectionServer) Start(addr string) error {
 	// クリーンアップワーカー開始
 	go mcs.startCleanupWorker()
 
-	// HTTPハンドラー設定
-	http.HandleFunc("/events", mcs.handleSSEConnection)
-	http.HandleFunc("/send", mcs.handleSendMessage)
-	http.HandleFunc("/metrics", mcs.handleMetrics)
-	http.HandleFunc("/health", mcs.handleHealth)
-	http.HandleFunc("/connections", mcs.handleConnections)
-	http.HandleFunc("/", mcs.handleIndex)
+	// HTTPハンドラー設定（DefaultServeMuxではなくローカルなmuxに登録する）
+	mux := http.NewServeMux()
+	mux.HandleFunc("/events", mcs.handleSSEConnection)
+	mux.HandleFunc("/send", mcs.handleSendMessage)
+	mux.HandleFunc("/metrics", mcs.handleMetrics)
+	mux.HandleFunc("/health", mcs.handleHealth)
+	mux.HandleFunc("/connections", mcs.handleConnections)
+	mux.HandleFunc("/", mcs.handleIndex)
+	mcs.mux = mux
 
 	// HTTPサーバー設定
 	server := &http.Server{
 		Addr:         addr,
+		Handler:      mux,
 		ReadTimeout:  mcs.config.ReadTimeout,
 		WriteTimeout: mcs.config.WriteTimeout,
 		IdleTimeout:  mcs.config.KeepAliveTimeout,
@@ -177,10 +202,10 @@ func (mcs *MassiveConnectionServer) Start(addr string) error {
 // handleSSEConnection Server-Sent Events接続をハンドル
 func (mcs *MassiveConnectionServer) handleSSEConnection(w http.ResponseWriter, r *http.Request) {
 	// 接続数制限チェック
-	currentConnections := atomic.LoadInt64(&mcs.metrics.activeConnections)
+	currentConnections := mcs.metrics.activeConnections.Load()
 	if currentConnections >= int64(mcs.config.MaxConnections) {
 		http.Error(w, "Connection limit exceeded", http.StatusServiceUnavailable)
-		atomic.AddInt64(&mcs.metrics.errorCount, 1)
+		mcs.metrics.errorCount.Add(1)
 		return
 	}
 
@@ -201,7 +226,7 @@ func (mcs *MassiveConnectionServer) handleSSEConnection(w http.ResponseWriter, r
 	// クライアント作成
 	clientID := fmt.Sprintf("client_%d_%d",
 		time.Now().UnixNano(),
-		atomic.AddInt64(&mcs.metrics.totalConnections, 1))
+		mcs.metrics.totalConnections.Add(1))
 
 	client := mcs.createSSEClient(clientID, w, flusher, r.Context())
 
@@ -209,7 +234,7 @@ func (mcs *MassiveConnectionServer) handleSSEConnection(w http.ResponseWriter, r
 	mcs.hub.register <- client
 
 	// 接続確認メッセージ送信
-	welcomeMsg := map[string]interface{}{
+	welcomeMsg := map[string]any{
 		"type":      "connection",
 		"client_id": clientID,
 		"timestamp": time.Now().Unix(),
@@ -222,8 +247,11 @@ func (mcs *MassiveConnectionServer) handleSSEConnection(w http.ResponseWriter, r
 	// ハートビート開始
 	go client.heartbeat(mcs.config.HeartbeatInterval)
 
-	// 接続維持（クライアント切断まで待機）
-	<-client.ctx.Done()
+	// 接続維持（クライアント切断かサーバー停止まで待機）
+	select {
+	case <-client.ctx.Done():
+	case <-mcs.shutdown:
+	}
 	mcs.hub.unregister <- client
 }
 
@@ -240,7 +268,7 @@ func (mcs *MassiveConnectionServer) createSSEClient(id string, w http.ResponseWr
 		cancel:  cancel,
 	}
 
-	atomic.StoreInt64(&client.lastSeen, time.Now().Unix())
+	client.lastSeen.Store(time.Now().Unix())
 
 	// 送信ループ開始
 	go client.sendLoop()
@@ -252,13 +280,16 @@ func (mcs *MassiveConnectionServer) createSSEClient(id string, w http.ResponseWr
 func (client *SSEClient) sendLoop() {
 	for {
 		select {
-		case message := <-client.send:
+		case message, ok := <-client.send:
+			if !ok {
+				return
+			}
 			if err := client.writeSSE(message); err != nil {
 				log.Printf("Failed to send message to client %s: %v", client.ID, err)
 				client.cancel()
 				return
 			}
-			atomic.AddInt64(&client.bytesSent, int64(len(message)))
+			client.bytesSent.Add(int64(len(message)))
 
 		case <-client.ctx.Done():
 			return
@@ -278,34 +309,28 @@ func (client *SSEClient) writeSSE(data []byte) error {
 	}
 
 	client.flusher.Flush()
-	atomic.StoreInt64(&client.lastSeen, time.Now().Unix())
+	client.lastSeen.Store(time.Now().Unix())
 	return nil
 }
 
 // sendJSON JSONメッセージを送信
-func (client *SSEClient) sendJSON(data interface{}) error {
+func (client *SSEClient) sendJSON(data any) error {
 	jsonData, err := json.Marshal(data)
 	if err != nil {
 		return err
 	}
 
-	select {
-	case client.send <- jsonData:
-		return nil
-	default:
-		return fmt.Errorf("send queue full")
-	}
+	return client.trySend(jsonData)
 }
 
 // heartbeat ハートビートを送信
 func (client *SSEClient) heartbeat(interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	tick := time.Tick(interval)
 
 	for {
 		select {
-		case <-ticker.C:
-			heartbeat := map[string]interface{}{
+		case <-tick:
+			heartbeat := map[string]any{
 				"type":      "heartbeat",
 				"timestamp": time.Now().Unix(),
 			}
@@ -322,8 +347,7 @@ func (client *SSEClient) heartbeat(interval time.Duration) {
 
 // run 接続ハブのメインループ
 func (ch *ConnectionHub) run(server *MassiveConnectionServer) {
-	resourceTicker := time.NewTicker(server.config.ResourceCheckInterval)
-	defer resourceTicker.Stop()
+	resourceTick := time.Tick(server.config.ResourceCheckInterval)
 
 	for {
 		select {
@@ -336,7 +360,7 @@ func (ch *ConnectionHub) run(server *MassiveConnectionServer) {
 		case broadcast := <-ch.broadcast:
 			go ch.handleBroadcast(broadcast, server)
 
-		case <-resourceTicker.C:
+		case <-resourceTick:
 			go server.checkResourceLimits()
 
 		case <-server.shutdown:
@@ -349,12 +373,12 @@ func (ch *ConnectionHub) run(server *MassiveConnectionServer) {
 func (ch *ConnectionHub) registerClient(client *SSEClient, server *MassiveConnectionServer) {
 	server.clients.Store(client.ID, client)
 
-	activeCount := atomic.AddInt64(&ch.activeClients, 1)
-	atomic.StoreInt64(&server.metrics.activeConnections, activeCount)
+	activeCount := ch.activeClients.Add(1)
+	server.metrics.activeConnections.Store(activeCount)
 
 	// ピーク接続数更新
-	if activeCount > atomic.LoadInt64(&server.metrics.peakConnections) {
-		atomic.StoreInt64(&server.metrics.peakConnections, activeCount)
+	if activeCount > server.metrics.peakConnections.Load() {
+		server.metrics.peakConnections.Store(activeCount)
 	}
 
 	if activeCount%1000 == 0 {
@@ -365,11 +389,17 @@ func (ch *ConnectionHub) registerClient(client *SSEClient, server *MassiveConnec
 // unregisterClient クライアントを登録解除
 func (ch *ConnectionHub) unregisterClient(client *SSEClient, server *MassiveConnectionServer) {
 	if _, loaded := server.clients.LoadAndDelete(client.ID); loaded {
+		// closedをLock下で立ててからcloseする。trySendはRLock保持中に送信を
+		// 完了させるため、以降に呼ばれるtrySendだけが弾かれる。
+		client.mu.Lock()
+		client.closed = true
+		client.mu.Unlock()
+
 		close(client.send)
 		client.cancel()
 
 		// チャンネルからクライアントを削除
-		client.channels.Range(func(channelID, _ interface{}) bool {
+		client.channels.Range(func(channelID, _ any) bool {
 			if chVal, ok := server.channels.Load(channelID); ok {
 				channel := chVal.(*Channel)
 				channel.clients.Delete(client.ID)
@@ -377,14 +407,14 @@ func (ch *ConnectionHub) unregisterClient(client *SSEClient, server *MassiveConn
 			return true
 		})
 
-		activeCount := atomic.AddInt64(&ch.activeClients, -1)
-		atomic.StoreInt64(&server.metrics.activeConnections, activeCount)
+		activeCount := ch.activeClients.Add(-1)
+		server.metrics.activeConnections.Store(activeCount)
 	}
 }
 
 // handleBroadcast ブロードキャストを処理
 func (ch *ConnectionHub) handleBroadcast(broadcast *BroadcastMessage, server *MassiveConnectionServer) {
-	atomic.AddInt64(&server.metrics.broadcastMessages, 1)
+	server.metrics.broadcastMessages.Add(1)
 
 	// 並行ブロードキャスト用のワーカープール
 	semaphore := make(chan struct{}, server.config.BroadcastWorkers)
@@ -394,48 +424,38 @@ func (ch *ConnectionHub) handleBroadcast(broadcast *BroadcastMessage, server *Ma
 		// チャンネル内ブロードキャスト
 		if chVal, ok := server.channels.Load(broadcast.ChannelID); ok {
 			channel := chVal.(*Channel)
-			channel.clients.Range(func(clientID, clientVal interface{}) bool {
+			channel.clients.Range(func(clientID, clientVal any) bool {
 				if clientID.(string) == broadcast.ExcludeClient {
 					return true
 				}
 
 				if client, ok := clientVal.(*SSEClient); ok {
-					wg.Add(1)
-					go func(c *SSEClient) {
-						defer wg.Done()
+					wg.Go(func() {
 						semaphore <- struct{}{}
 						defer func() { <-semaphore }()
 
-						select {
-						case c.send <- broadcast.Message:
-						default:
-							// 送信キューが満杯の場合は無視
-						}
-					}(client)
+						// closed済み・キュー満杯はどちらも無視してよい
+						_ = client.trySend(broadcast.Message)
+					})
 				}
 				return true
 			})
 		}
 	} else {
 		// 全体ブロードキャスト
-		server.clients.Range(func(clientID, clientVal interface{}) bool {
+		server.clients.Range(func(clientID, clientVal any) bool {
 			if clientID.(string) == broadcast.ExcludeClient {
 				return true
 			}
 
 			if client, ok := clientVal.(*SSEClient); ok {
-				wg.Add(1)
-				go func(c *SSEClient) {
-					defer wg.Done()
+				wg.Go(func() {
 					semaphore <- struct{}{}
 					defer func() { <-semaphore }()
 
-					select {
-					case c.send <- broadcast.Message:
-					default:
-						// 送信キューが満杯の場合は無視
-					}
-				}(client)
+					// closed済み・キュー満杯はどちらも無視してよい
+					_ = client.trySend(broadcast.Message)
+				})
 			}
 			return true
 		})
@@ -457,13 +477,13 @@ func (mcs *MassiveConnectionServer) handleSendMessage(w http.ResponseWriter, r *
 		return
 	}
 
-	var message map[string]interface{}
+	var message map[string]any
 	if err := json.Unmarshal(body, &message); err != nil {
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
 	}
 
-	atomic.AddInt64(&mcs.metrics.totalMessages, 1)
+	mcs.metrics.totalMessages.Add(1)
 
 	// メッセージ処理
 	messageType, ok := message["type"].(string)
@@ -490,7 +510,7 @@ func (mcs *MassiveConnectionServer) handleSendMessage(w http.ResponseWriter, r *
 }
 
 // handleJoinChannel チャンネル参加を処理
-func (mcs *MassiveConnectionServer) handleJoinChannel(client *SSEClient, message map[string]interface{}) {
+func (mcs *MassiveConnectionServer) handleJoinChannel(client *SSEClient, message map[string]any) {
 	channelID, ok := message["channel"].(string)
 	if !ok || channelID == "" {
 		return
@@ -506,21 +526,21 @@ func (mcs *MassiveConnectionServer) handleJoinChannel(client *SSEClient, message
 	// クライアントをチャンネルに追加
 	channel.clients.Store(client.ID, client)
 	client.channels.Store(channelID, true)
-	atomic.StoreInt64(&channel.lastActivity, time.Now().Unix())
+	channel.lastActivity.Store(time.Now().Unix())
 
 	// チャンネル数更新
 	channelCount := int64(0)
-	mcs.channels.Range(func(_, _ interface{}) bool {
+	mcs.channels.Range(func(_, _ any) bool {
 		channelCount++
 		return true
 	})
-	atomic.StoreInt64(&mcs.metrics.channelCount, channelCount)
+	mcs.metrics.channelCount.Store(channelCount)
 
 	log.Printf("Client %s joined channel %s", client.ID, channelID)
 }
 
 // handleLeaveChannel チャンネル退出を処理
-func (mcs *MassiveConnectionServer) handleLeaveChannel(client *SSEClient, message map[string]interface{}) {
+func (mcs *MassiveConnectionServer) handleLeaveChannel(client *SSEClient, message map[string]any) {
 	channelID, ok := message["channel"].(string)
 	if !ok || channelID == "" {
 		return
@@ -530,18 +550,18 @@ func (mcs *MassiveConnectionServer) handleLeaveChannel(client *SSEClient, messag
 		channel := channelVal.(*Channel)
 		channel.clients.Delete(client.ID)
 		client.channels.Delete(channelID)
-		atomic.StoreInt64(&channel.lastActivity, time.Now().Unix())
+		channel.lastActivity.Store(time.Now().Unix())
 	}
 
 	log.Printf("Client %s left channel %s", client.ID, channelID)
 }
 
 // handleBroadcast ブロードキャストメッセージを処理
-func (mcs *MassiveConnectionServer) handleBroadcast(client *SSEClient, message map[string]interface{}) {
+func (mcs *MassiveConnectionServer) handleBroadcast(client *SSEClient, message map[string]any) {
 	channelID, _ := message["channel"].(string)
 	content, _ := message["content"].(string)
 
-	broadcastMsg := map[string]interface{}{
+	broadcastMsg := map[string]any{
 		"type":      "message",
 		"channel":   channelID,
 		"from":      client.ID,
@@ -568,7 +588,7 @@ func (mcs *MassiveConnectionServer) handleBroadcast(client *SSEClient, message m
 }
 
 // handleDirectMessage ダイレクトメッセージを処理
-func (mcs *MassiveConnectionServer) handleDirectMessage(client *SSEClient, message map[string]interface{}) {
+func (mcs *MassiveConnectionServer) handleDirectMessage(client *SSEClient, message map[string]any) {
 	targetID, ok := message["target"].(string)
 	if !ok {
 		return
@@ -579,7 +599,7 @@ func (mcs *MassiveConnectionServer) handleDirectMessage(client *SSEClient, messa
 	if targetVal, ok := mcs.clients.Load(targetID); ok {
 		target := targetVal.(*SSEClient)
 
-		directMsg := map[string]interface{}{
+		directMsg := map[string]any{
 			"type":      "direct_message",
 			"from":      client.ID,
 			"content":   content,
@@ -593,8 +613,8 @@ func (mcs *MassiveConnectionServer) handleDirectMessage(client *SSEClient, messa
 }
 
 // handlePing Pingメッセージを処理
-func (mcs *MassiveConnectionServer) handlePing(client *SSEClient, message map[string]interface{}) {
-	pongMsg := map[string]interface{}{
+func (mcs *MassiveConnectionServer) handlePing(client *SSEClient, message map[string]any) {
+	pongMsg := map[string]any{
 		"type":      "pong",
 		"timestamp": time.Now().Unix(),
 	}
@@ -606,12 +626,11 @@ func (mcs *MassiveConnectionServer) handlePing(client *SSEClient, message map[st
 
 // startResourceMonitoring リソース監視を開始
 func (mcs *MassiveConnectionServer) startResourceMonitoring() {
-	ticker := time.NewTicker(mcs.config.ResourceCheckInterval)
-	defer ticker.Stop()
+	tick := time.Tick(mcs.config.ResourceCheckInterval)
 
 	for {
 		select {
-		case <-ticker.C:
+		case <-tick:
 			mcs.monitorResources()
 		case <-mcs.shutdown:
 			return
@@ -626,7 +645,7 @@ func (mcs *MassiveConnectionServer) monitorResources() {
 
 	currentMemoryMB := float64(m.Alloc) / 1024 / 1024
 	goroutines := runtime.NumGoroutine()
-	activeConnections := atomic.LoadInt64(&mcs.metrics.activeConnections)
+	activeConnections := mcs.metrics.activeConnections.Load()
 
 	// メモリ使用量チェック
 	if currentMemoryMB > mcs.config.MemoryLimitMB {
@@ -663,12 +682,11 @@ func (mcs *MassiveConnectionServer) checkResourceLimits() {
 
 // startMetricsCollection メトリクス収集を開始
 func (mcs *MassiveConnectionServer) startMetricsCollection() {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
+	tick := time.Tick(30 * time.Second)
 
 	for {
 		select {
-		case <-ticker.C:
+		case <-tick:
 			mcs.logMetrics()
 		case <-mcs.shutdown:
 			return
@@ -678,9 +696,9 @@ func (mcs *MassiveConnectionServer) startMetricsCollection() {
 
 // logMetrics メトリクスをログ出力
 func (mcs *MassiveConnectionServer) logMetrics() {
-	activeConnections := atomic.LoadInt64(&mcs.metrics.activeConnections)
-	totalMessages := atomic.LoadInt64(&mcs.metrics.totalMessages)
-	broadcastMessages := atomic.LoadInt64(&mcs.metrics.broadcastMessages)
+	activeConnections := mcs.metrics.activeConnections.Load()
+	totalMessages := mcs.metrics.totalMessages.Load()
+	broadcastMessages := mcs.metrics.broadcastMessages.Load()
 
 	if activeConnections > 0 {
 		uptime := time.Since(mcs.metrics.startTime)
@@ -688,7 +706,7 @@ func (mcs *MassiveConnectionServer) logMetrics() {
 
 		log.Printf("Metrics - Active: %d, Peak: %d, Messages: %d (%.1f/sec), Broadcasts: %d",
 			activeConnections,
-			atomic.LoadInt64(&mcs.metrics.peakConnections),
+			mcs.metrics.peakConnections.Load(),
 			totalMessages,
 			messagesPerSecond,
 			broadcastMessages)
@@ -697,12 +715,11 @@ func (mcs *MassiveConnectionServer) logMetrics() {
 
 // startCleanupWorker クリーンアップワーカーを開始
 func (mcs *MassiveConnectionServer) startCleanupWorker() {
-	ticker := time.NewTicker(mcs.config.CleanupInterval)
-	defer ticker.Stop()
+	tick := time.Tick(mcs.config.CleanupInterval)
 
 	for {
 		select {
-		case <-ticker.C:
+		case <-tick:
 			mcs.performCleanup()
 		case <-mcs.shutdown:
 			return
@@ -717,9 +734,9 @@ func (mcs *MassiveConnectionServer) performCleanup() {
 
 	// 古い接続をクリーンアップ
 	var staleClients []*SSEClient
-	mcs.clients.Range(func(clientID, clientVal interface{}) bool {
+	mcs.clients.Range(func(clientID, clientVal any) bool {
 		client := clientVal.(*SSEClient)
-		if atomic.LoadInt64(&client.lastSeen) < cutoff {
+		if client.lastSeen.Load() < cutoff {
 			staleClients = append(staleClients, client)
 		}
 		return true
@@ -744,14 +761,14 @@ func (mcs *MassiveConnectionServer) handleMetrics(w http.ResponseWriter, r *http
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
 
-	metrics := map[string]interface{}{
-		"total_connections":  atomic.LoadInt64(&mcs.metrics.totalConnections),
-		"active_connections": atomic.LoadInt64(&mcs.metrics.activeConnections),
-		"peak_connections":   atomic.LoadInt64(&mcs.metrics.peakConnections),
-		"total_messages":     atomic.LoadInt64(&mcs.metrics.totalMessages),
-		"broadcast_messages": atomic.LoadInt64(&mcs.metrics.broadcastMessages),
-		"error_count":        atomic.LoadInt64(&mcs.metrics.errorCount),
-		"channel_count":      atomic.LoadInt64(&mcs.metrics.channelCount),
+	metrics := map[string]any{
+		"total_connections":  mcs.metrics.totalConnections.Load(),
+		"active_connections": mcs.metrics.activeConnections.Load(),
+		"peak_connections":   mcs.metrics.peakConnections.Load(),
+		"total_messages":     mcs.metrics.totalMessages.Load(),
+		"broadcast_messages": mcs.metrics.broadcastMessages.Load(),
+		"error_count":        mcs.metrics.errorCount.Load(),
+		"channel_count":      mcs.metrics.channelCount.Load(),
 		"uptime_seconds":     time.Since(mcs.metrics.startTime).Seconds(),
 		"memory_mb":          float64(m.Alloc) / 1024 / 1024,
 		"memory_sys_mb":      float64(m.Sys) / 1024 / 1024,
@@ -780,10 +797,10 @@ func (mcs *MassiveConnectionServer) handleHealth(w http.ResponseWriter, r *http.
 		status = "critical"
 	}
 
-	health := map[string]interface{}{
+	health := map[string]any{
 		"status":             status,
 		"timestamp":          time.Now().Unix(),
-		"active_connections": atomic.LoadInt64(&mcs.metrics.activeConnections),
+		"active_connections": mcs.metrics.activeConnections.Load(),
 		"memory_mb":          memoryMB,
 		"memory_limit_mb":    mcs.config.MemoryLimitMB,
 		"goroutines":         runtime.NumGoroutine(),
@@ -805,29 +822,29 @@ func (mcs *MassiveConnectionServer) handleConnections(w http.ResponseWriter, r *
 	w.Header().Set("Content-Type", "application/json")
 
 	// チャンネル別統計
-	channelStats := make(map[string]interface{})
-	mcs.channels.Range(func(channelID, channelVal interface{}) bool {
+	channelStats := make(map[string]any)
+	mcs.channels.Range(func(channelID, channelVal any) bool {
 		channel := channelVal.(*Channel)
 		clientCount := 0
-		channel.clients.Range(func(_, _ interface{}) bool {
+		channel.clients.Range(func(_, _ any) bool {
 			clientCount++
 			return true
 		})
 
-		channelStats[channelID.(string)] = map[string]interface{}{
+		channelStats[channelID.(string)] = map[string]any{
 			"client_count":  clientCount,
-			"message_count": atomic.LoadInt64(&channel.messageCount),
+			"message_count": channel.messageCount.Load(),
 			"created":       channel.created.Unix(),
-			"last_activity": atomic.LoadInt64(&channel.lastActivity),
+			"last_activity": channel.lastActivity.Load(),
 		}
 		return true
 	})
 
-	stats := map[string]interface{}{
-		"active_connections": atomic.LoadInt64(&mcs.metrics.activeConnections),
-		"peak_connections":   atomic.LoadInt64(&mcs.metrics.peakConnections),
-		"total_connections":  atomic.LoadInt64(&mcs.metrics.totalConnections),
-		"channel_count":      atomic.LoadInt64(&mcs.metrics.channelCount),
+	stats := map[string]any{
+		"active_connections": mcs.metrics.activeConnections.Load(),
+		"peak_connections":   mcs.metrics.peakConnections.Load(),
+		"total_connections":  mcs.metrics.totalConnections.Load(),
+		"channel_count":      mcs.metrics.channelCount.Load(),
 		"channels":           channelStats,
 		"uptime_seconds":     time.Since(mcs.metrics.startTime).Seconds(),
 	}

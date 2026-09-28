@@ -14,7 +14,7 @@ import (
 
 // setupTestDB テスト用のPostgreSQLコンテナを起動し、初期化されたデータベースを返す
 func setupTestDB(t *testing.T) (*sql.DB, func()) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// PostgreSQLコンテナを起動
 	pgContainer, err := postgres.Run(ctx,
@@ -105,7 +105,7 @@ func createTestTables(db *sql.DB) error {
 	for _, query := range queries {
 		_, err := db.Exec(query)
 		if err != nil {
-			return fmt.Errorf("failed to create table: %v", err)
+			return fmt.Errorf("failed to create table: %w", err)
 		}
 	}
 
@@ -119,7 +119,7 @@ func createTestTables(db *sql.DB) error {
 		('Sports')
 	`)
 	if err != nil {
-		return fmt.Errorf("failed to insert test categories: %v", err)
+		return fmt.Errorf("failed to insert test categories: %w", err)
 	}
 
 	return nil
@@ -160,12 +160,12 @@ func TestBatchProcessor_BasicProcessing(t *testing.T) {
 	}
 
 	bp := NewBatchProcessor(db, config)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// テストレコード作成
 	const numRecords = 25
 	records := make([]Record, numRecords)
-	for i := 0; i < numRecords; i++ {
+	for i := range numRecords {
 		records[i] = &TestRecord{
 			ID:    int64(i + 1),
 			Name:  fmt.Sprintf("Test Item %d", i+1),
@@ -181,7 +181,7 @@ func TestBatchProcessor_BasicProcessing(t *testing.T) {
 				"INSERT INTO batch_test_items (name, value) VALUES ($1, $2)",
 				testRecord.Name, testRecord.Value)
 			if err != nil {
-				return fmt.Errorf("failed to insert record %d: %v", testRecord.ID, err)
+				return fmt.Errorf("failed to insert record %d: %w", testRecord.ID, err)
 			}
 		}
 		return nil
@@ -237,11 +237,11 @@ func TestBatchProcessor_WithFailures(t *testing.T) {
 	}
 
 	bp := NewBatchProcessor(db, config)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// テストレコード作成（いくつかは無効なデータ）
 	records := make([]Record, 10)
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		if i%3 == 0 {
 			// 無効なレコード（空の名前）
 			records[i] = &TestRecord{
@@ -266,7 +266,7 @@ func TestBatchProcessor_WithFailures(t *testing.T) {
 				"INSERT INTO batch_test_items (name, value) VALUES ($1, $2)",
 				testRecord.Name, testRecord.Value)
 			if err != nil {
-				return fmt.Errorf("failed to insert record %d: %v", testRecord.ID, err)
+				return fmt.Errorf("failed to insert record %d: %w", testRecord.ID, err)
 			}
 		}
 		return nil
@@ -311,12 +311,12 @@ func TestBatchProcessor_Concurrency(t *testing.T) {
 	}
 
 	bp := NewBatchProcessor(db, config)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// 大量のテストレコード作成
 	const numRecords = 100
 	records := make([]Record, numRecords)
-	for i := 0; i < numRecords; i++ {
+	for i := range numRecords {
 		records[i] = &TestRecord{
 			ID:    int64(i + 1),
 			Name:  fmt.Sprintf("Concurrent Item %d", i+1),
@@ -338,7 +338,7 @@ func TestBatchProcessor_Concurrency(t *testing.T) {
 				"INSERT INTO batch_test_items (name, value) VALUES ($1, $2)",
 				testRecord.Name, testRecord.Value)
 			if err != nil {
-				return fmt.Errorf("failed to insert record %d: %v", testRecord.ID, err)
+				return fmt.Errorf("failed to insert record %d: %w", testRecord.ID, err)
 			}
 		}
 		return nil
@@ -393,11 +393,11 @@ func TestBatchProcessor_Timeout(t *testing.T) {
 	}
 
 	bp := NewBatchProcessor(db, config)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// テストレコード作成
 	records := make([]Record, 5)
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		records[i] = &TestRecord{
 			ID:    int64(i + 1),
 			Name:  fmt.Sprintf("Timeout Test Item %d", i+1),
@@ -405,11 +405,10 @@ func TestBatchProcessor_Timeout(t *testing.T) {
 		}
 	}
 
-	// バッチ処理実行（意図的に長時間実行）
+	// バッチ処理実行（タイムアウトするまで戻らない）
 	processFn := func(ctx context.Context, tx *sql.Tx, records []Record) error {
-		// タイムアウトを発生させるために長時間待機
-		time.Sleep(200 * time.Millisecond)
-		return nil
+		<-ctx.Done()
+		return ctx.Err()
 	}
 
 	start := time.Now()
@@ -433,7 +432,7 @@ func TestBulkInsertProcessor_Products(t *testing.T) {
 	defer cleanup()
 
 	bip := NewBulkInsertProcessor(db)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// テスト用商品データ
 	products := []*ProductRecord{
@@ -503,14 +502,14 @@ func TestBulkInsertProcessor_LargeDataset(t *testing.T) {
 	defer cleanup()
 
 	bip := NewBulkInsertProcessor(db)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// 大量のテスト用商品データ
 	const numProducts = 1000
 	products := make([]*ProductRecord, numProducts)
 	categories := []int64{1, 2, 3, 4, 5}
 
-	for i := 0; i < numProducts; i++ {
+	for i := range numProducts {
 		products[i] = &ProductRecord{
 			Name:       fmt.Sprintf("Large Dataset Product %d", i+1),
 			Price:      float64((i%100 + 1) * 100),
@@ -551,7 +550,7 @@ func TestBulkInsertProcessor_ValidationError(t *testing.T) {
 	defer cleanup()
 
 	bip := NewBulkInsertProcessor(db)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// 無効なデータを含む商品データ
 	products := []*ProductRecord{
@@ -562,7 +561,7 @@ func TestBulkInsertProcessor_ValidationError(t *testing.T) {
 
 	err := bip.BulkInsertProducts(ctx, products)
 	if err == nil {
-		t.Error("Bulk insert should fail due to validation error")
+		t.Fatal("Bulk insert should fail due to validation error")
 	}
 
 	// エラーが正しく検出されることを確認
@@ -598,12 +597,12 @@ func TestBatchProcessor_Progress_Monitoring(t *testing.T) {
 	}
 
 	bp := NewBatchProcessor(db, config)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// テストレコード作成
 	const numRecords = 50
 	records := make([]Record, numRecords)
-	for i := 0; i < numRecords; i++ {
+	for i := range numRecords {
 		records[i] = &TestRecord{
 			ID:    int64(i + 1),
 			Name:  fmt.Sprintf("Progress Test Item %d", i+1),
@@ -615,16 +614,16 @@ func TestBatchProcessor_Progress_Monitoring(t *testing.T) {
 	progressUpdates := make(chan BatchProgressSnapshot, 10)
 	progressCtx, progressCancel := context.WithCancel(ctx)
 
-	// 進捗監視のgoroutine
+	// 進捗監視のgoroutine。送信側がチャネルを閉じるので、受信側は range で安全に読み切れる
 	go func() {
-		ticker := time.NewTicker(300 * time.Millisecond)
-		defer ticker.Stop()
+		defer close(progressUpdates)
+		tick := time.Tick(300 * time.Millisecond)
 
 		for {
 			select {
 			case <-progressCtx.Done():
 				return
-			case <-ticker.C:
+			case <-tick:
 				progress := bp.GetProgress()
 				if progress.ProcessedRecords > 0 {
 					select {
@@ -648,7 +647,7 @@ func TestBatchProcessor_Progress_Monitoring(t *testing.T) {
 				"INSERT INTO batch_test_items (name, value) VALUES ($1, $2)",
 				testRecord.Name, testRecord.Value)
 			if err != nil {
-				return fmt.Errorf("failed to insert record %d: %v", testRecord.ID, err)
+				return fmt.Errorf("failed to insert record %d: %w", testRecord.ID, err)
 			}
 		}
 		return nil
@@ -661,10 +660,8 @@ func TestBatchProcessor_Progress_Monitoring(t *testing.T) {
 
 	// 進捗監視停止
 	progressCancel()
-	time.Sleep(100 * time.Millisecond) // goroutineの停止を待つ
 
 	// 進捗更新を確認
-	close(progressUpdates)
 	updateCount := 0
 
 	for progress := range progressUpdates {

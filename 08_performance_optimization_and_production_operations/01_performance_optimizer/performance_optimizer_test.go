@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 )
@@ -17,12 +18,8 @@ func TestNewPerformanceOptimizer(t *testing.T) {
 		t.Errorf("Expected workerCount 4, got %d", optimizer.workerCount)
 	}
 
-	if optimizer.oldStyleMap == nil {
-		t.Error("oldStyleMap not initialized")
-	}
-
-	if optimizer.newStyleMap == nil {
-		t.Error("newStyleMap not initialized")
+	if optimizer.dataMap == nil {
+		t.Error("dataMap not initialized")
 	}
 
 	if optimizer.concurrentTasks == nil {
@@ -32,7 +29,7 @@ func TestNewPerformanceOptimizer(t *testing.T) {
 
 func TestPerformanceOptimizerStartStop(t *testing.T) {
 	optimizer := NewPerformanceOptimizer(2)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// システム開始
 	err := optimizer.Start(ctx)
@@ -40,12 +37,9 @@ func TestPerformanceOptimizerStartStop(t *testing.T) {
 		t.Fatalf("Start failed: %v", err)
 	}
 
-	if !optimizer.running {
+	if !optimizer.isRunning() {
 		t.Error("Expected running to be true after Start")
 	}
-
-	// 少し待機してワーカーが起動するのを確認
-	time.Sleep(100 * time.Millisecond)
 
 	// システム停止
 	err = optimizer.Stop()
@@ -53,7 +47,7 @@ func TestPerformanceOptimizerStartStop(t *testing.T) {
 		t.Fatalf("Stop failed: %v", err)
 	}
 
-	if optimizer.running {
+	if optimizer.isRunning() {
 		t.Error("Expected running to be false after Stop")
 	}
 }
@@ -124,7 +118,7 @@ func TestBenchmarkMemoryAllocation(t *testing.T) {
 
 func TestBenchmarkConcurrentProcessing(t *testing.T) {
 	optimizer := NewPerformanceOptimizer(2)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// システム開始
 	err := optimizer.Start(ctx)
@@ -175,15 +169,14 @@ func TestBenchmarkConcurrentProcessingNotRunning(t *testing.T) {
 		t.Error("Expected error when system not running")
 	}
 
-	expectedMsg := "performance optimizer not running"
-	if err.Error() != expectedMsg {
-		t.Errorf("Expected error message '%s', got '%s'", expectedMsg, err.Error())
+	if !errors.Is(err, errNotRunning) {
+		t.Errorf("Expected errNotRunning, got %v", err)
 	}
 }
 
 func TestGetOptimizationReport(t *testing.T) {
 	optimizer := NewPerformanceOptimizer(4)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// システム開始
 	err := optimizer.Start(ctx)
@@ -236,7 +229,7 @@ func TestObjectPoolEfficiency(t *testing.T) {
 
 	// オブジェクトプールの効率性をテスト
 	iterations := 1000
-	for i := 0; i < iterations; i++ {
+	for range iterations {
 		objInterface := optimizer.objectPool.Get()
 		obj := objInterface.([]byte)
 		if len(obj) != 64 {
@@ -262,8 +255,7 @@ func TestObjectPoolEfficiency(t *testing.T) {
 func BenchmarkMapOperations(b *testing.B) {
 	optimizer := NewPerformanceOptimizer(2)
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		result, err := optimizer.BenchmarkMapOperations(100)
 		if err != nil {
 			b.Fatalf("BenchmarkMapOperations failed: %v", err)
@@ -277,8 +269,7 @@ func BenchmarkMapOperations(b *testing.B) {
 func BenchmarkMemoryAllocation(b *testing.B) {
 	optimizer := NewPerformanceOptimizer(2)
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		result, err := optimizer.BenchmarkMemoryAllocation(1000)
 		if err != nil {
 			b.Fatalf("BenchmarkMemoryAllocation failed: %v", err)
@@ -291,9 +282,8 @@ func BenchmarkMemoryAllocation(b *testing.B) {
 
 func BenchmarkConcurrentProcessing(b *testing.B) {
 	optimizer := NewPerformanceOptimizer(4)
-	ctx := context.Background()
 
-	err := optimizer.Start(ctx)
+	err := optimizer.Start(b.Context())
 	if err != nil {
 		b.Fatalf("Start failed: %v", err)
 	}
@@ -303,14 +293,96 @@ func BenchmarkConcurrentProcessing(b *testing.B) {
 		}
 	}()
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		result, err := optimizer.BenchmarkConcurrentProcessing(50)
 		if err != nil {
 			b.Fatalf("BenchmarkConcurrentProcessing failed: %v", err)
 		}
 		if result == nil {
 			b.Fatal("Result is nil")
+		}
+	}
+}
+
+// TestStopConcurrentWithSubmit 投入と停止を並行させても panic せず、停止後の投入がエラーになることを確かめる
+func TestStopConcurrentWithSubmit(t *testing.T) {
+	for range 50 {
+		optimizer := NewPerformanceOptimizer(4)
+		if err := optimizer.Start(t.Context()); err != nil {
+			t.Fatalf("Start failed: %v", err)
+		}
+
+		errc := make(chan error, 1)
+		go func() {
+			_, err := optimizer.BenchmarkConcurrentProcessing(500)
+			errc <- err
+		}()
+		go optimizer.GetOptimizationReport()
+
+		if err := optimizer.Stop(); err != nil {
+			t.Fatalf("Stop failed: %v", err)
+		}
+		<-errc
+
+		if _, err := optimizer.BenchmarkConcurrentProcessing(1); err == nil {
+			t.Fatal("停止後の投入がエラーになっていない")
+		}
+	}
+}
+
+func TestStartStopTwice(t *testing.T) {
+	optimizer := NewPerformanceOptimizer(2)
+	if err := optimizer.Start(t.Context()); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	if err := optimizer.Start(t.Context()); err == nil {
+		t.Error("二重の Start がエラーになっていない")
+	}
+	if err := optimizer.Stop(); err != nil {
+		t.Fatalf("Stop failed: %v", err)
+	}
+	if err := optimizer.Stop(); err != nil {
+		t.Errorf("二度目の Stop がエラーを返した: %v", err)
+	}
+}
+
+// TestBenchmarkConcurrentProcessingCanceledContext ワーカーの ctx が先に終わっても、投入側が止まらずにエラーで返ることを確かめる
+func TestBenchmarkConcurrentProcessingCanceledContext(t *testing.T) {
+	optimizer := NewPerformanceOptimizer(2)
+	ctx, cancel := context.WithCancel(t.Context())
+	if err := optimizer.Start(ctx); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := optimizer.BenchmarkConcurrentProcessing(1000)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Error("ctx 終了後の投入がエラーになっていない")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("ctx 終了後に BenchmarkConcurrentProcessing が返らない")
+	}
+	if err := optimizer.Stop(); err != nil {
+		t.Fatalf("Stop failed: %v", err)
+	}
+}
+
+// TestBenchmarkMemoryUsageDoesNotUnderflow Alloc は GC で減るので、差分が uint64 のまま桁あふれしないことを確かめる
+func TestBenchmarkMemoryUsageDoesNotUnderflow(t *testing.T) {
+	optimizer := NewPerformanceOptimizer(2)
+	for range 5 {
+		result, err := optimizer.BenchmarkMapOperations(200000)
+		if err != nil {
+			t.Fatalf("BenchmarkMapOperations failed: %v", err)
+		}
+		if result.MemoryUsage > 1<<40 {
+			t.Fatalf("MemoryUsage が桁あふれしている: %d", result.MemoryUsage)
 		}
 	}
 }

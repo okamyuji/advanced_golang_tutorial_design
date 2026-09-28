@@ -97,7 +97,7 @@ services:
       - "5500:5500"
     volumes:
       - oracle_data:/opt/oracle/oradata
-      - ./docker/oracle/init.sql:/opt/oracle/scripts/startup/01-init.sql
+      - ./docker/oracle/init.sql:/container-entrypoint-initdb.d/01-init.sql
     networks:
       - multi_db_network
     healthcheck:

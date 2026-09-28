@@ -4,50 +4,50 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"math/rand"
+	"math/rand/v2"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-// DataProcessingTaskはデータ処理タスクです
+// DataProcessingTask データ処理タスクです
 type DataProcessingTask struct {
 	ID          int64
 	Data        []byte
 	Priority    int
 	ProcessTime time.Duration
 	Deadline    time.Time
-	Metadata    map[string]interface{}
+	Metadata    map[string]any
 	CreatedAt   time.Time
 }
 
-// ProcessingResultは処理結果です
+// ProcessingResult 処理結果です
 type ProcessingResult struct {
 	TaskID      int64
 	Success     bool
-	Result      interface{}
+	Result      any
 	Error       error
 	ProcessTime time.Duration
 	ProcessorID int
 	CompletedAt time.Time
 }
 
-// ProcessingStageは処理段階定義です
+// ProcessingStage 処理段階定義です
 type ProcessingStage struct {
 	Name        string
-	ProcessorFn func(context.Context, interface{}) (interface{}, error)
+	ProcessorFn func(context.Context, any) (any, error)
 	WorkerCount int
 	BufferSize  int
 	Timeout     time.Duration
 }
 
-// MultiStagePipelineは多段階パイプライン処理システムです
+// MultiStagePipeline 多段階パイプライン処理システムです
 type MultiStagePipeline struct {
 	// パイプライン設定
 	stages []ProcessingStage
 
 	// チャネル（段階間の接続）
-	stageChannels []chan interface{}
+	stageChannels []chan any
 
 	// コンテキスト制御
 	ctx    context.Context
@@ -61,30 +61,30 @@ type MultiStagePipeline struct {
 	stageStats []*StageStats
 
 	// 制御フラグ
-	isRunning int32
+	isRunning atomic.Bool
 	startTime time.Time
 }
 
-// StageProcessorは段階別プロセッサーです
+// StageProcessor 段階別プロセッサーです
 type StageProcessor struct {
 	StageIndex  int
 	ProcessorID int
 	StageName   string
-	ProcessorFn func(context.Context, interface{}) (interface{}, error)
+	ProcessorFn func(context.Context, any) (any, error)
 	Pipeline    *MultiStagePipeline
 	Stats       *ProcessorStats
 }
 
-// PipelineStatsはパイプライン統計です
+// PipelineStats パイプライン統計です
 type PipelineStats struct {
 	mu               sync.RWMutex
-	totalInputItems  int64
-	totalOutputItems int64
-	totalErrors      int64
+	totalInputItems  atomic.Int64
+	totalOutputItems atomic.Int64
+	totalErrors      atomic.Int64
 	startTime        time.Time
 }
 
-// StageStatsは段階別統計です
+// StageStats 段階別統計です
 type StageStats struct {
 	mu               sync.RWMutex
 	StageName        string
@@ -97,17 +97,18 @@ type StageStats struct {
 	QueueSize        int
 }
 
-// ProcessorStatsはプロセッサー統計です
+// ProcessorStats プロセッサー統計です。同じプロセッサーgoroutineだけが
+// 更新するため、カウンタは型付きatomicで保持しつつ他フィールドはそのままにします。
 type ProcessorStats struct {
 	ProcessorID      int
-	ProcessedItems   int64
-	SuccessItems     int64
-	ErrorItems       int64
+	ProcessedItems   atomic.Int64
+	SuccessItems     atomic.Int64
+	ErrorItems       atomic.Int64
 	TotalProcessTime time.Duration
 	AvgProcessTime   time.Duration
 }
 
-// PipelineConfigはパイプライン設定です
+// PipelineConfig パイプライン設定です
 type PipelineConfig struct {
 	InputBufferSize  int
 	OutputBufferSize int
@@ -117,7 +118,7 @@ type PipelineConfig struct {
 	ErrorThreshold   float64
 }
 
-// NewPipelineConfigはデフォルト設定を作成します
+// NewPipelineConfig デフォルト設定を作成します
 func NewPipelineConfig() *PipelineConfig {
 	return &PipelineConfig{
 		InputBufferSize:  1000,
@@ -129,19 +130,19 @@ func NewPipelineConfig() *PipelineConfig {
 	}
 }
 
-// NewMultiStagePipelineは新しい多段階パイプラインを作成します
+// NewMultiStagePipeline 新しい多段階パイプラインを作成します
 func NewMultiStagePipeline(stages []ProcessingStage, config *PipelineConfig) *MultiStagePipeline {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// 段階間チャネルを作成（段階数+1個必要）
-	stageChannels := make([]chan interface{}, len(stages)+1)
+	stageChannels := make([]chan any, len(stages)+1)
 	for i := range stageChannels {
 		if i == 0 {
-			stageChannels[i] = make(chan interface{}, config.InputBufferSize)
+			stageChannels[i] = make(chan any, config.InputBufferSize)
 		} else if i == len(stages) {
-			stageChannels[i] = make(chan interface{}, config.OutputBufferSize)
+			stageChannels[i] = make(chan any, config.OutputBufferSize)
 		} else {
-			stageChannels[i] = make(chan interface{}, stages[i-1].BufferSize)
+			stageChannels[i] = make(chan any, stages[i-1].BufferSize)
 		}
 	}
 
@@ -167,9 +168,9 @@ func NewMultiStagePipeline(stages []ProcessingStage, config *PipelineConfig) *Mu
 	}
 }
 
-// Startはパイプラインを開始します
+// Start パイプラインを開始します
 func (msp *MultiStagePipeline) Start() error {
-	if !atomic.CompareAndSwapInt32(&msp.isRunning, 0, 1) {
+	if !msp.isRunning.CompareAndSwap(false, true) {
 		return fmt.Errorf("pipeline is already running")
 	}
 
@@ -182,7 +183,7 @@ func (msp *MultiStagePipeline) Start() error {
 	for stageIndex, stage := range msp.stages {
 		log.Printf("Starting stage %d (%s) with %d workers", stageIndex, stage.Name, stage.WorkerCount)
 
-		for workerID := 0; workerID < stage.WorkerCount; workerID++ {
+		for workerID := range stage.WorkerCount {
 			processor := &StageProcessor{
 				StageIndex:  stageIndex,
 				ProcessorID: workerID,
@@ -194,27 +195,22 @@ func (msp *MultiStagePipeline) Start() error {
 				},
 			}
 
-			msp.wg.Add(1)
-			go processor.run()
+			msp.wg.Go(processor.run)
 		}
 	}
 
 	// 結果収集を開始
-	msp.wg.Add(1)
-	go msp.collectResults()
+	msp.wg.Go(msp.collectResults)
 
 	// メトリクス監視を開始
-	msp.wg.Add(1)
-	go msp.monitorMetrics()
+	msp.wg.Go(msp.monitorMetrics)
 
 	log.Printf("Multi-stage pipeline started successfully")
 	return nil
 }
 
-// runはプロセッサーのメインループです
+// run プロセッサーのメインループです
 func (sp *StageProcessor) run() {
-	defer sp.Pipeline.wg.Done()
-
 	log.Printf("Stage %d (%s) Processor %d started", sp.StageIndex, sp.StageName, sp.ProcessorID)
 
 	inputChannel := sp.Pipeline.stageChannels[sp.StageIndex]
@@ -225,12 +221,7 @@ func (sp *StageProcessor) run() {
 		case <-sp.Pipeline.ctx.Done():
 			log.Printf("Stage %d Processor %d stopping due to context cancellation", sp.StageIndex, sp.ProcessorID)
 			return
-		case data, ok := <-inputChannel:
-			if !ok {
-				log.Printf("Stage %d Processor %d stopping due to input channel closure", sp.StageIndex, sp.ProcessorID)
-				return
-			}
-
+		case data := <-inputChannel:
 			// データを処理
 			result := sp.processData(data)
 
@@ -248,8 +239,8 @@ func (sp *StageProcessor) run() {
 	}
 }
 
-// processDataはデータを処理します
-func (sp *StageProcessor) processData(data interface{}) interface{} {
+// processData データを処理します
+func (sp *StageProcessor) processData(data any) any {
 	start := time.Now()
 
 	// 段階固有のタイムアウトを設定
@@ -267,12 +258,9 @@ func (sp *StageProcessor) processData(data interface{}) interface{} {
 	processingTime := time.Since(start)
 
 	// 統計更新
-	atomic.AddInt64(&sp.Stats.ProcessedItems, 1)
+	processedItems := sp.Stats.ProcessedItems.Add(1)
 	sp.Stats.TotalProcessTime += processingTime
-
-	if sp.Stats.ProcessedItems > 0 {
-		sp.Stats.AvgProcessTime = sp.Stats.TotalProcessTime / time.Duration(sp.Stats.ProcessedItems)
-	}
+	sp.Stats.AvgProcessTime = sp.Stats.TotalProcessTime / time.Duration(processedItems)
 
 	// 段階別統計更新
 	stageStats := sp.Pipeline.stageStats[sp.StageIndex]
@@ -286,7 +274,7 @@ func (sp *StageProcessor) processData(data interface{}) interface{} {
 
 	if err != nil {
 		// エラー処理
-		atomic.AddInt64(&sp.Stats.ErrorItems, 1)
+		sp.Stats.ErrorItems.Add(1)
 
 		stageStats.mu.Lock()
 		stageStats.ErrorItems++
@@ -296,7 +284,7 @@ func (sp *StageProcessor) processData(data interface{}) interface{} {
 		return nil // エラーの場合は次の段階に送信しない
 	}
 
-	atomic.AddInt64(&sp.Stats.SuccessItems, 1)
+	sp.Stats.SuccessItems.Add(1)
 
 	stageStats.mu.Lock()
 	stageStats.SuccessItems++
@@ -305,15 +293,20 @@ func (sp *StageProcessor) processData(data interface{}) interface{} {
 	return result
 }
 
-// SubmitDataはデータを処理パイプラインに送信します
-func (msp *MultiStagePipeline) SubmitData(data interface{}) error {
-	if atomic.LoadInt32(&msp.isRunning) == 0 {
+// SubmitData データを処理パイプラインに送信します
+func (msp *MultiStagePipeline) SubmitData(data any) error {
+	if !msp.isRunning.Load() {
 		return fmt.Errorf("pipeline is not running")
+	}
+	// stageChannels[0]はcloseしないので送信自体はpanicしないが、停止後の投入は
+	// 処理されずに残ってしまうため、ctx側でも早期に拒否する。
+	if msp.ctx.Err() != nil {
+		return fmt.Errorf("pipeline is shutting down")
 	}
 
 	select {
 	case msp.stageChannels[0] <- data:
-		atomic.AddInt64(&msp.stats.totalInputItems, 1)
+		msp.stats.totalInputItems.Add(1)
 		return nil
 	case <-msp.ctx.Done():
 		return fmt.Errorf("pipeline is shutting down")
@@ -322,15 +315,13 @@ func (msp *MultiStagePipeline) SubmitData(data interface{}) error {
 	}
 }
 
-// GetOutputChannelは出力チャネルを取得します
-func (msp *MultiStagePipeline) GetOutputChannel() <-chan interface{} {
+// GetOutputChannel 出力チャネルを取得します
+func (msp *MultiStagePipeline) GetOutputChannel() <-chan any {
 	return msp.stageChannels[len(msp.stages)]
 }
 
-// collectResultsは結果を収集します
+// collectResults 結果を収集します
 func (msp *MultiStagePipeline) collectResults() {
-	defer msp.wg.Done()
-
 	log.Println("Result collector started")
 
 	outputChannel := msp.stageChannels[len(msp.stages)]
@@ -340,14 +331,9 @@ func (msp *MultiStagePipeline) collectResults() {
 		case <-msp.ctx.Done():
 			log.Println("Result collector stopping due to context cancellation")
 			return
-		case result, ok := <-outputChannel:
-			if !ok {
-				log.Println("Result collector stopping due to output channel closure")
-				return
-			}
-
+		case result := <-outputChannel:
 			// 統計更新
-			atomic.AddInt64(&msp.stats.totalOutputItems, 1)
+			msp.stats.totalOutputItems.Add(1)
 
 			// 結果処理（ログ出力など）
 			log.Printf("Pipeline output: %+v", result)
@@ -355,12 +341,9 @@ func (msp *MultiStagePipeline) collectResults() {
 	}
 }
 
-// monitorMetricsはメトリクスを監視します
+// monitorMetrics メトリクスを監視します
 func (msp *MultiStagePipeline) monitorMetrics() {
-	defer msp.wg.Done()
-
-	ticker := time.NewTicker(15 * time.Second)
-	defer ticker.Stop()
+	tick := time.Tick(15 * time.Second)
 
 	log.Println("Metrics monitor started")
 
@@ -369,20 +352,20 @@ func (msp *MultiStagePipeline) monitorMetrics() {
 		case <-msp.ctx.Done():
 			log.Println("Metrics monitor stopping")
 			return
-		case <-ticker.C:
+		case <-tick:
 			msp.reportMetrics()
 		}
 	}
 }
 
-// reportMetricsはメトリクスを報告します
+// reportMetrics メトリクスを報告します
 func (msp *MultiStagePipeline) reportMetrics() {
 	msp.stats.mu.RLock()
 	defer msp.stats.mu.RUnlock()
 
-	totalInput := atomic.LoadInt64(&msp.stats.totalInputItems)
-	totalOutput := atomic.LoadInt64(&msp.stats.totalOutputItems)
-	totalErrors := atomic.LoadInt64(&msp.stats.totalErrors)
+	totalInput := msp.stats.totalInputItems.Load()
+	totalOutput := msp.stats.totalOutputItems.Load()
+	totalErrors := msp.stats.totalErrors.Load()
 
 	uptime := time.Since(msp.stats.startTime)
 	var throughput float64
@@ -412,26 +395,21 @@ func (msp *MultiStagePipeline) reportMetrics() {
 	}
 }
 
-// Shutdownはパイプラインを停止します
+// Shutdown パイプラインを停止します
 func (msp *MultiStagePipeline) Shutdown(timeout time.Duration) error {
-	if !atomic.CompareAndSwapInt32(&msp.isRunning, 1, 0) {
+	if !msp.isRunning.CompareAndSwap(true, false) {
 		return fmt.Errorf("pipeline is not running")
 	}
 
 	log.Println("Shutting down multi-stage pipeline...")
 
-	// 1. 入力チャネルを閉じて新しいデータの受付を停止
-	close(msp.stageChannels[0])
+	// ワーカーに停止を指示する。stageChannelsはどれもcloseしない
+	// （SubmitDataや前段のプロセッサーとの競合でpanic: send on closed channelになるため。
+	//   以前は2秒間隔でチャネルを連鎖closeしていたが、固定Sleepでは処理完了を保証できず、
+	//   送信側と競合してpanicする余地があった）。
+	msp.cancel()
 
-	// 2. 段階間チャネルの連鎖閉じ処理を開始
-	go func() {
-		for i := 1; i < len(msp.stageChannels); i++ {
-			time.Sleep(2 * time.Second) // 各段階の処理完了を待つ
-			close(msp.stageChannels[i])
-		}
-	}()
-
-	// 3. ワーカーの終了を待機
+	// ワーカーの終了を待機
 	done := make(chan struct{})
 	go func() {
 		msp.wg.Wait()
@@ -442,30 +420,21 @@ func (msp *MultiStagePipeline) Shutdown(timeout time.Duration) error {
 	case <-done:
 		log.Println("All pipeline workers stopped gracefully")
 	case <-time.After(timeout):
-		log.Println("Timeout reached, forcing shutdown...")
-		msp.cancel()
-
-		// 追加の待機時間
-		select {
-		case <-done:
-			log.Println("Workers stopped after cancellation")
-		case <-time.After(2 * time.Second):
-			log.Println("Some workers may not have stopped properly")
-		}
+		log.Println("Some workers may not have stopped properly")
 	}
 
 	log.Println("Multi-stage pipeline shutdown completed")
 	return nil
 }
 
-// GetStatsは統計情報を取得します
-func (msp *MultiStagePipeline) GetStats() map[string]interface{} {
+// GetStats 統計情報を取得します
+func (msp *MultiStagePipeline) GetStats() map[string]any {
 	msp.stats.mu.RLock()
 	defer msp.stats.mu.RUnlock()
 
-	totalInput := atomic.LoadInt64(&msp.stats.totalInputItems)
-	totalOutput := atomic.LoadInt64(&msp.stats.totalOutputItems)
-	totalErrors := atomic.LoadInt64(&msp.stats.totalErrors)
+	totalInput := msp.stats.totalInputItems.Load()
+	totalOutput := msp.stats.totalOutputItems.Load()
+	totalErrors := msp.stats.totalErrors.Load()
 
 	uptime := time.Since(msp.stats.startTime)
 	var throughput float64
@@ -473,10 +442,10 @@ func (msp *MultiStagePipeline) GetStats() map[string]interface{} {
 		throughput = float64(totalOutput) / uptime.Seconds()
 	}
 
-	stageStats := make(map[string]interface{})
+	stageStats := make(map[string]any)
 	for i, stats := range msp.stageStats {
 		stats.mu.RLock()
-		stageStats[fmt.Sprintf("stage_%d_%s", i, stats.StageName)] = map[string]interface{}{
+		stageStats[fmt.Sprintf("stage_%d_%s", i, stats.StageName)] = map[string]any{
 			"processed_items":      stats.ProcessedItems,
 			"success_items":        stats.SuccessItems,
 			"error_items":          stats.ErrorItems,
@@ -486,7 +455,7 @@ func (msp *MultiStagePipeline) GetStats() map[string]interface{} {
 		stats.mu.RUnlock()
 	}
 
-	return map[string]interface{}{
+	return map[string]any{
 		"total_input":    totalInput,
 		"total_output":   totalOutput,
 		"total_errors":   totalErrors,
@@ -499,15 +468,15 @@ func (msp *MultiStagePipeline) GetStats() map[string]interface{} {
 
 // 使用例とテスト用の処理関数
 
-// DataValidationは第1段階のデータ検証処理です
-func DataValidation(ctx context.Context, data interface{}) (interface{}, error) {
+// DataValidation 第1段階のデータ検証処理です
+func DataValidation(ctx context.Context, data any) (any, error) {
 	task, ok := data.(DataProcessingTask)
 	if !ok {
 		return nil, fmt.Errorf("invalid data type")
 	}
 
 	// データ検証をシミュレート
-	time.Sleep(time.Duration(rand.Intn(50)+10) * time.Millisecond)
+	time.Sleep(time.Duration(rand.IntN(50)+10) * time.Millisecond)
 
 	// ランダムに検証エラーを発生（5%の確率）
 	if rand.Float64() < 0.05 {
@@ -522,15 +491,15 @@ func DataValidation(ctx context.Context, data interface{}) (interface{}, error) 
 	return validatedTask, nil
 }
 
-// DataTransformationは第2段階のデータ変換処理です
-func DataTransformation(ctx context.Context, data interface{}) (interface{}, error) {
+// DataTransformation 第2段階のデータ変換処理です
+func DataTransformation(ctx context.Context, data any) (any, error) {
 	task, ok := data.(DataProcessingTask)
 	if !ok {
 		return nil, fmt.Errorf("invalid data type")
 	}
 
 	// データ変換をシミュレート
-	time.Sleep(time.Duration(rand.Intn(100)+50) * time.Millisecond)
+	time.Sleep(time.Duration(rand.IntN(100)+50) * time.Millisecond)
 
 	// タイムアウトチェック
 	select {
@@ -553,15 +522,15 @@ func DataTransformation(ctx context.Context, data interface{}) (interface{}, err
 	return transformedTask, nil
 }
 
-// DataEnrichmentは第3段階のデータ拡張処理です
-func DataEnrichment(ctx context.Context, data interface{}) (interface{}, error) {
+// DataEnrichment 第3段階のデータ拡張処理です
+func DataEnrichment(ctx context.Context, data any) (any, error) {
 	task, ok := data.(DataProcessingTask)
 	if !ok {
 		return nil, fmt.Errorf("invalid data type")
 	}
 
 	// データ拡張をシミュレート（外部API呼び出しなど）
-	time.Sleep(time.Duration(rand.Intn(200)+100) * time.Millisecond)
+	time.Sleep(time.Duration(rand.IntN(200)+100) * time.Millisecond)
 
 	// タイムアウトチェック
 	select {
@@ -579,7 +548,7 @@ func DataEnrichment(ctx context.Context, data interface{}) (interface{}, error) 
 	enrichedTask := task
 	enrichedTask.Metadata["enriched"] = true
 	enrichedTask.Metadata["enrichment_time"] = time.Now()
-	enrichedTask.Metadata["external_data"] = map[string]interface{}{
+	enrichedTask.Metadata["external_data"] = map[string]any{
 		"source":    "external_api",
 		"timestamp": time.Now().Unix(),
 		"version":   "1.0",
@@ -588,15 +557,15 @@ func DataEnrichment(ctx context.Context, data interface{}) (interface{}, error) 
 	return enrichedTask, nil
 }
 
-// DataOutputは第4段階の出力処理です
-func DataOutput(ctx context.Context, data interface{}) (interface{}, error) {
+// DataOutput 第4段階の出力処理です
+func DataOutput(ctx context.Context, data any) (any, error) {
 	task, ok := data.(DataProcessingTask)
 	if !ok {
 		return nil, fmt.Errorf("invalid data type")
 	}
 
 	// 出力処理をシミュレート
-	time.Sleep(time.Duration(rand.Intn(30)+10) * time.Millisecond)
+	time.Sleep(time.Duration(rand.IntN(30)+10) * time.Millisecond)
 
 	// ランダムに出力エラーを発生（1%の確率）
 	if rand.Float64() < 0.01 {
@@ -673,13 +642,13 @@ func main() {
 
 	// テストデータを生成・送信
 	go func() {
-		for i := 0; i < 1000; i++ {
+		for i := range 1000 {
 			task := DataProcessingTask{
 				ID:       int64(i),
 				Data:     []byte(fmt.Sprintf("task_data_%d", i)),
-				Priority: rand.Intn(5),
-				Deadline: time.Now().Add(time.Duration(rand.Intn(60)+30) * time.Second),
-				Metadata: map[string]interface{}{
+				Priority: rand.IntN(5),
+				Deadline: time.Now().Add(time.Duration(rand.IntN(60)+30) * time.Second),
+				Metadata: map[string]any{
 					"batch_id": i / 100,
 					"source":   "test_generator",
 				},
@@ -692,7 +661,7 @@ func main() {
 			}
 
 			// 送信頻度を制御
-			time.Sleep(time.Duration(rand.Intn(50)+10) * time.Millisecond)
+			time.Sleep(time.Duration(rand.IntN(50)+10) * time.Millisecond)
 		}
 
 		log.Println("All test tasks submitted")

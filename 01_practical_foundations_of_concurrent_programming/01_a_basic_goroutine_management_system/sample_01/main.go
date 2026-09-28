@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"maps"
 	"runtime"
+	"slices"
 	"sync"
 	"time"
 )
@@ -98,11 +100,8 @@ func (gm *GoroutineManager) StopWorker(id string) error {
 // StopAll すべてのワーカーを停止します
 func (gm *GoroutineManager) StopAll() {
 	gm.mu.Lock()
-	workers := make([]*Worker, 0, len(gm.workers))
-	for _, worker := range gm.workers {
-		workers = append(workers, worker)
-	}
-	gm.workers = make(map[string]*Worker) // マップをクリア
+	workers := slices.Collect(maps.Values(gm.workers))
+	clear(gm.workers)
 	gm.mu.Unlock()
 
 	// すべてのワーカーをキャンセル
@@ -152,15 +151,14 @@ func (gm *GoroutineManager) GetWorkerCount() int {
 
 // サンプルタスク関数
 func sampleTask(ctx context.Context) {
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
+	tick := time.Tick(100 * time.Millisecond)
 
 	for {
 		select {
 		case <-ctx.Done():
 			fmt.Println("Task cancelled")
 			return
-		case <-ticker.C:
+		case <-tick:
 			// 何らかの処理を実行
 			runtime.Gosched() // 他のGoroutineに処理を譲る
 		}
@@ -171,7 +169,7 @@ func main() {
 	gm := NewGoroutineManager()
 
 	// ワーカーを開始
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		workerID := fmt.Sprintf("worker-%d", i)
 		if err := gm.StartWorker(workerID, sampleTask); err != nil {
 			log.Printf("Failed to start worker %s: %v", workerID, err)
@@ -180,12 +178,11 @@ func main() {
 
 	// メトリクス収集を開始
 	go func() {
-		for {
+		for range time.Tick(time.Second) {
 			gm.CollectMetrics()
 			goroutines, memory, timestamp := gm.GetMetrics()
 			fmt.Printf("Metrics [%s]: Goroutines=%d, Memory=%.2fMB, Workers=%d\n",
 				timestamp.Format("15:04:05"), goroutines, memory, gm.GetWorkerCount())
-			time.Sleep(1 * time.Second)
 		}
 	}()
 

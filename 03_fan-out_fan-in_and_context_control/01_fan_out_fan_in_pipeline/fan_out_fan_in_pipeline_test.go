@@ -114,23 +114,21 @@ func TestPipelineDataProcessing(t *testing.T) {
 	var results []AggregatedResult
 	var wg sync.WaitGroup
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		for result := range pipeline.GetResultChannel() {
 			results = append(results, result)
 			return // 1つの結果を取得したら終了
 		}
-	}()
+	})
 
 	// テストデータを送信
 	testDataCount := 10
-	for i := 0; i < testDataCount; i++ {
+	for i := range testDataCount {
 		item := DataItem{
 			ID:        int64(i),
 			Value:     fmt.Sprintf("test_data_%d", i),
 			Timestamp: time.Now(),
-			Metadata:  map[string]interface{}{"test": true},
+			Metadata:  map[string]any{"test": true},
 			Source:    "test",
 		}
 
@@ -205,18 +203,16 @@ func TestPipelineErrorHandling(t *testing.T) {
 	var results []AggregatedResult
 	var wg sync.WaitGroup
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		for result := range pipeline.GetResultChannel() {
 			results = append(results, result)
 			return
 		}
-	}()
+	})
 
 	// テストデータを送信
 	testDataCount := 5
-	for i := 0; i < testDataCount; i++ {
+	for i := range testDataCount {
 		item := DataItem{
 			ID:        int64(i),
 			Value:     fmt.Sprintf("error_test_%d", i),
@@ -445,9 +441,7 @@ func BenchmarkPipelineProcessing(b *testing.B) {
 		}
 	}()
 
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
+	for i := 0; b.Loop(); i++ {
 		item := DataItem{
 			ID:        int64(i),
 			Value:     fmt.Sprintf("bench_data_%d", i),
@@ -458,6 +452,59 @@ func BenchmarkPipelineProcessing(b *testing.B) {
 		err := pipeline.SubmitData(item)
 		if err != nil {
 			b.Errorf("Failed to submit data %d: %v", i, err)
+		}
+	}
+}
+
+// TestShutdownConcurrentWithSubmit SubmitDataとShutdownを並行させてもpanicせず、
+// 停止後の投入は必ずエラーになることを確かめる回帰テストです。
+func TestShutdownConcurrentWithSubmit(t *testing.T) {
+	for range 50 {
+		config := &PipelineConfig{
+			WorkerCount:     2,
+			BufferSize:      4,
+			ProcessingDelay: 1 * time.Millisecond,
+			ErrorRate:       0.0,
+			TimeoutDuration: 1 * time.Second,
+			RetryAttempts:   1,
+			EnableMetrics:   false,
+			LogLevel:        "INFO",
+		}
+
+		pipeline := NewFanOutFanInPipeline(config)
+		if err := pipeline.Start(); err != nil {
+			t.Fatalf("Failed to start pipeline: %v", err)
+		}
+
+		var submitWg sync.WaitGroup
+		stop := make(chan struct{})
+
+		const submitters = 8
+		for range submitters {
+			submitWg.Go(func() {
+				for {
+					select {
+					case <-stop:
+						return
+					default:
+						_ = pipeline.SubmitData(DataItem{ID: 1, Value: "race_test"})
+					}
+				}
+			})
+		}
+
+		time.Sleep(time.Millisecond)
+
+		if err := pipeline.Shutdown(1 * time.Second); err != nil {
+			t.Fatalf("Failed to shutdown pipeline: %v", err)
+		}
+
+		close(stop)
+		submitWg.Wait()
+
+		// 停止後の投入は必ずエラーになる
+		if err := pipeline.SubmitData(DataItem{ID: 2, Value: "after_shutdown"}); err == nil {
+			t.Error("Expected error when submitting data after shutdown")
 		}
 	}
 }

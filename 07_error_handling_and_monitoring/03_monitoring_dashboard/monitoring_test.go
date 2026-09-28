@@ -3,11 +3,26 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 )
+
+// waitFor 条件が満たされるまで待ちます
+// Start は実際のポートで HTTP サーバーを起動するので synctest のバブルでは動かせない。固定の Sleep の代わりに条件を確かめながら待つ。
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
 
 // MockMetricsCollector テスト用のメトリクス収集器です
 type MockMetricsCollector struct {
@@ -172,13 +187,14 @@ func TestMonitoringDashboard_BasicOperation(t *testing.T) {
 		}
 	}()
 
-	// メトリクス収集を待機
-	time.Sleep(300 * time.Millisecond)
+	// メトリクスが収集されるまで待機
+	waitFor(t, "metrics to be collected", func() bool {
+		return len(dashboard.dataStore.GetAllMetrics()) > 0
+	})
 
-	// メトリクスが収集されたことを確認
-	metrics := dashboard.dataStore.GetAllMetrics()
-	if len(metrics) == 0 {
-		t.Error("Expected metrics to be collected")
+	want := []string{"test_collector.counter", "test_collector.value"}
+	if got := dashboard.dataStore.GetAllMetrics(); len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Errorf("Expected metrics %v, got %v", want, got)
 	}
 }
 
@@ -199,16 +215,22 @@ func TestMonitoringDashboard_CollectorError(t *testing.T) {
 		}
 	}()
 
-	// エラーが発生してもシステムが継続することを確認
-	time.Sleep(200 * time.Millisecond)
+	// エラーが発生しても収集ループが続くことを確認
+	waitFor(t, "repeated collections", func() bool {
+		return dashboard.totalCollections.Load() >= 3
+	})
 
-	// ダッシュボードが実行中であることを確認
-	_ = map[string]interface{}{}
-	// stats の取得ロジックは簡略化
+	if !dashboard.isRunning.Load() {
+		t.Error("Expected dashboard to keep running after collector errors")
+	}
+	if got := dashboard.totalMetrics.Load(); got != 0 {
+		t.Errorf("Expected no metrics from a failing collector, got %d", got)
+	}
 }
 
 func TestMonitoringDashboard_AlertEvaluation(t *testing.T) {
 	dashboard := NewMonitoringDashboard(50*time.Millisecond, time.Hour, 100)
+	dashboard.alertInterval = 50 * time.Millisecond
 
 	// アラートルールを追加
 	rule := AlertRule{
@@ -216,7 +238,7 @@ func TestMonitoringDashboard_AlertEvaluation(t *testing.T) {
 		MetricName:  "test.value",
 		Condition:   "gt",
 		Threshold:   50.0,
-		Duration:    100 * time.Millisecond,
+		Duration:    time.Minute,
 		Severity:    "warning",
 		Enabled:     true,
 		Description: "Test alert",
@@ -243,11 +265,16 @@ func TestMonitoringDashboard_AlertEvaluation(t *testing.T) {
 	}
 	dashboard.dataStore.Store(metrics)
 
-	// アラート評価を待機
-	time.Sleep(300 * time.Millisecond)
+	// アラートが発火するまで待機
+	waitFor(t, "alert to fire", func() bool {
+		return dashboard.totalAlerts.Load() >= 1
+	})
 
-	// アラートが発火したことを簡易確認
-	// 実際の実装では、アラートカウンターやコールバックで確認
+	// 同じルールは 5 分間は再発火しない
+	time.Sleep(200 * time.Millisecond)
+	if got := dashboard.totalAlerts.Load(); got != 1 {
+		t.Errorf("Expected the alert to fire once, got %d", got)
+	}
 }
 
 func TestMonitoringDashboard_HTTPEndpoints(t *testing.T) {
@@ -282,7 +309,7 @@ func TestMonitoringDashboard_HTTPEndpoints(t *testing.T) {
 		t.Errorf("Expected status 200, got %d", w.Code)
 	}
 
-	var response map[string]interface{}
+	var response map[string]any
 	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
 		t.Errorf("Failed to parse response: %v", err)
 	}
@@ -318,13 +345,25 @@ func TestMonitoringDashboard_HTTPEndpoints(t *testing.T) {
 		t.Errorf("Expected status 200 for alerts, got %d", w.Code)
 	}
 
-	// /api/stats エンドポイントをテスト
+	// /api/stats エンドポイントをテスト。稼働時間は開始時刻からの経過時間になる
+	dashboard.mutex.Lock()
+	dashboard.startedAt = time.Now().Add(-time.Hour)
+	dashboard.mutex.Unlock()
+
 	req = httptest.NewRequest("GET", "/api/stats", nil)
 	w = httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
 
 	if w.Code != http.StatusOK {
 		t.Errorf("Expected status 200 for stats, got %d", w.Code)
+	}
+
+	var stats map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &stats); err != nil {
+		t.Fatalf("Failed to parse stats: %v", err)
+	}
+	if uptime := time.Duration(stats["uptime"].(float64)); uptime < time.Hour {
+		t.Errorf("Expected uptime of at least 1h, got %v", uptime)
 	}
 }
 
@@ -355,12 +394,12 @@ func TestMonitoringDashboard_QueryWithTimeRange(t *testing.T) {
 		t.Errorf("Expected status 200, got %d", w.Code)
 	}
 
-	var response map[string]interface{}
+	var response map[string]any
 	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
 		t.Errorf("Failed to parse response: %v", err)
 	}
 
-	series := response["series"].([]interface{})
+	series := response["series"].([]any)
 	if len(series) == 0 {
 		t.Error("Expected time series data")
 	}
@@ -398,6 +437,55 @@ func TestMonitoringDashboard_StartStop(t *testing.T) {
 	if err == nil {
 		t.Error("Expected error when stopping already stopped dashboard")
 	}
+
+	// 停止後の再開始はループが動かないのでエラー
+	if err := dashboard.Start(0); err == nil {
+		t.Error("Expected error when starting a stopped dashboard")
+	}
+}
+
+func TestMonitoringDashboard_AlertsEndpointDuringFire(t *testing.T) {
+	dashboard := NewMonitoringDashboard(time.Hour, time.Hour, 100)
+	mux := http.NewServeMux()
+	dashboard.setupRoutes(mux)
+
+	// アラート発火と /api/alerts の JSON 化が同時に走っても、activeAlerts の読み書きが競合しない
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for i := range 100 {
+			dashboard.fireAlert(AlertRule{Name: fmt.Sprintf("rule-%d", i), MetricName: "m"}, 1)
+		}
+	})
+	wg.Go(func() {
+		for range 100 {
+			mux.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/api/alerts", nil))
+		}
+	})
+	wg.Wait()
+
+	if got := dashboard.totalAlerts.Load(); got != 100 {
+		t.Errorf("Expected 100 alerts, got %d", got)
+	}
+}
+
+func TestMonitoringDashboard_ConcurrentStartStop(t *testing.T) {
+	for range 50 {
+		dashboard := NewMonitoringDashboard(time.Millisecond, time.Hour, 100)
+		dashboard.AddCollector(NewMockMetricsCollector("c", time.Millisecond))
+
+		var wg sync.WaitGroup
+		wg.Go(func() { _ = dashboard.Start(0) })
+		wg.Go(func() { _ = dashboard.Stop() })
+		wg.Wait()
+		_ = dashboard.Stop()
+
+		if err := dashboard.Start(0); err == nil {
+			t.Fatal("Expected error when starting after stop")
+		}
+		if dashboard.isRunning.Load() {
+			t.Fatal("Expected dashboard to stay stopped")
+		}
+	}
 }
 
 func TestSystemMetricsCollector(t *testing.T) {
@@ -411,8 +499,7 @@ func TestSystemMetricsCollector(t *testing.T) {
 		t.Errorf("Expected interval 1s, got %v", collector.Interval())
 	}
 
-	ctx := context.Background()
-	metrics, err := collector.Collect(ctx)
+	metrics, err := collector.Collect(t.Context())
 
 	if err != nil {
 		t.Errorf("Expected no error, got %v", err)
@@ -493,8 +580,7 @@ func BenchmarkTimeSeriesStore_Store(b *testing.B) {
 		{Name: "bench.metric", Value: 42.0, Timestamp: time.Now()},
 	}
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		store.Store(metrics)
 	}
 }
@@ -504,7 +590,7 @@ func BenchmarkTimeSeriesStore_Query(b *testing.B) {
 
 	// テストデータを準備
 	now := time.Now()
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		metrics := []Metric{
 			{Name: "bench.query", Value: float64(i), Timestamp: now.Add(time.Duration(i) * time.Second)},
 		}
@@ -514,18 +600,16 @@ func BenchmarkTimeSeriesStore_Query(b *testing.B) {
 	start := now.Add(-time.Hour)
 	end := now.Add(time.Hour)
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		store.Query("bench.query", nil, start, end)
 	}
 }
 
 func BenchmarkSystemMetricsCollector_Collect(b *testing.B) {
 	collector := NewSystemMetricsCollector(time.Second)
-	ctx := context.Background()
+	ctx := b.Context()
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		if _, err := collector.Collect(ctx); err != nil {
 			b.Errorf("Failed to collect metrics: %v", err)
 		}

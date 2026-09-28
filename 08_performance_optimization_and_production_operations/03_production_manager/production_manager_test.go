@@ -3,10 +3,14 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
+	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -130,12 +134,7 @@ func TestHealthCheckerGetStatus(t *testing.T) {
 }
 
 func TestConfigManagerLoadConfig(t *testing.T) {
-	configFile := "test_config.json"
-	defer func() {
-		if err := os.Remove(configFile); err != nil {
-			t.Logf("Failed to remove test config file: %v", err)
-		}
-	}() // テスト後にファイル削除
+	configFile := filepath.Join(t.TempDir(), "test_config.json")
 
 	manager := NewConfigManager(configFile)
 
@@ -170,12 +169,7 @@ func TestConfigManagerLoadConfig(t *testing.T) {
 }
 
 func TestConfigManagerInvalidFile(t *testing.T) {
-	configFile := "invalid_config.json"
-	defer func() {
-		if err := os.Remove(configFile); err != nil {
-			t.Logf("Failed to remove invalid config file: %v", err)
-		}
-	}()
+	configFile := filepath.Join(t.TempDir(), "invalid_config.json")
 
 	// 無効なJSONファイルを作成
 	invalidJSON := `{"invalid": json}`
@@ -221,17 +215,17 @@ func TestAddShutdownHook(t *testing.T) {
 
 func TestSystemHealthCheck(t *testing.T) {
 	manager := NewProductionManager(9093)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// システムが停止中の場合
-	manager.running = false
+	manager.running.Store(false)
 	err := manager.systemHealthCheck(ctx)
 	if err == nil {
 		t.Error("Expected error when system not running")
 	}
 
 	// システムが実行中の場合
-	manager.running = true
+	manager.running.Store(true)
 	err = manager.systemHealthCheck(ctx)
 	if err != nil {
 		t.Errorf("Unexpected error when system running: %v", err)
@@ -240,7 +234,7 @@ func TestSystemHealthCheck(t *testing.T) {
 
 func TestMemoryHealthCheck(t *testing.T) {
 	manager := NewProductionManager(9094)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// メモリヘルスチェック実行（エラーが発生しないことを確認）
 	err := manager.memoryHealthCheck(ctx)
@@ -251,7 +245,7 @@ func TestMemoryHealthCheck(t *testing.T) {
 
 func TestGoroutineHealthCheck(t *testing.T) {
 	manager := NewProductionManager(9095)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Goroutineヘルスチェック実行（エラーが発生しないことを確認）
 	err := manager.goroutineHealthCheck(ctx)
@@ -262,7 +256,7 @@ func TestGoroutineHealthCheck(t *testing.T) {
 
 func TestHealthHandler(t *testing.T) {
 	manager := NewProductionManager(9096)
-	manager.running = true
+	manager.running.Store(true)
 	manager.healthChecker.healthy = true
 
 	req := httptest.NewRequest("GET", "/health", nil)
@@ -309,7 +303,7 @@ func TestConfigHandler(t *testing.T) {
 		t.Errorf("Expected status 200, got %d", w.Code)
 	}
 
-	var response map[string]interface{}
+	var response map[string]any
 	err := json.NewDecoder(w.Body).Decode(&response)
 	if err != nil {
 		t.Fatalf("Failed to decode response: %v", err)
@@ -321,13 +315,14 @@ func TestConfigHandler(t *testing.T) {
 }
 
 func TestShutdownHandler(t *testing.T) {
-	manager := NewProductionManager(9098)
+	manager := newTestManager(t)
+	mux := manager.httpServer.Handler
 
 	// POSTメソッドでのテスト
 	req := httptest.NewRequest("POST", "/shutdown", nil)
 	w := httptest.NewRecorder()
 
-	manager.shutdownHandler(w, req)
+	mux.ServeHTTP(w, req)
 
 	if w.Code != http.StatusOK {
 		t.Errorf("Expected status 200, got %d", w.Code)
@@ -347,20 +342,23 @@ func TestShutdownHandler(t *testing.T) {
 	req = httptest.NewRequest("GET", "/shutdown", nil)
 	w = httptest.NewRecorder()
 
-	manager.shutdownHandler(w, req)
+	mux.ServeHTTP(w, req)
 
 	if w.Code != http.StatusMethodNotAllowed {
 		t.Errorf("Expected status 405, got %d", w.Code)
 	}
+
+	// 受け付けた停止処理の完了を待つ
+	if err := manager.GracefulShutdown(t.Context()); err != nil {
+		t.Fatalf("GracefulShutdown failed: %v", err)
+	}
+	if manager.running.Load() {
+		t.Error("Expected running to be false after shutdown")
+	}
 }
 
 func TestReloadHandler(t *testing.T) {
-	configFile := "test_reload_config.json"
-	defer func() {
-		if err := os.Remove(configFile); err != nil {
-			t.Logf("Failed to remove reload config file: %v", err)
-		}
-	}()
+	configFile := filepath.Join(t.TempDir(), "test_reload_config.json")
 
 	manager := NewProductionManager(9099)
 	manager.configManager.configFile = configFile
@@ -375,7 +373,7 @@ func TestReloadHandler(t *testing.T) {
 	req := httptest.NewRequest("POST", "/reload", nil)
 	w := httptest.NewRecorder()
 
-	manager.reloadHandler(w, req)
+	manager.httpServer.Handler.ServeHTTP(w, req)
 
 	if w.Code != http.StatusOK {
 		t.Errorf("Expected status 200, got %d", w.Code)
@@ -395,7 +393,7 @@ func TestReloadHandler(t *testing.T) {
 	req = httptest.NewRequest("GET", "/reload", nil)
 	w = httptest.NewRecorder()
 
-	manager.reloadHandler(w, req)
+	manager.httpServer.Handler.ServeHTTP(w, req)
 
 	if w.Code != http.StatusMethodNotAllowed {
 		t.Errorf("Expected status 405, got %d", w.Code)
@@ -404,7 +402,7 @@ func TestReloadHandler(t *testing.T) {
 
 func TestStatusHandler(t *testing.T) {
 	manager := NewProductionManager(9100)
-	manager.running = true
+	manager.running.Store(true)
 
 	req := httptest.NewRequest("GET", "/status", nil)
 	w := httptest.NewRecorder()
@@ -415,7 +413,7 @@ func TestStatusHandler(t *testing.T) {
 		t.Errorf("Expected status 200, got %d", w.Code)
 	}
 
-	var response map[string]interface{}
+	var response map[string]any
 	err := json.NewDecoder(w.Body).Decode(&response)
 	if err != nil {
 		t.Fatalf("Failed to decode response: %v", err)
@@ -435,12 +433,7 @@ func TestStatusHandler(t *testing.T) {
 }
 
 func TestCheckConfigChange(t *testing.T) {
-	configFile := "test_change_config.json"
-	defer func() {
-		if err := os.Remove(configFile); err != nil {
-			t.Logf("Failed to remove change config file: %v", err)
-		}
-	}()
+	configFile := filepath.Join(t.TempDir(), "test_change_config.json")
 
 	manager := NewConfigManager(configFile)
 
@@ -453,8 +446,7 @@ func TestCheckConfigChange(t *testing.T) {
 	originalModTime := manager.lastModified
 
 	// ファイルを変更
-	time.Sleep(10 * time.Millisecond) // ファイルシステムの時間精度を考慮
-	updatedConfig := map[string]interface{}{
+	updatedConfig := map[string]any{
 		"app_name": "updated_app",
 		"version":  "2.0.0",
 	}
@@ -467,6 +459,11 @@ func TestCheckConfigChange(t *testing.T) {
 	err = os.WriteFile(configFile, data, 0644)
 	if err != nil {
 		t.Fatalf("Failed to write updated config: %v", err)
+	}
+	// ファイルシステムの時刻の粒度に依存しないよう、更新時刻を明示的に進める
+	later := originalModTime.Add(time.Second)
+	if err := os.Chtimes(configFile, later, later); err != nil {
+		t.Fatalf("Chtimes failed: %v", err)
 	}
 
 	// 変更検出テスト
@@ -482,46 +479,57 @@ func TestCheckConfigChange(t *testing.T) {
 	}
 }
 
+// TestConfigWatcherIntegration 監視ループが設定ファイルの書き換えを拾って再読み込みすることを確かめる
 func TestConfigWatcherIntegration(t *testing.T) {
-	configFile := "test_watcher_config.json"
-	defer func() {
-		if err := os.Remove(configFile); err != nil {
-			t.Logf("Failed to remove watcher config file: %v", err)
+	configFile := filepath.Join(t.TempDir(), "test_watcher_config.json")
+
+	synctest.Test(t, func(t *testing.T) {
+		manager := NewConfigManager(configFile)
+		manager.watcher.interval = 100 * time.Millisecond
+
+		// 初期設定ファイル作成
+		if err := manager.LoadConfig(); err != nil {
+			t.Fatalf("Failed to create initial config: %v", err)
 		}
-	}()
 
-	manager := NewConfigManager(configFile)
-	manager.watcher.interval = 100 * time.Millisecond // 短い間隔でテスト
+		data, err := json.Marshal(map[string]any{"app_name": "watched_app"})
+		if err != nil {
+			t.Fatalf("Marshal failed: %v", err)
+		}
+		if err := os.WriteFile(configFile, data, 0o644); err != nil {
+			t.Fatalf("WriteFile failed: %v", err)
+		}
+		later := manager.lastModified.Add(time.Second)
+		if err := os.Chtimes(configFile, later, later); err != nil {
+			t.Fatalf("Chtimes failed: %v", err)
+		}
 
-	// 初期設定ファイル作成
-	err := manager.LoadConfig()
-	if err != nil {
-		t.Fatalf("Failed to create initial config: %v", err)
-	}
+		if err := manager.StartWatcher(t.Context()); err != nil {
+			t.Fatalf("Failed to start watcher: %v", err)
+		}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+		// 監視間隔を1回分進め、監視ループが処理を終えるまで待つ
+		time.Sleep(150 * time.Millisecond)
+		synctest.Wait()
 
-	// ウォッチャー開始
-	err = manager.StartWatcher(ctx)
-	if err != nil {
-		t.Fatalf("Failed to start watcher: %v", err)
-	}
+		manager.mutex.RLock()
+		appName := manager.config["app_name"]
+		manager.mutex.RUnlock()
+		if appName != "watched_app" {
+			t.Errorf("Expected app_name 'watched_app', got %v", appName)
+		}
 
-	// 少し待機してからウォッチャー停止
-	time.Sleep(200 * time.Millisecond)
-	manager.StopWatcher()
-
-	// エラーが発生しないことを確認
+		manager.StopWatcher()
+		manager.StopWatcher()
+	})
 }
 
 func BenchmarkHealthCheck(b *testing.B) {
 	manager := NewProductionManager(9101)
-	manager.running = true
-	ctx := context.Background()
+	manager.running.Store(true)
+	ctx := b.Context()
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		err := manager.systemHealthCheck(ctx)
 		if err != nil {
 			b.Fatalf("Health check failed: %v", err)
@@ -530,12 +538,7 @@ func BenchmarkHealthCheck(b *testing.B) {
 }
 
 func BenchmarkConfigLoad(b *testing.B) {
-	configFile := "bench_config.json"
-	defer func() {
-		if err := os.Remove(configFile); err != nil {
-			b.Logf("Failed to remove bench config file: %v", err)
-		}
-	}()
+	configFile := filepath.Join(b.TempDir(), "bench_config.json")
 
 	manager := NewConfigManager(configFile)
 
@@ -545,11 +548,141 @@ func BenchmarkConfigLoad(b *testing.B) {
 		b.Fatalf("Failed to create initial config: %v", err)
 	}
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		err := manager.LoadConfig()
 		if err != nil {
 			b.Fatalf("LoadConfig failed: %v", err)
 		}
 	}
+}
+
+// newTestManager 設定ファイルを一時ディレクトリに置き、空きポートで待ち受けるマネージャーを作る
+func newTestManager(t *testing.T) *ProductionManager {
+	t.Helper()
+	manager := NewProductionManager(0)
+	manager.httpServer.Addr = "127.0.0.1:0"
+	manager.configManager.configFile = filepath.Join(t.TempDir(), "config.json")
+	return manager
+}
+
+// TestGracefulShutdownConcurrent シグナルと /shutdown が重なるなど、停止処理が並行して呼ばれても panic しないことを確かめる
+func TestGracefulShutdownConcurrent(t *testing.T) {
+	for range 50 {
+		manager := newTestManager(t)
+		if err := manager.healthChecker.Start(t.Context()); err != nil {
+			t.Fatalf("healthChecker.Start failed: %v", err)
+		}
+		if err := manager.configManager.StartWatcher(t.Context()); err != nil {
+			t.Fatalf("StartWatcher failed: %v", err)
+		}
+
+		var wg sync.WaitGroup
+		for range 2 {
+			wg.Go(func() {
+				if err := manager.GracefulShutdown(t.Context()); err != nil {
+					t.Errorf("GracefulShutdown failed: %v", err)
+				}
+			})
+		}
+		wg.Go(func() {
+			manager.statusHandler(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/status", nil))
+		})
+		wg.Wait()
+	}
+}
+
+// TestStartReturnsWhenContextCanceled ctx が終わると Start がグレースフルシャットダウンして返り、停止後の再開はエラーになることを確かめる
+func TestStartReturnsWhenContextCanceled(t *testing.T) {
+	manager := newTestManager(t)
+	ctx, cancel := context.WithCancel(t.Context())
+
+	errc := make(chan error, 1)
+	go func() { errc <- manager.Start(ctx) }()
+	cancel()
+
+	select {
+	case err := <-errc:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			t.Fatalf("Start returned unexpected error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ctx が終わっても Start が返らない")
+	}
+
+	if err := manager.Start(t.Context()); err == nil || errors.Is(err, http.ErrServerClosed) {
+		t.Fatalf("停止後の Start が明示的なエラーになっていない: %v", err)
+	}
+}
+
+// TestShutdownHandlerRunsHooksWithoutExit /shutdown はプロセスを終了させず、シャットダウンフックを実行して停止処理を終えることを確かめる
+func TestShutdownHandlerRunsHooksWithoutExit(t *testing.T) {
+	manager := newTestManager(t)
+	hookCalled := make(chan struct{})
+	manager.AddShutdownHook(func() error {
+		close(hookCalled)
+		return nil
+	})
+
+	w := httptest.NewRecorder()
+	manager.shutdownHandler(w, httptest.NewRequest(http.MethodPost, "/shutdown", nil))
+
+	select {
+	case <-hookCalled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("シャットダウンフックが呼ばれない")
+	}
+	// os.Exit を呼ぶ実装だと、ここで待つ間にテストプロセスが終了する
+	if err := manager.GracefulShutdown(t.Context()); err != nil {
+		t.Fatalf("GracefulShutdown failed: %v", err)
+	}
+}
+
+// TestHealthStatusConcurrentWithChecks ヘルスチェックの実行と状態取得を並行させる
+func TestHealthStatusConcurrentWithChecks(t *testing.T) {
+	checker := NewHealthChecker(time.Second, time.Second)
+	checker.AddCheck("fail", func(context.Context) error { return errors.New("失敗") })
+
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for range 20 {
+			checker.runHealthChecks(t.Context())
+		}
+	})
+	wg.Go(func() {
+		for range 20 {
+			checker.GetStatus()
+		}
+	})
+	wg.Wait()
+
+	status := checker.GetStatus()
+	if status.Overall != "unhealthy" {
+		t.Errorf("Expected unhealthy, got %s", status.Overall)
+	}
+	if result, ok := status.Checks["fail"]; !ok || result.Status != "unhealthy" {
+		t.Errorf("個別チェックの結果が返っていない: %+v", status.Checks)
+	}
+}
+
+// TestConfigChangeConcurrentWithReload 設定ファイルの監視と /reload による読み込みを並行させる
+func TestConfigChangeConcurrentWithReload(t *testing.T) {
+	manager := NewConfigManager(filepath.Join(t.TempDir(), "config.json"))
+	if err := manager.LoadConfig(); err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for range 20 {
+			manager.checkConfigChange()
+		}
+	})
+	wg.Go(func() {
+		for range 20 {
+			if err := manager.LoadConfig(); err != nil {
+				t.Errorf("LoadConfig failed: %v", err)
+			}
+		}
+	})
+	wg.Wait()
 }

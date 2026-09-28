@@ -1,11 +1,13 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"log"
-	"math/rand"
+	"math"
+	"math/rand/v2"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -72,21 +74,35 @@ type RequestResult struct {
 
 // CacheEntry キャッシュエントリを表します
 type CacheEntry struct {
-	Data      interface{}
+	Data      any
 	Timestamp time.Time
 	TTL       time.Duration
 }
 
 // ExternalService 外部サービスインターフェースです
 type ExternalService interface {
-	Call(ctx context.Context, request interface{}) (interface{}, error)
+	Call(ctx context.Context, request any) (any, error)
 	Name() string
 }
 
 // FallbackProvider フォールバック提供インターフェースです
 type FallbackProvider interface {
-	GetFallbackData(ctx context.Context, request interface{}) (interface{}, error)
-	CanProvideFallback(request interface{}) bool
+	GetFallbackData(ctx context.Context, request any) (any, error)
+	CanProvideFallback(request any) bool
+}
+
+// counters リクエストごとに並行して増えるカウンターです
+// ロックを取らずに増やせるよう型付き atomic で持ち、GetMetrics で FallbackManagerMetrics に詰め替えます。
+type counters struct {
+	totalRequests        atomic.Uint64
+	normalModeRequests   atomic.Uint64
+	fallbackModeRequests atomic.Uint64
+	successfulRequests   atomic.Uint64
+	failedRequests       atomic.Uint64
+	modeChangeCount      atomic.Uint64
+	fallbackActivations  atomic.Uint64
+	cacheHits            atomic.Uint64
+	cacheMisses          atomic.Uint64
 }
 
 // FallbackManager エラー率ベースの自動フォールバック管理です
@@ -96,50 +112,43 @@ type FallbackManager struct {
 	fallbackProvider FallbackProvider
 	cache            sync.Map // map[string]*CacheEntry
 
-	currentMode   FallbackMode
-	metrics       FallbackManagerMetrics
-	requestWindow []RequestResult
-	windowIndex   int
-	windowFull    bool
+	counters counters
 
-	activeWorkers int64
-	isRunning     int64
+	// 以下は mutex で守ります
+	currentMode    FallbackMode
+	lastModeChange time.Time
+	requestWindow  []RequestResult
+	windowIndex    int
+	windowFull     bool
+
+	activeWorkers atomic.Int64
+	isRunning     atomic.Bool
 
 	ctx    context.Context
 	cancel context.CancelFunc
 	mutex  sync.RWMutex
+	// lifecycle Start と Stop を直列化し、wg.Go と wg.Wait が同時に走らないようにします
+	lifecycle sync.Mutex
+	wg        sync.WaitGroup
 }
 
 var (
 	ErrTooManyWorkers     = errors.New("too many concurrent workers")
 	ErrServiceUnavailable = errors.New("service unavailable")
 	ErrCacheMiss          = errors.New("cache miss")
+	ErrStopped            = errors.New("fallback manager is stopped")
 )
 
 // NewFallbackManager 新しいフォールバック管理を作成します
 func NewFallbackManager(config FallbackManagerConfig, service ExternalService, provider FallbackProvider) *FallbackManager {
 	// デフォルト値設定
-	if config.ErrorRateThreshold == 0 {
-		config.ErrorRateThreshold = 0.3 // 30%
-	}
-	if config.RecoveryThreshold == 0 {
-		config.RecoveryThreshold = 0.1 // 10%
-	}
-	if config.MinimumRequestCount == 0 {
-		config.MinimumRequestCount = 20
-	}
-	if config.SlidingWindowSize == 0 {
-		config.SlidingWindowSize = 100
-	}
-	if config.EvaluationInterval == 0 {
-		config.EvaluationInterval = 10 * time.Second
-	}
-	if config.TransitionDuration == 0 {
-		config.TransitionDuration = 30 * time.Second
-	}
-	if config.MaxConcurrentWorkers == 0 {
-		config.MaxConcurrentWorkers = 50
-	}
+	config.ErrorRateThreshold = cmp.Or(config.ErrorRateThreshold, 0.3) // 30%
+	config.RecoveryThreshold = cmp.Or(config.RecoveryThreshold, 0.1)   // 10%
+	config.MinimumRequestCount = cmp.Or(config.MinimumRequestCount, 20)
+	config.SlidingWindowSize = cmp.Or(config.SlidingWindowSize, 100)
+	config.EvaluationInterval = cmp.Or(config.EvaluationInterval, 10*time.Second)
+	config.TransitionDuration = cmp.Or(config.TransitionDuration, 30*time.Second)
+	config.MaxConcurrentWorkers = cmp.Or(config.MaxConcurrentWorkers, 50)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -149,24 +158,28 @@ func NewFallbackManager(config FallbackManagerConfig, service ExternalService, p
 		fallbackProvider: provider,
 		currentMode:      NormalMode,
 		requestWindow:    make([]RequestResult, config.SlidingWindowSize),
+		lastModeChange:   time.Now(),
 		ctx:              ctx,
 		cancel:           cancel,
-		metrics: FallbackManagerMetrics{
-			LastModeChange: time.Now(),
-		},
 	}
 }
 
 // Start フォールバック管理を開始します
 func (fm *FallbackManager) Start() error {
-	if !atomic.CompareAndSwapInt64(&fm.isRunning, 0, 1) {
-		return fmt.Errorf("fallback manager is already running")
+	fm.lifecycle.Lock()
+	defer fm.lifecycle.Unlock()
+
+	if fm.ctx.Err() != nil {
+		return ErrStopped
+	}
+	if !fm.isRunning.CompareAndSwap(false, true) {
+		return errors.New("fallback manager is already running")
 	}
 
 	log.Printf("Starting Fallback Manager [%s]...", fm.config.Name)
 
 	// 評価ループを開始
-	go fm.evaluationLoop()
+	fm.wg.Go(fm.evaluationLoop)
 
 	log.Printf("Fallback Manager [%s] started successfully", fm.config.Name)
 	return nil
@@ -174,30 +187,37 @@ func (fm *FallbackManager) Start() error {
 
 // Stop フォールバック管理を停止します
 func (fm *FallbackManager) Stop() error {
-	if !atomic.CompareAndSwapInt64(&fm.isRunning, 1, 0) {
-		return fmt.Errorf("fallback manager is not running")
+	fm.lifecycle.Lock()
+	defer fm.lifecycle.Unlock()
+
+	if !fm.isRunning.CompareAndSwap(true, false) {
+		return errors.New("fallback manager is not running")
 	}
 
 	log.Printf("Stopping Fallback Manager [%s]...", fm.config.Name)
 	fm.cancel()
+	fm.wg.Wait()
 	log.Printf("Fallback Manager [%s] stopped", fm.config.Name)
 	return nil
 }
 
 // Execute リクエストを実行します
-func (fm *FallbackManager) Execute(ctx context.Context, request interface{}) (interface{}, error) {
-	// 並行数制御
-	if atomic.LoadInt64(&fm.activeWorkers) >= int64(fm.config.MaxConcurrentWorkers) {
-		return nil, ErrTooManyWorkers
+func (fm *FallbackManager) Execute(ctx context.Context, request any) (any, error) {
+	if fm.ctx.Err() != nil {
+		return nil, ErrStopped
 	}
 
-	atomic.AddInt64(&fm.activeWorkers, 1)
-	defer atomic.AddInt64(&fm.activeWorkers, -1)
+	// 並行数制御。先に確保してから超過を判定しないと、Load と Add の間に他の呼び出しが割り込んで上限を超える
+	if fm.activeWorkers.Add(1) > int64(fm.config.MaxConcurrentWorkers) {
+		fm.activeWorkers.Add(-1)
+		return nil, ErrTooManyWorkers
+	}
+	defer fm.activeWorkers.Add(-1)
 
-	atomic.AddUint64(&fm.metrics.TotalRequests, 1)
+	fm.counters.totalRequests.Add(1)
 
 	start := time.Now()
-	var result interface{}
+	var result any
 	var err error
 	var success bool
 
@@ -208,11 +228,11 @@ func (fm *FallbackManager) Execute(ctx context.Context, request interface{}) (in
 	switch currentMode {
 	case NormalMode:
 		result, err, success = fm.executeNormalMode(ctx, request)
-		atomic.AddUint64(&fm.metrics.NormalModeRequests, 1)
+		fm.counters.normalModeRequests.Add(1)
 
 	case Fallback:
 		result, err, success = fm.executeFallbackMode(ctx, request)
-		atomic.AddUint64(&fm.metrics.FallbackModeRequests, 1)
+		fm.counters.fallbackModeRequests.Add(1)
 
 	case TransitionMode:
 		result, err, success = fm.executeTransitionMode(ctx, request)
@@ -236,13 +256,13 @@ func (fm *FallbackManager) Execute(ctx context.Context, request interface{}) (in
 }
 
 // executeNormalMode 通常モードでリクエストを実行します
-func (fm *FallbackManager) executeNormalMode(ctx context.Context, request interface{}) (interface{}, error, bool) {
+func (fm *FallbackManager) executeNormalMode(ctx context.Context, request any) (any, error, bool) {
 	// キャッシュチェック
 	if cached, found := fm.getFromCache(request); found {
-		atomic.AddUint64(&fm.metrics.CacheHits, 1)
+		fm.counters.cacheHits.Add(1)
 		return cached, nil, true
 	}
-	atomic.AddUint64(&fm.metrics.CacheMisses, 1)
+	fm.counters.cacheMisses.Add(1)
 
 	// 外部サービス呼び出し
 	result, err := fm.externalService.Call(ctx, request)
@@ -263,13 +283,13 @@ func (fm *FallbackManager) executeNormalMode(ctx context.Context, request interf
 }
 
 // executeFallbackMode フォールバックモードでリクエストを実行します
-func (fm *FallbackManager) executeFallbackMode(ctx context.Context, request interface{}) (interface{}, error, bool) {
+func (fm *FallbackManager) executeFallbackMode(ctx context.Context, request any) (any, error, bool) {
 	// フォールバックデータを取得
 	result, err := fm.fallbackProvider.GetFallbackData(ctx, request)
 	if err != nil {
 		// フォールバックも失敗した場合は古いキャッシュを試行
 		if cached, found := fm.getFromCacheIgnoreTTL(request); found {
-			atomic.AddUint64(&fm.metrics.CacheHits, 1)
+			fm.counters.cacheHits.Add(1)
 			return cached, nil, false
 		}
 		return nil, err, false
@@ -279,28 +299,27 @@ func (fm *FallbackManager) executeFallbackMode(ctx context.Context, request inte
 }
 
 // executeTransitionMode 移行モードでリクエストを実行します
-func (fm *FallbackManager) executeTransitionMode(ctx context.Context, request interface{}) (interface{}, error, bool) {
+func (fm *FallbackManager) executeTransitionMode(ctx context.Context, request any) (any, error, bool) {
 	// 移行期間中は一部のリクエストを外部サービスに送信
 	if rand.Float64() < 0.1 { // 10%のリクエストを外部サービスに
-		atomic.AddUint64(&fm.metrics.NormalModeRequests, 1)
+		fm.counters.normalModeRequests.Add(1)
 		return fm.executeNormalMode(ctx, request)
-	} else {
-		atomic.AddUint64(&fm.metrics.FallbackModeRequests, 1)
-		return fm.executeFallbackMode(ctx, request)
 	}
+	fm.counters.fallbackModeRequests.Add(1)
+	return fm.executeFallbackMode(ctx, request)
 }
 
 // recordResult リクエスト結果を記録します
 func (fm *FallbackManager) recordResult(success bool, mode FallbackMode, duration time.Duration) {
-	fm.mutex.Lock()
-	defer fm.mutex.Unlock()
-
 	// メトリクス更新
 	if success {
-		atomic.AddUint64(&fm.metrics.SuccessfulRequests, 1)
+		fm.counters.successfulRequests.Add(1)
 	} else {
-		atomic.AddUint64(&fm.metrics.FailedRequests, 1)
+		fm.counters.failedRequests.Add(1)
 	}
+
+	fm.mutex.Lock()
+	defer fm.mutex.Unlock()
 
 	// スライディングウィンドウに追加
 	result := RequestResult{
@@ -320,14 +339,13 @@ func (fm *FallbackManager) recordResult(success bool, mode FallbackMode, duratio
 
 // evaluationLoop 評価ループを実行します
 func (fm *FallbackManager) evaluationLoop() {
-	ticker := time.NewTicker(fm.config.EvaluationInterval)
-	defer ticker.Stop()
+	tick := time.Tick(fm.config.EvaluationInterval)
 
 	for {
 		select {
 		case <-fm.ctx.Done():
 			return
-		case <-ticker.C:
+		case <-tick:
 			fm.evaluateMode()
 		}
 	}
@@ -339,7 +357,6 @@ func (fm *FallbackManager) evaluateMode() {
 	defer fm.mutex.Unlock()
 
 	errorRate := fm.calculateCurrentErrorRate()
-	fm.metrics.CurrentErrorRate = errorRate
 
 	windowSize := fm.getEffectiveWindowSize()
 	if windowSize < fm.config.MinimumRequestCount {
@@ -349,21 +366,21 @@ func (fm *FallbackManager) evaluateMode() {
 	switch fm.currentMode {
 	case NormalMode:
 		if errorRate >= fm.config.ErrorRateThreshold {
-			fm.transitionTo(Fallback)
+			fm.transitionTo(Fallback, errorRate)
 		}
 
 	case Fallback:
 		if errorRate <= fm.config.RecoveryThreshold {
-			fm.transitionTo(TransitionMode)
+			fm.transitionTo(TransitionMode, errorRate)
 		}
 
 	case TransitionMode:
 		// 移行期間が経過したか確認
-		if time.Since(fm.metrics.LastModeChange) >= fm.config.TransitionDuration {
+		if time.Since(fm.lastModeChange) >= fm.config.TransitionDuration {
 			if errorRate <= fm.config.RecoveryThreshold {
-				fm.transitionTo(NormalMode)
+				fm.transitionTo(NormalMode, errorRate)
 			} else {
-				fm.transitionTo(Fallback)
+				fm.transitionTo(Fallback, errorRate)
 			}
 		}
 	}
@@ -377,7 +394,7 @@ func (fm *FallbackManager) calculateCurrentErrorRate() float64 {
 	}
 
 	failures := 0
-	for i := 0; i < windowSize; i++ {
+	for i := range windowSize {
 		if !fm.requestWindow[i].Success {
 			failures++
 		}
@@ -395,22 +412,22 @@ func (fm *FallbackManager) getEffectiveWindowSize() int {
 }
 
 // transitionTo 指定されたモードに遷移します
-func (fm *FallbackManager) transitionTo(newMode FallbackMode) {
+func (fm *FallbackManager) transitionTo(newMode FallbackMode, errorRate float64) {
 	if fm.currentMode == newMode {
 		return
 	}
 
 	oldMode := fm.currentMode
 	fm.currentMode = newMode
-	fm.metrics.LastModeChange = time.Now()
-	atomic.AddUint64(&fm.metrics.ModeChangeCount, 1)
+	fm.lastModeChange = time.Now()
+	fm.counters.modeChangeCount.Add(1)
 
 	if newMode == Fallback {
-		atomic.AddUint64(&fm.metrics.FallbackActivations, 1)
+		fm.counters.fallbackActivations.Add(1)
 	}
 
 	log.Printf("Fallback Manager [%s]: %s -> %s (Error Rate: %.2f%%)",
-		fm.config.Name, oldMode, newMode, fm.metrics.CurrentErrorRate*100)
+		fm.config.Name, oldMode, newMode, errorRate*100)
 
 	// コールバック実行
 	if fm.config.OnModeChange != nil {
@@ -419,7 +436,7 @@ func (fm *FallbackManager) transitionTo(newMode FallbackMode) {
 }
 
 // getFromCache キャッシュからデータを取得します
-func (fm *FallbackManager) getFromCache(request interface{}) (interface{}, bool) {
+func (fm *FallbackManager) getFromCache(request any) (any, bool) {
 	key := fm.generateCacheKey(request)
 	value, ok := fm.cache.Load(key)
 	if !ok {
@@ -436,7 +453,7 @@ func (fm *FallbackManager) getFromCache(request interface{}) (interface{}, bool)
 }
 
 // getFromCacheIgnoreTTL TTLを無視してキャッシュからデータを取得します
-func (fm *FallbackManager) getFromCacheIgnoreTTL(request interface{}) (interface{}, bool) {
+func (fm *FallbackManager) getFromCacheIgnoreTTL(request any) (any, bool) {
 	key := fm.generateCacheKey(request)
 	value, ok := fm.cache.Load(key)
 	if !ok {
@@ -448,7 +465,7 @@ func (fm *FallbackManager) getFromCacheIgnoreTTL(request interface{}) (interface
 }
 
 // saveToCache データをキャッシュに保存します
-func (fm *FallbackManager) saveToCache(request interface{}, data interface{}, ttl time.Duration) {
+func (fm *FallbackManager) saveToCache(request any, data any, ttl time.Duration) {
 	key := fm.generateCacheKey(request)
 	entry := &CacheEntry{
 		Data:      data,
@@ -459,7 +476,7 @@ func (fm *FallbackManager) saveToCache(request interface{}, data interface{}, tt
 }
 
 // generateCacheKey キャッシュキーを生成します
-func (fm *FallbackManager) generateCacheKey(request interface{}) string {
+func (fm *FallbackManager) generateCacheKey(request any) string {
 	// 簡易実装：実際にはrequest内容をハッシュ化など
 	return fmt.Sprintf("cache_%v", request)
 }
@@ -476,18 +493,25 @@ func (fm *FallbackManager) GetMetrics() FallbackManagerMetrics {
 	fm.mutex.RLock()
 	defer fm.mutex.RUnlock()
 
-	// コピーを返す
-	metrics := fm.metrics
-	metrics.CurrentErrorRate = fm.calculateCurrentErrorRate()
-	return metrics
+	c := &fm.counters
+	return FallbackManagerMetrics{
+		TotalRequests:        c.totalRequests.Load(),
+		NormalModeRequests:   c.normalModeRequests.Load(),
+		FallbackModeRequests: c.fallbackModeRequests.Load(),
+		SuccessfulRequests:   c.successfulRequests.Load(),
+		FailedRequests:       c.failedRequests.Load(),
+		CurrentErrorRate:     fm.calculateCurrentErrorRate(),
+		LastModeChange:       fm.lastModeChange,
+		ModeChangeCount:      c.modeChangeCount.Load(),
+		FallbackActivations:  c.fallbackActivations.Load(),
+		CacheHits:            c.cacheHits.Load(),
+		CacheMisses:          c.cacheMisses.Load(),
+	}
 }
 
 // ClearCache キャッシュをクリアします
 func (fm *FallbackManager) ClearCache() {
-	fm.cache.Range(func(key, value interface{}) bool {
-		fm.cache.Delete(key)
-		return true
-	})
+	fm.cache.Clear()
 }
 
 // Reset フォールバック管理をリセットします
@@ -496,8 +520,13 @@ func (fm *FallbackManager) Reset() {
 	defer fm.mutex.Unlock()
 
 	fm.currentMode = NormalMode
-	fm.metrics = FallbackManagerMetrics{
-		LastModeChange: time.Now(),
+	fm.lastModeChange = time.Now()
+	for _, c := range []*atomic.Uint64{
+		&fm.counters.totalRequests, &fm.counters.normalModeRequests, &fm.counters.fallbackModeRequests,
+		&fm.counters.successfulRequests, &fm.counters.failedRequests, &fm.counters.modeChangeCount,
+		&fm.counters.fallbackActivations, &fm.counters.cacheHits, &fm.counters.cacheMisses,
+	} {
+		c.Store(0)
 	}
 	fm.requestWindow = make([]RequestResult, fm.config.SlidingWindowSize)
 	fm.windowIndex = 0
@@ -507,29 +536,35 @@ func (fm *FallbackManager) Reset() {
 
 // MockExternalService テスト用の外部サービスです
 type MockExternalService struct {
-	name        string
-	failureRate float64
-	delay       time.Duration
+	name string
+	// failureRateBits 呼び出し中に SetFailureRate で変えられるよう、float64 のビット列を atomic に持ちます
+	failureRateBits atomic.Uint64
+	delay           time.Duration
 }
 
 func NewMockExternalService(name string, failureRate float64, delay time.Duration) *MockExternalService {
-	return &MockExternalService{
-		name:        name,
-		failureRate: failureRate,
-		delay:       delay,
+	mes := &MockExternalService{
+		name:  name,
+		delay: delay,
 	}
+	mes.SetFailureRate(failureRate)
+	return mes
 }
 
 func (mes *MockExternalService) Name() string {
 	return mes.name
 }
 
-func (mes *MockExternalService) Call(ctx context.Context, request interface{}) (interface{}, error) {
+func (mes *MockExternalService) Call(ctx context.Context, request any) (any, error) {
 	// 遅延シミュレート
-	time.Sleep(mes.delay)
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-time.After(mes.delay):
+	}
 
 	// 失敗シミュレート
-	if rand.Float64() < mes.failureRate {
+	if rand.Float64() < math.Float64frombits(mes.failureRateBits.Load()) {
 		return nil, errors.New("external service error")
 	}
 
@@ -537,22 +572,22 @@ func (mes *MockExternalService) Call(ctx context.Context, request interface{}) (
 }
 
 func (mes *MockExternalService) SetFailureRate(rate float64) {
-	mes.failureRate = rate
+	mes.failureRateBits.Store(math.Float64bits(rate))
 }
 
 // MockFallbackProvider テスト用のフォールバック提供者です
 type MockFallbackProvider struct {
-	cache map[string]interface{}
+	cache map[string]any
 	mutex sync.RWMutex
 }
 
 func NewMockFallbackProvider() *MockFallbackProvider {
 	return &MockFallbackProvider{
-		cache: make(map[string]interface{}),
+		cache: make(map[string]any),
 	}
 }
 
-func (mfp *MockFallbackProvider) GetFallbackData(ctx context.Context, request interface{}) (interface{}, error) {
+func (mfp *MockFallbackProvider) GetFallbackData(ctx context.Context, request any) (any, error) {
 	mfp.mutex.RLock()
 	defer mfp.mutex.RUnlock()
 
@@ -565,14 +600,42 @@ func (mfp *MockFallbackProvider) GetFallbackData(ctx context.Context, request in
 	return fmt.Sprintf("Fallback result for %v", request), nil
 }
 
-func (mfp *MockFallbackProvider) CanProvideFallback(request interface{}) bool {
+func (mfp *MockFallbackProvider) CanProvideFallback(request any) bool {
 	return true // すべてのリクエストにフォールバック可能
 }
 
-func (mfp *MockFallbackProvider) SetFallbackData(key string, data interface{}) {
+func (mfp *MockFallbackProvider) SetFallbackData(key string, data any) {
 	mfp.mutex.Lock()
 	defer mfp.mutex.Unlock()
 	mfp.cache[key] = data
+}
+
+// runPhase 外部サービスのエラー率を変えて 30 件のリクエストを送り、5 件ごとに状態を表示します
+func runPhase(fm *FallbackManager, svc *MockExternalService, title string, failureRate float64, firstID int) {
+	log.Printf("\n--- %s ---", title)
+	svc.SetFailureRate(failureRate)
+
+	for n := range 30 {
+		i := firstID + n
+		request := fmt.Sprintf("request-%d", i)
+
+		result, err := fm.Execute(context.Background(), request)
+		if err != nil {
+			log.Printf("Request %d failed: %v", i, err)
+		} else {
+			log.Printf("Request %d succeeded: %v", i, result)
+		}
+
+		time.Sleep(200 * time.Millisecond)
+
+		// 5リクエストごとに状態表示
+		if (n+1)%5 == 0 {
+			mode := fm.GetCurrentMode()
+			metrics := fm.GetMetrics()
+			log.Printf("Current Mode: %s, Error Rate: %.2f%%, Total Requests: %d",
+				mode, metrics.CurrentErrorRate*100, metrics.TotalRequests)
+		}
+	}
 }
 
 // 使用例とテスト用のmain関数
@@ -619,80 +682,13 @@ func main() {
 	log.Println("=== Fallback Manager Demo ===")
 
 	// 段階1: 正常動作（低エラー率）
-	log.Println("\n--- Phase 1: Normal Operation (Low Error Rate) ---")
-	externalService.SetFailureRate(0.05) // 5%エラー率
-
-	for i := 0; i < 30; i++ {
-		ctx := context.Background()
-		request := fmt.Sprintf("request-%d", i)
-
-		result, err := fallbackManager.Execute(ctx, request)
-		if err != nil {
-			log.Printf("Request %d failed: %v", i, err)
-		} else {
-			log.Printf("Request %d succeeded: %v", i, result)
-		}
-
-		time.Sleep(200 * time.Millisecond)
-
-		// 5リクエストごとに状態表示
-		if (i+1)%5 == 0 {
-			mode := fallbackManager.GetCurrentMode()
-			metrics := fallbackManager.GetMetrics()
-			log.Printf("Current Mode: %s, Error Rate: %.2f%%, Total Requests: %d",
-				mode, metrics.CurrentErrorRate*100, metrics.TotalRequests)
-		}
-	}
+	runPhase(fallbackManager, externalService, "Phase 1: Normal Operation (Low Error Rate)", 0.05, 0)
 
 	// 段階2: 高エラー率（フォールバック発動）
-	log.Println("\n--- Phase 2: High Error Rate (Fallback Activation) ---")
-	externalService.SetFailureRate(0.6) // 60%エラー率
-
-	for i := 30; i < 60; i++ {
-		ctx := context.Background()
-		request := fmt.Sprintf("request-%d", i)
-
-		result, err := fallbackManager.Execute(ctx, request)
-		if err != nil {
-			log.Printf("Request %d failed: %v", i, err)
-		} else {
-			log.Printf("Request %d succeeded: %v", i, result)
-		}
-
-		time.Sleep(200 * time.Millisecond)
-
-		if (i+1)%5 == 0 {
-			mode := fallbackManager.GetCurrentMode()
-			metrics := fallbackManager.GetMetrics()
-			log.Printf("Current Mode: %s, Error Rate: %.2f%%, Total Requests: %d",
-				mode, metrics.CurrentErrorRate*100, metrics.TotalRequests)
-		}
-	}
+	runPhase(fallbackManager, externalService, "Phase 2: High Error Rate (Fallback Activation)", 0.6, 30)
 
 	// 段階3: 回復（低エラー率に戻す）
-	log.Println("\n--- Phase 3: Recovery (Low Error Rate) ---")
-	externalService.SetFailureRate(0.05) // 5%エラー率
-
-	for i := 60; i < 90; i++ {
-		ctx := context.Background()
-		request := fmt.Sprintf("request-%d", i)
-
-		result, err := fallbackManager.Execute(ctx, request)
-		if err != nil {
-			log.Printf("Request %d failed: %v", i, err)
-		} else {
-			log.Printf("Request %d succeeded: %v", i, result)
-		}
-
-		time.Sleep(200 * time.Millisecond)
-
-		if (i+1)%5 == 0 {
-			mode := fallbackManager.GetCurrentMode()
-			metrics := fallbackManager.GetMetrics()
-			log.Printf("Current Mode: %s, Error Rate: %.2f%%, Total Requests: %d",
-				mode, metrics.CurrentErrorRate*100, metrics.TotalRequests)
-		}
-	}
+	runPhase(fallbackManager, externalService, "Phase 3: Recovery (Low Error Rate)", 0.05, 60)
 
 	// 最終統計
 	finalMetrics := fallbackManager.GetMetrics()

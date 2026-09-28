@@ -1,3 +1,3 @@
 module order_processor
 
-go 1.24.5
+go 1.27.0

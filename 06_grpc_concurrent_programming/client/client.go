@@ -2,8 +2,9 @@ package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"strings"
+	"io"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -12,10 +13,18 @@ import (
 	"grpc-concurrent-programming/security"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
+
+// ErrNoAvailableClient 接続プールに使えるクライアントがないときのエラーです
+var ErrNoAvailableClient = errors.New("利用可能なクライアントがありません")
+
+// ErrCircuitOpen サーキットブレーカーが開いていて呼び出しを止めたときのエラーです
+var ErrCircuitOpen = errors.New("サーキットブレーカーが開いています")
 
 // ClientConfig gRPCクライアントの設定を定義します
 type ClientConfig struct {
@@ -34,11 +43,22 @@ type ClientConfig struct {
 	CircuitBreakerThreshold int           `json:"circuit_breaker_threshold"`
 	CircuitBreakerTimeout   time.Duration `json:"circuit_breaker_timeout"`
 	EnableTLS               bool          `json:"enable_tls"`
-	AuthToken               string        `json:"auth_token"` // JWT認証トークン
+	TLSCAFile               string        `json:"tls_ca_file"` // EnableTLSのときにサーバー証明書を検証するCA証明書（PEM）
+	AuthToken               string        `json:"auth_token"`  // JWT認証トークン
 }
 
 // ClientMetrics クライアントのパフォーマンス指標を追跡します
 type ClientMetrics struct {
+	TotalRequests       atomic.Int64
+	SuccessfulRequests  atomic.Int64
+	FailedRequests      atomic.Int64
+	AverageLatency      atomic.Int64
+	MaxLatency          atomic.Int64
+	CircuitBreakerTrips atomic.Int64
+}
+
+// ClientMetricsSnapshot ある時点のClientMetricsの値を保持します
+type ClientMetricsSnapshot struct {
 	TotalRequests       int64 `json:"total_requests"`
 	SuccessfulRequests  int64 `json:"successful_requests"`
 	FailedRequests      int64 `json:"failed_requests"`
@@ -52,7 +72,7 @@ type ClientMetrics struct {
 type ConnectionPool struct {
 	connections []*grpc.ClientConn
 	clients     []pb.UserServiceClient
-	current     int64
+	current     atomic.Int64
 	config      ClientConfig
 	mutex       sync.RWMutex
 }
@@ -64,11 +84,10 @@ func NewConnectionPool(config ClientConfig) (*ConnectionPool, error) {
 	}
 
 	for _, addr := range config.ServerAddresses {
-		for i := 0; i < config.MaxConnections; i++ {
+		for range config.MaxConnections {
 			conn, client, err := pool.createConnection(addr)
 			if err != nil {
-				pool.Close()
-				return nil, fmt.Errorf("接続作成エラー (%s): %w", addr, err)
+				return nil, errors.Join(fmt.Errorf("接続作成エラー (%s): %w", addr, err), pool.Close())
 			}
 
 			pool.connections = append(pool.connections, conn)
@@ -86,21 +105,28 @@ func (cp *ConnectionPool) createConnection(address string) (*grpc.ClientConn, pb
 			Timeout:             cp.config.KeepaliveTimeout,
 			PermitWithoutStream: cp.config.PermitWithoutStream,
 		}),
-		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(cp.config.MaxReceiveMessageSize),
-			grpc.MaxCallSendMsgSize(cp.config.MaxSendMessageSize),
-		),
+	}
+	// 0を渡すと上限0バイトになり全RPCが失敗するので、未設定ならgRPCの既定値に任せる
+	if cp.config.MaxReceiveMessageSize > 0 {
+		opts = append(opts, grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(cp.config.MaxReceiveMessageSize)))
+	}
+	if cp.config.MaxSendMessageSize > 0 {
+		opts = append(opts, grpc.WithDefaultCallOptions(grpc.MaxCallSendMsgSize(cp.config.MaxSendMessageSize)))
 	}
 
 	// TLS設定
 	if cp.config.EnableTLS {
-		creds := security.CreateTLSCredentials()
+		creds, err := security.ClientTLSCredentials(cp.config.TLSCAFile)
+		if err != nil {
+			return nil, nil, err
+		}
 		opts = append(opts, grpc.WithTransportCredentials(creds))
 	} else {
 		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	}
 
-	conn, err := grpc.Dial(address, opts...)
+	// NewClient 接続を最初のRPCまで遅らせる。既定のリゾルバーがdnsなので"host:port"をそのまま渡せる
+	conn, err := grpc.NewClient(address, opts...)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -120,7 +146,7 @@ func (cp *ConnectionPool) GetClient() pb.UserServiceClient {
 	}
 
 	// ラウンドロビンによる負荷分散
-	index := atomic.AddInt64(&cp.current, 1) % int64(len(cp.clients))
+	index := cp.current.Add(1) % int64(len(cp.clients))
 	return cp.clients[index]
 }
 
@@ -129,15 +155,15 @@ func (cp *ConnectionPool) Close() error {
 	cp.mutex.Lock()
 	defer cp.mutex.Unlock()
 
-	var errors []error
+	var errs []error
 	for _, conn := range cp.connections {
 		if err := conn.Close(); err != nil {
-			errors = append(errors, err)
+			errs = append(errs, err)
 		}
 	}
 
-	if len(errors) > 0 {
-		return fmt.Errorf("接続終了エラー: %v", errors)
+	if err := errors.Join(errs...); err != nil {
+		return fmt.Errorf("接続終了エラー: %w", err)
 	}
 
 	return nil
@@ -173,8 +199,9 @@ func NewCircuitBreaker(threshold int, timeout time.Duration) *CircuitBreaker {
 
 // CanExecute 実行可能かどうかを判定します
 func (cb *CircuitBreaker) CanExecute() bool {
-	cb.mutex.RLock()
-	defer cb.mutex.RUnlock()
+	// Open→HalfOpenの遷移で状態を書き換えるので、読み取りロックでは足りない
+	cb.mutex.Lock()
+	defer cb.mutex.Unlock()
 
 	switch cb.state {
 	case CircuitBreakerClosed:
@@ -268,21 +295,18 @@ func NewHighPerformanceGRPCClient(config ClientConfig) (*HighPerformanceGRPCClie
 // executeWithRetry 再試行機能付きで操作を実行します
 func (c *HighPerformanceGRPCClient) executeWithRetry(ctx context.Context, operation func() error) error {
 	if !c.circuitBreaker.CanExecute() {
-		atomic.AddInt64(&c.metrics.CircuitBreakerTrips, 1)
-		return fmt.Errorf("サーキットブレーカーが開いています")
+		c.metrics.CircuitBreakerTrips.Add(1)
+		return ErrCircuitOpen
 	}
 
 	var lastError error
 	backoff := c.retryPolicy.initialBackoff
 
-	for attempt := 0; attempt <= c.retryPolicy.maxRetries; attempt++ {
+	for attempt := range c.retryPolicy.maxRetries + 1 {
 		if attempt > 0 {
 			select {
 			case <-time.After(backoff):
-				backoff = time.Duration(float64(backoff) * c.retryPolicy.multiplier)
-				if backoff > c.retryPolicy.maxBackoff {
-					backoff = c.retryPolicy.maxBackoff
-				}
+				backoff = min(time.Duration(float64(backoff)*c.retryPolicy.multiplier), c.retryPolicy.maxBackoff)
 			case <-ctx.Done():
 				return ctx.Err()
 			}
@@ -307,28 +331,27 @@ func (c *HighPerformanceGRPCClient) executeWithRetry(ctx context.Context, operat
 }
 
 func (c *HighPerformanceGRPCClient) isRetryableError(err error) bool {
-	// gRPCステータスコードに基づいて再試行可能性を判定
-	errorStr := err.Error()
-	retryableKeywords := []string{
-		"unavailable",
-		"timeout",
-		"deadline exceeded",
-		"connection refused",
+	// gRPCステータスコードで判定する。接続拒否はUnavailableとして返る
+	switch status.Code(err) {
+	case codes.Unavailable, codes.DeadlineExceeded:
+		return true
+	default:
+		return false
 	}
+}
 
-	for _, keyword := range retryableKeywords {
-		if strings.Contains(strings.ToLower(errorStr), keyword) {
-			return true
-		}
+// withAuth AuthTokenが設定されていれば、JWT認証ヘッダーを付けたコンテキストを返します
+func (c *HighPerformanceGRPCClient) withAuth(ctx context.Context) context.Context {
+	if c.config.AuthToken == "" {
+		return ctx
 	}
-
-	return false
+	return metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+c.config.AuthToken)
 }
 
 // GetUser Unary RPC呼び出しを行います
 func (c *HighPerformanceGRPCClient) GetUser(ctx context.Context, userID int64) (*pb.User, error) {
 	start := time.Now()
-	atomic.AddInt64(&c.metrics.TotalRequests, 1)
+	c.metrics.TotalRequests.Add(1)
 
 	var result *pb.User
 	var resultErr error
@@ -336,17 +359,11 @@ func (c *HighPerformanceGRPCClient) GetUser(ctx context.Context, userID int64) (
 	operation := func() error {
 		client := c.pool.GetClient()
 		if client == nil {
-			return fmt.Errorf("利用可能なクライアントがありません")
+			return ErrNoAvailableClient
 		}
 
-		ctxWithTimeout, cancel := context.WithTimeout(ctx, c.config.DefaultTimeout)
+		ctxWithTimeout, cancel := context.WithTimeout(c.withAuth(ctx), c.config.DefaultTimeout)
 		defer cancel()
-
-		// JWT認証ヘッダーを追加
-		if c.config.AuthToken != "" {
-			md := metadata.Pairs("authorization", "Bearer "+c.config.AuthToken)
-			ctxWithTimeout = metadata.NewOutgoingContext(ctxWithTimeout, md)
-		}
 
 		response, err := client.GetUser(ctxWithTimeout, &pb.GetUserRequest{Id: userID})
 		if err != nil {
@@ -358,10 +375,10 @@ func (c *HighPerformanceGRPCClient) GetUser(ctx context.Context, userID int64) (
 	}
 
 	if err := c.executeWithRetry(ctx, operation); err != nil {
-		atomic.AddInt64(&c.metrics.FailedRequests, 1)
+		c.metrics.FailedRequests.Add(1)
 		resultErr = err
 	} else {
-		atomic.AddInt64(&c.metrics.SuccessfulRequests, 1)
+		c.metrics.SuccessfulRequests.Add(1)
 	}
 
 	c.updateLatencyMetrics(start)
@@ -372,7 +389,7 @@ func (c *HighPerformanceGRPCClient) GetUser(ctx context.Context, userID int64) (
 // CreateUser Unary RPC呼び出しを行います
 func (c *HighPerformanceGRPCClient) CreateUser(ctx context.Context, name, email string) (*pb.User, error) {
 	start := time.Now()
-	atomic.AddInt64(&c.metrics.TotalRequests, 1)
+	c.metrics.TotalRequests.Add(1)
 
 	var result *pb.User
 	var resultErr error
@@ -380,10 +397,10 @@ func (c *HighPerformanceGRPCClient) CreateUser(ctx context.Context, name, email 
 	operation := func() error {
 		client := c.pool.GetClient()
 		if client == nil {
-			return fmt.Errorf("利用可能なクライアントがありません")
+			return ErrNoAvailableClient
 		}
 
-		ctxWithTimeout, cancel := context.WithTimeout(ctx, c.config.DefaultTimeout)
+		ctxWithTimeout, cancel := context.WithTimeout(c.withAuth(ctx), c.config.DefaultTimeout)
 		defer cancel()
 
 		response, err := client.CreateUser(ctxWithTimeout, &pb.CreateUserRequest{
@@ -399,10 +416,10 @@ func (c *HighPerformanceGRPCClient) CreateUser(ctx context.Context, name, email 
 	}
 
 	if err := c.executeWithRetry(ctx, operation); err != nil {
-		atomic.AddInt64(&c.metrics.FailedRequests, 1)
+		c.metrics.FailedRequests.Add(1)
 		resultErr = err
 	} else {
-		atomic.AddInt64(&c.metrics.SuccessfulRequests, 1)
+		c.metrics.SuccessfulRequests.Add(1)
 	}
 
 	c.updateLatencyMetrics(start)
@@ -422,20 +439,20 @@ func (c *HighPerformanceGRPCClient) ListUsersStream(ctx context.Context, pageSiz
 		operation := func() error {
 			client := c.pool.GetClient()
 			if client == nil {
-				return fmt.Errorf("利用可能なクライアントがありません")
+				return ErrNoAvailableClient
 			}
 
-			stream, err := client.ListUsers(ctx, &pb.ListUsersRequest{PageSize: pageSize})
+			stream, err := client.ListUsers(c.withAuth(ctx), &pb.ListUsersRequest{PageSize: pageSize})
 			if err != nil {
 				return err
 			}
 
 			for {
 				user, err := stream.Recv()
+				if errors.Is(err, io.EOF) {
+					return nil
+				}
 				if err != nil {
-					if err.Error() == "EOF" {
-						return nil
-					}
 					return err
 				}
 
@@ -463,10 +480,10 @@ func (c *HighPerformanceGRPCClient) BulkCreateUsersStream(ctx context.Context, u
 	operation := func() error {
 		client := c.pool.GetClient()
 		if client == nil {
-			return fmt.Errorf("利用可能なクライアントがありません")
+			return ErrNoAvailableClient
 		}
 
-		stream, err := client.BulkCreateUsers(ctx)
+		stream, err := client.BulkCreateUsers(c.withAuth(ctx))
 		if err != nil {
 			return err
 		}
@@ -498,42 +515,38 @@ func (c *HighPerformanceGRPCClient) BulkCreateUsersStream(ctx context.Context, u
 func (c *HighPerformanceGRPCClient) UserChatStream(ctx context.Context) (pb.UserService_UserChatClient, error) {
 	client := c.pool.GetClient()
 	if client == nil {
-		return nil, fmt.Errorf("利用可能なクライアントがありません")
+		return nil, ErrNoAvailableClient
 	}
 
-	return client.UserChat(ctx)
+	return client.UserChat(c.withAuth(ctx))
 }
 
 func (c *HighPerformanceGRPCClient) updateLatencyMetrics(start time.Time) {
 	elapsed := time.Since(start).Nanoseconds()
 
 	// 平均レイテンシー更新（簡易移動平均）
-	currentAvg := atomic.LoadInt64(&c.metrics.AverageLatency)
-	newAvg := (currentAvg + elapsed) / 2
-	atomic.StoreInt64(&c.metrics.AverageLatency, newAvg)
+	currentAvg := c.metrics.AverageLatency.Load()
+	c.metrics.AverageLatency.Store((currentAvg + elapsed) / 2)
 
 	// 最大レイテンシー更新
 	for {
-		currentMax := atomic.LoadInt64(&c.metrics.MaxLatency)
-		if elapsed <= currentMax {
-			break
-		}
-		if atomic.CompareAndSwapInt64(&c.metrics.MaxLatency, currentMax, elapsed) {
+		currentMax := c.metrics.MaxLatency.Load()
+		if elapsed <= currentMax || c.metrics.MaxLatency.CompareAndSwap(currentMax, elapsed) {
 			break
 		}
 	}
 }
 
 // GetMetrics メトリクスを取得します
-func (c *HighPerformanceGRPCClient) GetMetrics() ClientMetrics {
-	return ClientMetrics{
-		TotalRequests:       atomic.LoadInt64(&c.metrics.TotalRequests),
-		SuccessfulRequests:  atomic.LoadInt64(&c.metrics.SuccessfulRequests),
-		FailedRequests:      atomic.LoadInt64(&c.metrics.FailedRequests),
-		AverageLatency:      atomic.LoadInt64(&c.metrics.AverageLatency),
-		MaxLatency:          atomic.LoadInt64(&c.metrics.MaxLatency),
+func (c *HighPerformanceGRPCClient) GetMetrics() ClientMetricsSnapshot {
+	return ClientMetricsSnapshot{
+		TotalRequests:       c.metrics.TotalRequests.Load(),
+		SuccessfulRequests:  c.metrics.SuccessfulRequests.Load(),
+		FailedRequests:      c.metrics.FailedRequests.Load(),
+		AverageLatency:      c.metrics.AverageLatency.Load(),
+		MaxLatency:          c.metrics.MaxLatency.Load(),
 		ActiveConnections:   int64(len(c.pool.connections)),
-		CircuitBreakerTrips: atomic.LoadInt64(&c.metrics.CircuitBreakerTrips),
+		CircuitBreakerTrips: c.metrics.CircuitBreakerTrips.Load(),
 	}
 }
 

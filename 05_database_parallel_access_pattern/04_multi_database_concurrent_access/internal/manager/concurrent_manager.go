@@ -3,9 +3,12 @@ package manager
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -24,7 +27,6 @@ type ConcurrentDBManager struct {
 	errorChan  chan error
 	ctx        context.Context
 	cancel     context.CancelFunc
-	wg         sync.WaitGroup
 	metrics    *PerformanceMetrics
 	mutex      sync.RWMutex
 	registry   *adapters.AdapterRegistry
@@ -32,13 +34,14 @@ type ConcurrentDBManager struct {
 
 // TaskResult タスク実行結果
 type TaskResult struct {
-	TaskID    string                   `json:"task_id"`
-	DBType    string                   `json:"db_type"`
-	Data      []map[string]interface{} `json:"data,omitempty"`
-	Error     error                    `json:"error,omitempty"`
-	Elapsed   time.Duration            `json:"elapsed"`
-	Timestamp time.Time                `json:"timestamp"`
-	Operation string                   `json:"operation"`
+	TaskID    string           `json:"task_id"`
+	DBType    string           `json:"db_type"`
+	Data      []map[string]any `json:"data,omitempty"`
+	Users     []*models.User   `json:"users,omitempty"`
+	Error     error            `json:"error,omitempty"`
+	Elapsed   time.Duration    `json:"elapsed"`
+	Timestamp time.Time        `json:"timestamp"`
+	Operation string           `json:"operation"`
 }
 
 // PerformanceMetrics パフォーマンス指標
@@ -49,9 +52,12 @@ type PerformanceMetrics struct {
 	AverageLatency time.Duration `json:"average_latency"`
 	MaxLatency     time.Duration `json:"max_latency"`
 	MinLatency     time.Duration `json:"min_latency"`
-	ActiveTasks    int64         `json:"active_tasks"`
+	ActiveTasks    atomic.Int64  `json:"-"`
 	mutex          sync.RWMutex  `json:"-"`
 }
+
+// ErrManagerClosed Close 後に投入されたタスクへ返すエラー
+var ErrManagerClosed = errors.New("マネージャーは停止済みです")
 
 // WorkerPoolConfig ワーカープール設定
 type WorkerPoolConfig struct {
@@ -66,7 +72,7 @@ type DatabaseTask struct {
 	DBType     string            `json:"db_type"`
 	Operation  string            `json:"operation"`
 	Query      string            `json:"query"`
-	Args       []interface{}     `json:"args"`
+	Args       []any             `json:"args"`
 	ResultChan chan *TaskResult  `json:"-"`
 	Context    context.Context   `json:"-"`
 	Callback   func(*TaskResult) `json:"-"`
@@ -77,7 +83,7 @@ func NewConcurrentDBManager(poolConfig WorkerPoolConfig) *ConcurrentDBManager {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	if poolConfig.MaxWorkers <= 0 {
-		poolConfig.MaxWorkers = runtime.NumCPU() * 4
+		poolConfig.MaxWorkers = runtime.GOMAXPROCS(0) * 4
 	}
 	if poolConfig.QueueSize <= 0 {
 		poolConfig.QueueSize = poolConfig.MaxWorkers * 2
@@ -94,47 +100,39 @@ func NewConcurrentDBManager(poolConfig WorkerPoolConfig) *ConcurrentDBManager {
 		ctx:        ctx,
 		cancel:     cancel,
 		metrics:    &PerformanceMetrics{MinLatency: time.Duration(^uint64(0) >> 1)}, // 最大値で初期化
-		registry:   adapters.NewAdapterRegistry(),
+		registry:   adapters.DefaultRegistry,
 	}
 
 	// デフォルトアダプターを登録
 	adapters.RegisterDefaultAdapters()
-	manager.registry = adapters.DefaultRegistry
 
-	// ワーカーゴルーチン起動
-	for i := 0; i < poolConfig.MaxWorkers; i++ {
-		manager.wg.Add(1)
-		go manager.worker()
-	}
-
+	// 並行数は workerPool（セマフォ）で各タスクが制御するので、常駐ワーカーは置かない
 	return manager
 }
 
-// worker ワーカーゴルーチン
-func (cm *ConcurrentDBManager) worker() {
-	defer cm.wg.Done()
+// adapterFor 停止済みなら ErrManagerClosed、未登録ならエラーを返す
+func (cm *ConcurrentDBManager) adapterFor(dbType string) (adapters.DBAdapter, error) {
+	cm.mutex.RLock()
+	defer cm.mutex.RUnlock()
 
-	for {
-		select {
-		case <-cm.ctx.Done():
-			return
-		default:
-			// ワーカープールから許可取得を試行
-			select {
-			case cm.workerPool <- struct{}{}:
-				// タスクを処理（実際のタスクキューからの取得は簡略化）
-				<-cm.workerPool // 処理完了後に許可を返却
-			case <-cm.ctx.Done():
-				return
-			}
-		}
+	if cm.ctx.Err() != nil {
+		return nil, ErrManagerClosed
 	}
+	adapter, exists := cm.adapters[dbType]
+	if !exists {
+		return nil, fmt.Errorf("データベースアダプターが見つかりません: %s", dbType)
+	}
+	return adapter, nil
 }
 
 // RegisterDatabase データベース登録
 func (cm *ConcurrentDBManager) RegisterDatabase(dbType string, cfg config.DatabaseConfig) error {
 	cm.mutex.Lock()
 	defer cm.mutex.Unlock()
+
+	if cm.ctx.Err() != nil {
+		return ErrManagerClosed
+	}
 
 	adapter, err := cm.registry.Create(dbType)
 	if err != nil {
@@ -151,7 +149,7 @@ func (cm *ConcurrentDBManager) RegisterDatabase(dbType string, cfg config.Databa
 }
 
 // ExecuteQuery 並行クエリ実行
-func (cm *ConcurrentDBManager) ExecuteQuery(ctx context.Context, dbType, query string, args ...interface{}) <-chan *TaskResult {
+func (cm *ConcurrentDBManager) ExecuteQuery(ctx context.Context, dbType, query string, args ...any) <-chan *TaskResult {
 	taskID := fmt.Sprintf("%s_%d", dbType, time.Now().UnixNano())
 	resultChan := make(chan *TaskResult, 1)
 
@@ -170,7 +168,8 @@ func (cm *ConcurrentDBManager) ExecuteQuery(ctx context.Context, dbType, query s
 }
 
 // ExecuteTransaction トランザクション実行
-func (cm *ConcurrentDBManager) ExecuteTransaction(ctx context.Context, dbType string, fn func(adapters.DBAdapter) error) <-chan *TaskResult {
+// fnにはアダプターが開始した*sql.Txを渡す。fnの中の操作は、すべてこのtxを通して行うこと。
+func (cm *ConcurrentDBManager) ExecuteTransaction(ctx context.Context, dbType string, fn func(*sql.Tx) error) <-chan *TaskResult {
 	taskID := fmt.Sprintf("tx_%s_%d", dbType, time.Now().UnixNano())
 	resultChan := make(chan *TaskResult, 1)
 
@@ -194,15 +193,12 @@ func (cm *ConcurrentDBManager) ExecuteTransaction(ctx context.Context, dbType st
 			return
 		}
 
-		cm.mutex.RLock()
-		adapter, exists := cm.adapters[dbType]
-		cm.mutex.RUnlock()
-
-		if !exists {
+		adapter, err := cm.adapterFor(dbType)
+		if err != nil {
 			resultChan <- &TaskResult{
 				TaskID:    taskID,
 				DBType:    dbType,
-				Error:     fmt.Errorf("データベースアダプターが見つかりません: %s", dbType),
+				Error:     err,
 				Elapsed:   time.Since(start),
 				Timestamp: time.Now(),
 				Operation: "transaction",
@@ -211,9 +207,7 @@ func (cm *ConcurrentDBManager) ExecuteTransaction(ctx context.Context, dbType st
 		}
 
 		// トランザクション実行
-		err := adapter.Transaction(ctx, func(tx *sql.Tx) error {
-			return fn(adapter)
-		})
+		err = adapter.Transaction(ctx, fn)
 
 		result := &TaskResult{
 			TaskID:    taskID,
@@ -235,8 +229,8 @@ func (cm *ConcurrentDBManager) ExecuteTransaction(ctx context.Context, dbType st
 func (cm *ConcurrentDBManager) processTask(task *DatabaseTask) {
 	defer close(task.ResultChan)
 	start := time.Now()
-	atomic.AddInt64(&cm.metrics.ActiveTasks, 1)
-	defer atomic.AddInt64(&cm.metrics.ActiveTasks, -1)
+	cm.metrics.ActiveTasks.Add(1)
+	defer cm.metrics.ActiveTasks.Add(-1)
 
 	// ワーカープールから許可取得
 	select {
@@ -254,15 +248,12 @@ func (cm *ConcurrentDBManager) processTask(task *DatabaseTask) {
 		return
 	}
 
-	cm.mutex.RLock()
-	adapter, exists := cm.adapters[task.DBType]
-	cm.mutex.RUnlock()
-
-	if !exists {
+	adapter, err := cm.adapterFor(task.DBType)
+	if err != nil {
 		result := &TaskResult{
 			TaskID:    task.ID,
 			DBType:    task.DBType,
-			Error:     fmt.Errorf("データベースアダプターが見つかりません: %s", task.DBType),
+			Error:     err,
 			Elapsed:   time.Since(start),
 			Timestamp: time.Now(),
 			Operation: task.Operation,
@@ -290,13 +281,13 @@ func (cm *ConcurrentDBManager) processTask(task *DatabaseTask) {
 }
 
 // executeWithRetry 再試行機能付き実行
-func (cm *ConcurrentDBManager) executeWithRetry(ctx context.Context, adapter adapters.DBAdapter, query string, args ...interface{}) *TaskResult {
+func (cm *ConcurrentDBManager) executeWithRetry(ctx context.Context, adapter adapters.DBAdapter, query string, args ...any) *TaskResult {
 	var lastErr error
 	maxRetries := 3
 	baseDelay := 100 * time.Millisecond
 	start := time.Now()
 
-	for attempt := 0; attempt <= maxRetries; attempt++ {
+	for attempt := range maxRetries + 1 {
 		if attempt > 0 {
 			// 指数バックオフ
 			delay := time.Duration(attempt) * baseDelay
@@ -356,13 +347,9 @@ func (cm *ConcurrentDBManager) isUnrecoverableError(err error) bool {
 		"invalid argument",
 	}
 
-	for _, keyword := range unrecoverableKeywords {
-		if strings.Contains(errorStr, keyword) {
-			return true
-		}
-	}
-
-	return false
+	return slices.ContainsFunc(unrecoverableKeywords, func(keyword string) bool {
+		return strings.Contains(errorStr, keyword)
+	})
 }
 
 // ExecuteParallelQueries 並列クエリ実行
@@ -418,15 +405,12 @@ func (cm *ConcurrentDBManager) ExecuteBulkOperation(ctx context.Context, dbType 
 			return
 		}
 
-		cm.mutex.RLock()
-		adapter, exists := cm.adapters[dbType]
-		cm.mutex.RUnlock()
-
-		if !exists {
+		adapter, err := cm.adapterFor(dbType)
+		if err != nil {
 			resultChan <- &TaskResult{
 				TaskID:    taskID,
 				DBType:    dbType,
-				Error:     fmt.Errorf("データベースアダプターが見つかりません: %s", dbType),
+				Error:     err,
 				Elapsed:   time.Since(start),
 				Timestamp: time.Now(),
 				Operation: "bulk_insert",
@@ -435,7 +419,7 @@ func (cm *ConcurrentDBManager) ExecuteBulkOperation(ctx context.Context, dbType 
 		}
 
 		// バルク挿入実行
-		err := adapter.BulkInsertUsers(ctx, users)
+		err = adapter.BulkInsertUsers(ctx, users)
 
 		result := &TaskResult{
 			TaskID:    taskID,
@@ -455,32 +439,24 @@ func (cm *ConcurrentDBManager) ExecuteBulkOperation(ctx context.Context, dbType 
 
 // updateMetrics メトリクス更新
 func (cm *ConcurrentDBManager) updateMetrics(result *TaskResult) {
-	cm.metrics.mutex.Lock()
-	defer cm.metrics.mutex.Unlock()
+	m := cm.metrics
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
 
-	atomic.AddInt64(&cm.metrics.TotalTasks, 1)
-
+	m.TotalTasks++
 	if result.Error != nil {
-		atomic.AddInt64(&cm.metrics.FailedTasks, 1)
+		m.FailedTasks++
 	} else {
-		atomic.AddInt64(&cm.metrics.SuccessTasks, 1)
+		m.SuccessTasks++
 	}
 
 	if result.Elapsed > 0 {
-		// 最大レイテンシー更新
-		if result.Elapsed > cm.metrics.MaxLatency {
-			cm.metrics.MaxLatency = result.Elapsed
-		}
-
-		// 最小レイテンシー更新
-		if result.Elapsed < cm.metrics.MinLatency {
-			cm.metrics.MinLatency = result.Elapsed
-		}
+		m.MaxLatency = max(m.MaxLatency, result.Elapsed)
+		m.MinLatency = min(m.MinLatency, result.Elapsed)
 
 		// 移動平均計算
-		totalTasks := atomic.LoadInt64(&cm.metrics.TotalTasks)
-		totalLatency := cm.metrics.AverageLatency * time.Duration(totalTasks-1)
-		cm.metrics.AverageLatency = (totalLatency + result.Elapsed) / time.Duration(totalTasks)
+		totalLatency := m.AverageLatency * time.Duration(m.TotalTasks-1)
+		m.AverageLatency = (totalLatency + result.Elapsed) / time.Duration(m.TotalTasks)
 	}
 }
 
@@ -501,13 +477,13 @@ func (cm *ConcurrentDBManager) GetMetrics() MetricsResponse {
 	defer cm.metrics.mutex.RUnlock()
 
 	return MetricsResponse{
-		TotalTasks:     atomic.LoadInt64(&cm.metrics.TotalTasks),
-		SuccessTasks:   atomic.LoadInt64(&cm.metrics.SuccessTasks),
-		FailedTasks:    atomic.LoadInt64(&cm.metrics.FailedTasks),
+		TotalTasks:     cm.metrics.TotalTasks,
+		SuccessTasks:   cm.metrics.SuccessTasks,
+		FailedTasks:    cm.metrics.FailedTasks,
 		AverageLatency: cm.metrics.AverageLatency,
 		MaxLatency:     cm.metrics.MaxLatency,
 		MinLatency:     cm.metrics.MinLatency,
-		ActiveTasks:    atomic.LoadInt64(&cm.metrics.ActiveTasks),
+		ActiveTasks:    cm.metrics.ActiveTasks.Load(),
 	}
 }
 
@@ -517,16 +493,19 @@ func (cm *ConcurrentDBManager) HealthCheck(ctx context.Context) map[string]error
 	defer cm.mutex.RUnlock()
 
 	results := make(map[string]error)
+	var resultsMu sync.Mutex
 	var wg sync.WaitGroup
 
 	for dbType, adapter := range cm.adapters {
-		wg.Add(1)
-		go func(dbType string, adapter adapters.DBAdapter) {
-			defer wg.Done()
+		wg.Go(func() {
 			ctxTimeout, cancel := context.WithTimeout(ctx, 5*time.Second)
 			defer cancel()
-			results[dbType] = adapter.Ping(ctxTimeout)
-		}(dbType, adapter)
+			err := adapter.Ping(ctxTimeout)
+
+			resultsMu.Lock()
+			results[dbType] = err
+			resultsMu.Unlock()
+		})
 	}
 
 	wg.Wait()
@@ -563,12 +542,8 @@ func (cm *ConcurrentDBManager) GetRegisteredDatabases() []string {
 	cm.mutex.RLock()
 	defer cm.mutex.RUnlock()
 
-	var databases []string
-	for dbType := range cm.adapters {
-		databases = append(databases, dbType)
-	}
-
-	return databases
+	// 呼び出し側が先頭を既定の DB に選ぶので、マップの順序に左右されないよう並べて返す
+	return slices.Sorted(maps.Keys(cm.adapters))
 }
 
 // CreateUser ユーザー作成（アダプター固有メソッド使用）
@@ -581,20 +556,18 @@ func (cm *ConcurrentDBManager) CreateUser(ctx context.Context, dbType string, us
 		start := time.Now()
 		taskID := fmt.Sprintf("createuser_%s_%d", dbType, time.Now().UnixNano())
 
-		cm.mutex.RLock()
-		adapter, exists := cm.adapters[dbType]
-		cm.mutex.RUnlock()
-
-		if !exists {
-			atomic.AddInt64(&cm.metrics.FailedTasks, 1)
-			resultChan <- &TaskResult{
+		adapter, err := cm.adapterFor(dbType)
+		if err != nil {
+			result := &TaskResult{
 				TaskID:    taskID,
 				DBType:    dbType,
-				Error:     fmt.Errorf("データベースアダプターが見つかりません: %s", dbType),
+				Error:     err,
 				Elapsed:   time.Since(start),
 				Timestamp: time.Now(),
 				Operation: "CreateUser",
 			}
+			cm.updateMetrics(result)
+			resultChan <- result
 			return
 		}
 
@@ -602,11 +575,8 @@ func (cm *ConcurrentDBManager) CreateUser(ctx context.Context, dbType string, us
 		createdUser, err := adapter.CreateUser(ctx, user)
 		elapsed := time.Since(start)
 
-		atomic.AddInt64(&cm.metrics.TotalTasks, 1)
-
 		var result *TaskResult
 		if err != nil {
-			atomic.AddInt64(&cm.metrics.FailedTasks, 1)
 			result = &TaskResult{
 				TaskID:    taskID,
 				DBType:    dbType,
@@ -616,10 +586,8 @@ func (cm *ConcurrentDBManager) CreateUser(ctx context.Context, dbType string, us
 				Operation: "CreateUser",
 			}
 		} else {
-			atomic.AddInt64(&cm.metrics.SuccessTasks, 1)
-			
 			// ユーザー情報をマップ形式に変換
-			userData := map[string]interface{}{
+			userData := map[string]any{
 				"id":         createdUser.ID,
 				"name":       createdUser.Name,
 				"email":      createdUser.Email,
@@ -631,7 +599,7 @@ func (cm *ConcurrentDBManager) CreateUser(ctx context.Context, dbType string, us
 			result = &TaskResult{
 				TaskID:    taskID,
 				DBType:    dbType,
-				Data:      []map[string]interface{}{userData},
+				Data:      []map[string]any{userData},
 				Elapsed:   elapsed,
 				Timestamp: time.Now(),
 				Operation: "CreateUser",
@@ -657,25 +625,21 @@ func (cm *ConcurrentDBManager) GetUsersByAgeRange(ctx context.Context, dbType st
 		start := time.Now()
 		taskID := fmt.Sprintf("searchusers_%s_%d", dbType, time.Now().UnixNano())
 
-		cm.mutex.RLock()
-		adapter, exists := cm.adapters[dbType]
-		cm.mutex.RUnlock()
-
-		if !exists {
-			atomic.AddInt64(&cm.metrics.FailedTasks, 1)
-			resultChan <- &TaskResult{
-				TaskID:    taskID,
-				DBType:    dbType,
-				Error:     fmt.Errorf("データベースアダプターが見つかりません: %s", dbType),
-				Elapsed:   time.Since(start),
+		adapter, err := cm.adapterFor(dbType)
+		if err != nil {
+			result := &TaskResult{
+				TaskID:  taskID,
+				DBType:  dbType,
+				Error:   err,
+				Elapsed: time.Since(start),
 			}
+			cm.updateMetrics(result)
+			resultChan <- result
 			return
 		}
 
 		// アダプター固有のGetUsersByAgeRangeメソッドを呼び出し
-		users, err := adapter.(interface {
-			GetUsersByAgeRange(context.Context, int, int) ([]*models.User, error)
-		}).GetUsersByAgeRange(ctx, minAge, maxAge)
+		users, err := adapter.GetUsersByAgeRange(ctx, minAge, maxAge)
 
 		result := &TaskResult{
 			TaskID:  taskID,
@@ -685,22 +649,8 @@ func (cm *ConcurrentDBManager) GetUsersByAgeRange(ctx context.Context, dbType st
 
 		if err != nil {
 			result.Error = err
-			atomic.AddInt64(&cm.metrics.FailedTasks, 1)
 		} else {
-			// ユーザーデータをmap形式に変換
-			data := make([]map[string]interface{}, len(users))
-			for i, user := range users {
-				data[i] = map[string]interface{}{
-					"id":         user.ID,
-					"name":       user.Name,
-					"email":      user.Email,
-					"age":        user.Age,
-					"created_at": user.CreatedAt.Format("2006-01-02T15:04:05Z"),
-					"updated_at": user.UpdatedAt.Format("2006-01-02T15:04:05Z"),
-				}
-			}
-			result.Data = data
-			atomic.AddInt64(&cm.metrics.SuccessTasks, 1)
+			result.Users = users
 		}
 
 		// メトリクス更新
@@ -714,21 +664,21 @@ func (cm *ConcurrentDBManager) GetUsersByAgeRange(ctx context.Context, dbType st
 
 // Close リソース解放
 func (cm *ConcurrentDBManager) Close() error {
-	cm.cancel()
-	cm.wg.Wait()
-
+	// adapterFor と同じロックの中で停止を記録するので、Close 後の投入は必ず ErrManagerClosed になる
 	cm.mutex.Lock()
 	defer cm.mutex.Unlock()
+	cm.cancel()
 
-	var errors []error
+	var errs []error
 	for dbType, adapter := range cm.adapters {
 		if err := adapter.Close(); err != nil {
-			errors = append(errors, fmt.Errorf("%s: %w", dbType, err))
+			errs = append(errs, fmt.Errorf("%s: %w", dbType, err))
 		}
 	}
+	clear(cm.adapters)
 
-	if len(errors) > 0 {
-		return fmt.Errorf("データベース終了エラー: %v", errors)
+	if err := errors.Join(errs...); err != nil {
+		return fmt.Errorf("データベース終了エラー: %w", err)
 	}
 
 	return nil

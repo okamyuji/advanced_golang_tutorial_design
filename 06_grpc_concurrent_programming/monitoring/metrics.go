@@ -2,6 +2,7 @@ package monitoring
 
 import (
 	"context"
+	"log"
 	"net/http"
 	"strconv"
 	"time"
@@ -96,7 +97,7 @@ func InitMetrics() {
 
 // MetricsInterceptor Prometheusメトリクス収集用のインターセプターを提供します
 func MetricsInterceptor() grpc.UnaryServerInterceptor {
-	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 		startTime := time.Now()
 		method := info.FullMethod
 
@@ -132,7 +133,7 @@ func MetricsInterceptor() grpc.UnaryServerInterceptor {
 
 // StreamMetricsInterceptor ストリーミングRPC用のメトリクス収集インターセプターを提供します
 func StreamMetricsInterceptor() grpc.StreamServerInterceptor {
-	return func(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+	return func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
 		startTime := time.Now()
 		method := info.FullMethod
 
@@ -189,22 +190,27 @@ func RecordResponseSize(method string, size int) {
 
 // StartMetricsServer Prometheusメトリクス用のHTTPサーバーを起動します
 func StartMetricsServer(port int) error {
-	http.Handle("/metrics", promhttp.Handler())
-	
-	// ヘルスチェックエンドポイント
-	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
-	})
-
 	address := ":" + strconv.Itoa(port)
-	return http.ListenAndServe(address, nil)
+	return http.ListenAndServe(address, newMux())
+}
+
+// newMux メトリクスとヘルスチェックのハンドラーを登録したServeMuxを作ります
+func newMux() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.Handle("GET /metrics", promhttp.Handler())
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		if _, err := w.Write([]byte("OK")); err != nil {
+			log.Printf("ヘルスチェック応答の書き込みエラー: %v", err)
+		}
+	})
+	return mux
 }
 
 // GetMetricsSummary 現在のメトリクス概要を取得します
-func GetMetricsSummary() map[string]interface{} {
+func GetMetricsSummary() map[string]any {
 	// Prometheusから現在の値を取得（実際の実装では、各メトリクスの値を収集）
-	summary := map[string]interface{}{
+	summary := map[string]any{
 		"active_connections": getGaugeValue(activeConnections),
 		"total_requests":     getCounterVecValue(requestsTotal),
 		"error_rate":         getCounterVecValue(errorRate),

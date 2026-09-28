@@ -6,9 +6,11 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net/http"
 	"net/url"
 	"strings"
@@ -48,17 +50,17 @@ type AuthProvider interface {
 
 // AuthResult 認証結果
 type AuthResult struct {
-	Success      bool                   `json:"success"`
-	UserID       string                 `json:"user_id"`
-	Username     string                 `json:"username"`
-	Email        string                 `json:"email"`
-	Roles        []string               `json:"roles"`
-	Claims       map[string]interface{} `json:"claims,omitempty"`
-	Provider     string                 `json:"provider"`
-	ExpiresAt    time.Time              `json:"expires_at"`
-	IssuedAt     time.Time              `json:"issued_at"`
-	TokenHash    string                 `json:"token_hash"`
-	ResponseTime time.Duration          `json:"response_time"`
+	Success      bool           `json:"success"`
+	UserID       string         `json:"user_id"`
+	Username     string         `json:"username"`
+	Email        string         `json:"email"`
+	Roles        []string       `json:"roles"`
+	Claims       map[string]any `json:"claims,omitempty"`
+	Provider     string         `json:"provider"`
+	ExpiresAt    time.Time      `json:"expires_at"`
+	IssuedAt     time.Time      `json:"issued_at"`
+	TokenHash    string         `json:"token_hash"`
+	ResponseTime time.Duration  `json:"response_time"`
 }
 
 // ProviderInfo プロバイダー情報
@@ -78,39 +80,71 @@ type AuthCache struct {
 	cache     map[string]*CacheEntry
 	mu        sync.RWMutex
 	maxSize   int
-	evictions int64
+	evictions atomic.Int64
 }
 
-// CacheEntry キャッシュエントリ
+// CacheEntry キャッシュエントリです。AccessCount/lastAccessは、cache.muのRLock下でも
+// 複数goroutineから同時に更新されるため型付きatomicで保持します。
 type CacheEntry struct {
 	Result      *AuthResult
 	ExpiresAt   time.Time
-	AccessCount int64
-	LastAccess  time.Time
+	AccessCount atomic.Int64
+	lastAccess  atomic.Int64 // UnixNano
+}
+
+// LastAccess 最終アクセス時刻を返します
+func (e *CacheEntry) LastAccess() time.Time {
+	return time.Unix(0, e.lastAccess.Load())
+}
+
+// touch アクセス回数と最終アクセス時刻を更新します
+func (e *CacheEntry) touch() {
+	e.AccessCount.Add(1)
+	e.lastAccess.Store(time.Now().UnixNano())
 }
 
 // AuthMetrics 認証メトリクス
 type AuthMetrics struct {
-	totalRequests   int64
-	successfulAuth  int64
-	failedAuth      int64
-	cacheHits       int64
-	cacheMisses     int64
-	parallelAuth    int64
+	totalRequests   atomic.Int64
+	successfulAuth  atomic.Int64
+	failedAuth      atomic.Int64
+	cacheHits       atomic.Int64
+	cacheMisses     atomic.Int64
+	parallelAuth    atomic.Int64
 	providerStats   map[string]*ProviderStats
-	avgResponseTime int64
+	avgResponseTime atomic.Int64
 	mu              sync.RWMutex
 }
 
 // ProviderStats プロバイダー統計
 type ProviderStats struct {
-	totalRequests int64
-	successCount  int64
-	errorCount    int64
-	totalLatency  int64
-	timeoutCount  int64
+	totalRequests atomic.Int64
+	successCount  atomic.Int64
+	errorCount    atomic.Int64
+	totalLatency  atomic.Int64
+	timeoutCount  atomic.Int64
 	lastError     string
 	lastErrorTime time.Time
+}
+
+// record 1回の認証の所要時間と成否を記録する
+func (s *ProviderStats) record(start time.Time, err error) {
+	s.totalRequests.Add(1)
+	s.totalLatency.Add(time.Since(start).Nanoseconds())
+	if err != nil {
+		s.errorCount.Add(1)
+		return
+	}
+	s.successCount.Add(1)
+}
+
+// avgLatency 記録した認証の平均所要時間を返す
+func (s *ProviderStats) avgLatency() time.Duration {
+	n := s.totalRequests.Load()
+	if n == 0 {
+		return 0
+	}
+	return time.Duration(s.totalLatency.Load() / n)
 }
 
 // ParallelAuthResult 並列認証結果
@@ -176,17 +210,17 @@ type JWTHeader struct {
 
 // JWTPayload JWTペイロード
 type JWTPayload struct {
-	Issuer    string                 `json:"iss,omitempty"`
-	Subject   string                 `json:"sub,omitempty"`
-	Audience  string                 `json:"aud,omitempty"`
-	ExpiresAt int64                  `json:"exp,omitempty"`
-	NotBefore int64                  `json:"nbf,omitempty"`
-	IssuedAt  int64                  `json:"iat,omitempty"`
-	JWTID     string                 `json:"jti,omitempty"`
-	Username  string                 `json:"username,omitempty"`
-	Email     string                 `json:"email,omitempty"`
-	Roles     []string               `json:"roles,omitempty"`
-	Custom    map[string]interface{} `json:",inline"`
+	Issuer    string         `json:"iss,omitempty"`
+	Subject   string         `json:"sub,omitempty"`
+	Audience  string         `json:"aud,omitempty"`
+	ExpiresAt int64          `json:"exp,omitempty"`
+	NotBefore int64          `json:"nbf,omitempty"`
+	IssuedAt  int64          `json:"iat,omitempty"`
+	JWTID     string         `json:"jti,omitempty"`
+	Username  string         `json:"username,omitempty"`
+	Email     string         `json:"email,omitempty"`
+	Roles     []string       `json:"roles,omitempty"`
+	Custom    map[string]any `json:"-"` // 標準クレーム以外。Authenticateで別に取り出す
 }
 
 // NewMultiAuthSystem 新しい複数認証システムを作成
@@ -220,35 +254,35 @@ func (mas *MultiAuthSystem) AuthenticateParallel(ctx context.Context, token stri
 	start := time.Now()
 	defer func() {
 		duration := time.Since(start)
-		atomic.AddInt64(&mas.metrics.avgResponseTime, duration.Nanoseconds())
-		atomic.AddInt64(&mas.metrics.totalRequests, 1)
-		atomic.AddInt64(&mas.metrics.parallelAuth, 1)
+		mas.metrics.avgResponseTime.Add(duration.Nanoseconds())
+		mas.metrics.totalRequests.Add(1)
+		mas.metrics.parallelAuth.Add(1)
 	}()
 
 	// キャッシュチェック
 	if result := mas.checkCache(token); result != nil {
-		atomic.AddInt64(&mas.metrics.cacheHits, 1)
+		mas.metrics.cacheHits.Add(1)
 		return result, nil
 	}
-	atomic.AddInt64(&mas.metrics.cacheMisses, 1)
+	mas.metrics.cacheMisses.Add(1)
 
 	// 並列認証実行
 	results, err := mas.executeParallelAuth(ctx, token)
 	if err != nil {
-		atomic.AddInt64(&mas.metrics.failedAuth, 1)
+		mas.metrics.failedAuth.Add(1)
 		return nil, err
 	}
 
 	// 最適な結果を選択
 	selectedResult := mas.selectBestResult(results)
 	if selectedResult == nil {
-		atomic.AddInt64(&mas.metrics.failedAuth, 1)
+		mas.metrics.failedAuth.Add(1)
 		return nil, fmt.Errorf("all authentication providers failed")
 	}
 
 	// キャッシュに保存
 	mas.cacheResult(token, selectedResult)
-	atomic.AddInt64(&mas.metrics.successfulAuth, 1)
+	mas.metrics.successfulAuth.Add(1)
 
 	return selectedResult, nil
 }
@@ -270,11 +304,9 @@ func (mas *MultiAuthSystem) executeParallelAuth(ctx context.Context, token strin
 	var wg sync.WaitGroup
 
 	for _, providerName := range enabledProviders {
-		wg.Add(1)
-		go func(name string) {
-			defer wg.Done()
-			mas.authenticateWithProvider(authCtx, name, token, resultChan)
-		}(providerName)
+		wg.Go(func() {
+			mas.authenticateWithProvider(authCtx, providerName, token, resultChan)
+		})
 	}
 
 	// 結果収集
@@ -314,7 +346,7 @@ func (mas *MultiAuthSystem) authenticateWithProvider(ctx context.Context, provid
 	duration := time.Since(start)
 
 	// タイムアウトチェック
-	timedOut := err != nil && ctx.Err() == context.DeadlineExceeded
+	timedOut := err != nil && errors.Is(ctx.Err(), context.DeadlineExceeded)
 
 	if result != nil {
 		result.Provider = providerName
@@ -408,19 +440,19 @@ func (mas *MultiAuthSystem) updateProviderStats(result *ParallelAuthResult) {
 		mas.metrics.providerStats[result.Provider] = stats
 	}
 
-	atomic.AddInt64(&stats.totalRequests, 1)
-	atomic.AddInt64(&stats.totalLatency, result.Duration.Nanoseconds())
+	stats.totalRequests.Add(1)
+	stats.totalLatency.Add(result.Duration.Nanoseconds())
 
 	if result.TimedOut {
-		atomic.AddInt64(&stats.timeoutCount, 1)
+		stats.timeoutCount.Add(1)
 	}
 
 	if result.Error != nil {
-		atomic.AddInt64(&stats.errorCount, 1)
+		stats.errorCount.Add(1)
 		stats.lastError = result.Error.Error()
 		stats.lastErrorTime = time.Now()
 	} else if result.Result != nil && result.Result.Success {
-		atomic.AddInt64(&stats.successCount, 1)
+		stats.successCount.Add(1)
 	}
 }
 
@@ -443,8 +475,7 @@ func (mas *MultiAuthSystem) checkCache(token string) *AuthResult {
 	}
 
 	// アクセス情報更新
-	atomic.AddInt64(&entry.AccessCount, 1)
-	entry.LastAccess = time.Now()
+	entry.touch()
 
 	return entry.Result
 }
@@ -464,11 +495,11 @@ func (mas *MultiAuthSystem) cacheResult(token string, result *AuthResult) {
 	}
 
 	entry := &CacheEntry{
-		Result:      result,
-		ExpiresAt:   expiresAt,
-		AccessCount: 1,
-		LastAccess:  time.Now(),
+		Result:    result,
+		ExpiresAt: expiresAt,
 	}
+	entry.AccessCount.Store(1)
+	entry.lastAccess.Store(time.Now().UnixNano())
 
 	mas.cache.mu.Lock()
 	defer mas.cache.mu.Unlock()
@@ -487,15 +518,15 @@ func (mas *MultiAuthSystem) evictLeastRecentlyUsed() {
 	var oldestTime = time.Now()
 
 	for key, entry := range mas.cache.cache {
-		if entry.LastAccess.Before(oldestTime) {
-			oldestTime = entry.LastAccess
+		if entry.LastAccess().Before(oldestTime) {
+			oldestTime = entry.LastAccess()
 			oldestKey = key
 		}
 	}
 
 	if oldestKey != "" {
 		delete(mas.cache.cache, oldestKey)
-		atomic.AddInt64(&mas.cache.evictions, 1)
+		mas.cache.evictions.Add(1)
 	}
 }
 
@@ -505,7 +536,7 @@ func (mas *MultiAuthSystem) evictCacheEntry(tokenHash string) {
 	defer mas.cache.mu.Unlock()
 
 	delete(mas.cache.cache, tokenHash)
-	atomic.AddInt64(&mas.cache.evictions, 1)
+	mas.cache.evictions.Add(1)
 }
 
 // hashToken トークンのハッシュを計算
@@ -531,13 +562,9 @@ func NewOAuth2Provider(name, clientID, clientSecret, endpoint string, timeout ti
 }
 
 // Authenticate OAuth2認証を実行
-func (o *OAuth2Provider) Authenticate(ctx context.Context, token string) (*AuthResult, error) {
+func (o *OAuth2Provider) Authenticate(ctx context.Context, token string) (_ *AuthResult, err error) {
 	start := time.Now()
-	defer func() {
-		o.mu.Lock()
-		o.stats.totalLatency = time.Since(start).Nanoseconds()
-		o.mu.Unlock()
-	}()
+	defer func() { o.stats.record(start, err) }()
 
 	// OAuth2トークン形式チェック
 	if !strings.HasPrefix(token, "oauth2_") {
@@ -554,7 +581,7 @@ func (o *OAuth2Provider) Authenticate(ctx context.Context, token string) (*AuthR
 	data.Set("client_id", o.clientID)
 	data.Set("client_secret", o.clientSecret)
 
-	req, err := http.NewRequestWithContext(reqCtx, "POST", o.endpoint+"/oauth/token/info", strings.NewReader(data.Encode()))
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, o.endpoint+"/oauth/token/info", strings.NewReader(data.Encode()))
 	if err != nil {
 		return &AuthResult{Success: false}, err
 	}
@@ -595,7 +622,7 @@ func (o *OAuth2Provider) GetProviderInfo() *ProviderInfo {
 		Endpoint:    o.endpoint,
 		IsHealthy:   true,
 		LastCheck:   time.Now(),
-		AvgLatency:  time.Duration(o.stats.totalLatency),
+		AvgLatency:  o.stats.avgLatency(),
 		SuccessRate: o.calculateSuccessRate(),
 	}
 }
@@ -608,11 +635,11 @@ func (o *OAuth2Provider) HealthCheck(ctx context.Context) error {
 
 // calculateSuccessRate 成功率を計算
 func (o *OAuth2Provider) calculateSuccessRate() float64 {
-	total := atomic.LoadInt64(&o.stats.totalRequests)
+	total := o.stats.totalRequests.Load()
 	if total == 0 {
 		return 100.0
 	}
-	success := atomic.LoadInt64(&o.stats.successCount)
+	success := o.stats.successCount.Load()
 	return float64(success) / float64(total) * 100.0
 }
 
@@ -636,13 +663,9 @@ func NewJWTProvider(name string, secretKey []byte, issuer, audience string, time
 }
 
 // Authenticate JWT認証を実行（標準ライブラリのみ）
-func (j *JWTProvider) Authenticate(ctx context.Context, tokenString string) (*AuthResult, error) {
+func (j *JWTProvider) Authenticate(ctx context.Context, tokenString string) (_ *AuthResult, err error) {
 	start := time.Now()
-	defer func() {
-		j.mu.Lock()
-		j.stats.totalLatency = time.Since(start).Nanoseconds()
-		j.mu.Unlock()
-	}()
+	defer func() { j.stats.record(start, err) }()
 
 	// JWT形式チェック
 	parts := strings.Split(tokenString, ".")
@@ -653,12 +676,12 @@ func (j *JWTProvider) Authenticate(ctx context.Context, tokenString string) (*Au
 	// ヘッダーデコード
 	headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
 	if err != nil {
-		return &AuthResult{Success: false}, fmt.Errorf("invalid header encoding: %v", err)
+		return &AuthResult{Success: false}, fmt.Errorf("invalid header encoding: %w", err)
 	}
 
 	var header JWTHeader
 	if err := json.Unmarshal(headerBytes, &header); err != nil {
-		return &AuthResult{Success: false}, fmt.Errorf("invalid header JSON: %v", err)
+		return &AuthResult{Success: false}, fmt.Errorf("invalid header JSON: %w", err)
 	}
 
 	// アルゴリズムチェック
@@ -669,19 +692,25 @@ func (j *JWTProvider) Authenticate(ctx context.Context, tokenString string) (*Au
 	// ペイロードデコード
 	payloadBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
-		return &AuthResult{Success: false}, fmt.Errorf("invalid payload encoding: %v", err)
+		return &AuthResult{Success: false}, fmt.Errorf("invalid payload encoding: %w", err)
 	}
 
 	var payload JWTPayload
 	if err := json.Unmarshal(payloadBytes, &payload); err != nil {
-		return &AuthResult{Success: false}, fmt.Errorf("invalid payload JSON: %v", err)
+		return &AuthResult{Success: false}, fmt.Errorf("invalid payload JSON: %w", err)
+	}
+	if err := json.Unmarshal(payloadBytes, &payload.Custom); err != nil {
+		return &AuthResult{Success: false}, fmt.Errorf("invalid payload JSON: %w", err)
+	}
+	for _, k := range []string{"iss", "sub", "aud", "exp", "nbf", "iat", "jti", "username", "email", "roles"} {
+		delete(payload.Custom, k)
 	}
 
 	// 署名検証
 	expectedSignature := j.generateSignature(parts[0] + "." + parts[1])
 	actualSignature, err := base64.RawURLEncoding.DecodeString(parts[2])
 	if err != nil {
-		return &AuthResult{Success: false}, fmt.Errorf("invalid signature encoding: %v", err)
+		return &AuthResult{Success: false}, fmt.Errorf("invalid signature encoding: %w", err)
 	}
 
 	if !hmac.Equal(expectedSignature, actualSignature) {
@@ -723,14 +752,12 @@ func (j *JWTProvider) Authenticate(ctx context.Context, tokenString string) (*Au
 		ExpiresAt: expiresAt,
 		IssuedAt:  time.Unix(payload.IssuedAt, 0),
 		TokenHash: j.hashToken(tokenString),
-		Claims:    make(map[string]interface{}),
+		Claims:    make(map[string]any),
 	}
 
 	// カスタムクレームを追加
 	if payload.Custom != nil {
-		for k, v := range payload.Custom {
-			result.Claims[k] = v
-		}
+		maps.Copy(result.Claims, payload.Custom)
 	}
 
 	return result, nil
@@ -755,7 +782,7 @@ func (j *JWTProvider) GetProviderInfo() *ProviderInfo {
 		Endpoint:    j.issuer,
 		IsHealthy:   true,
 		LastCheck:   time.Now(),
-		AvgLatency:  time.Duration(j.stats.totalLatency),
+		AvgLatency:  j.stats.avgLatency(),
 		SuccessRate: j.calculateSuccessRate(),
 	}
 }
@@ -767,11 +794,11 @@ func (j *JWTProvider) HealthCheck(ctx context.Context) error {
 
 // calculateSuccessRate 成功率を計算
 func (j *JWTProvider) calculateSuccessRate() float64 {
-	total := atomic.LoadInt64(&j.stats.totalRequests)
+	total := j.stats.totalRequests.Load()
 	if total == 0 {
 		return 100.0
 	}
-	success := atomic.LoadInt64(&j.stats.successCount)
+	success := j.stats.successCount.Load()
 	return float64(success) / float64(total) * 100.0
 }
 
@@ -796,6 +823,9 @@ func NewAPIKeyProvider(name, headerName, keyPrefix string, timeout time.Duration
 
 // AddAPIKey APIキーを追加
 func (a *APIKeyProvider) AddAPIKey(keyID, userID, username, email string, roles []string, expiresAt time.Time) {
+	// Authenticateはtokenのプレフィックスを除いてから引くので、保存側でも除く
+	keyID = strings.TrimPrefix(keyID, a.keyPrefix)
+
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -812,13 +842,9 @@ func (a *APIKeyProvider) AddAPIKey(keyID, userID, username, email string, roles 
 }
 
 // Authenticate APIキー認証を実行
-func (a *APIKeyProvider) Authenticate(ctx context.Context, token string) (*AuthResult, error) {
+func (a *APIKeyProvider) Authenticate(ctx context.Context, token string) (_ *AuthResult, err error) {
 	start := time.Now()
-	defer func() {
-		a.mu.Lock()
-		a.stats.totalLatency = time.Since(start).Nanoseconds()
-		a.mu.Unlock()
-	}()
+	defer func() { a.stats.record(start, err) }()
 
 	// プレフィックスチェック
 	if a.keyPrefix != "" && !strings.HasPrefix(token, a.keyPrefix) {
@@ -869,7 +895,7 @@ func (a *APIKeyProvider) GetProviderInfo() *ProviderInfo {
 		Version:     "1.0",
 		IsHealthy:   true,
 		LastCheck:   time.Now(),
-		AvgLatency:  time.Duration(a.stats.totalLatency),
+		AvgLatency:  a.stats.avgLatency(),
 		SuccessRate: a.calculateSuccessRate(),
 	}
 }
@@ -881,11 +907,11 @@ func (a *APIKeyProvider) HealthCheck(ctx context.Context) error {
 
 // calculateSuccessRate 成功率を計算
 func (a *APIKeyProvider) calculateSuccessRate() float64 {
-	total := atomic.LoadInt64(&a.stats.totalRequests)
+	total := a.stats.totalRequests.Load()
 	if total == 0 {
 		return 100.0
 	}
-	success := atomic.LoadInt64(&a.stats.successCount)
+	success := a.stats.successCount.Load()
 	return float64(success) / float64(total) * 100.0
 }
 
@@ -940,18 +966,18 @@ func (mas *MultiAuthSystem) MetricsHandler() http.HandlerFunc {
 		w.Header().Set("Content-Type", "application/json")
 
 		mas.metrics.mu.RLock()
-		providerStats := make(map[string]interface{})
+		providerStats := make(map[string]any)
 		for provider, stats := range mas.metrics.providerStats {
-			total := atomic.LoadInt64(&stats.totalRequests)
-			success := atomic.LoadInt64(&stats.successCount)
-			errors := atomic.LoadInt64(&stats.errorCount)
-			timeouts := atomic.LoadInt64(&stats.timeoutCount)
-			avgLatency := float64(atomic.LoadInt64(&stats.totalLatency)) / float64(time.Millisecond)
+			total := stats.totalRequests.Load()
+			success := stats.successCount.Load()
+			errors := stats.errorCount.Load()
+			timeouts := stats.timeoutCount.Load()
+			avgLatency := float64(stats.totalLatency.Load()) / float64(time.Millisecond)
 			if total > 0 {
 				avgLatency = avgLatency / float64(total)
 			}
 
-			providerStats[provider] = map[string]interface{}{
+			providerStats[provider] = map[string]any{
 				"total_requests":  total,
 				"success_count":   success,
 				"error_count":     errors,
@@ -964,17 +990,17 @@ func (mas *MultiAuthSystem) MetricsHandler() http.HandlerFunc {
 		}
 		mas.metrics.mu.RUnlock()
 
-		metrics := map[string]interface{}{
-			"total_requests":       atomic.LoadInt64(&mas.metrics.totalRequests),
-			"successful_auth":      atomic.LoadInt64(&mas.metrics.successfulAuth),
-			"failed_auth":          atomic.LoadInt64(&mas.metrics.failedAuth),
-			"cache_hits":           atomic.LoadInt64(&mas.metrics.cacheHits),
-			"cache_misses":         atomic.LoadInt64(&mas.metrics.cacheMisses),
-			"parallel_auth":        atomic.LoadInt64(&mas.metrics.parallelAuth),
-			"avg_response_time_ms": float64(atomic.LoadInt64(&mas.metrics.avgResponseTime)) / float64(time.Millisecond),
+		metrics := map[string]any{
+			"total_requests":       mas.metrics.totalRequests.Load(),
+			"successful_auth":      mas.metrics.successfulAuth.Load(),
+			"failed_auth":          mas.metrics.failedAuth.Load(),
+			"cache_hits":           mas.metrics.cacheHits.Load(),
+			"cache_misses":         mas.metrics.cacheMisses.Load(),
+			"parallel_auth":        mas.metrics.parallelAuth.Load(),
+			"avg_response_time_ms": float64(mas.metrics.avgResponseTime.Load()) / float64(time.Millisecond),
 			"provider_stats":       providerStats,
 			"cache_size":           len(mas.cache.cache),
-			"cache_evictions":      atomic.LoadInt64(&mas.cache.evictions),
+			"cache_evictions":      mas.cache.evictions.Load(),
 		}
 
 		if err := json.NewEncoder(w).Encode(metrics); err != nil {
@@ -997,7 +1023,7 @@ func (mas *MultiAuthSystem) TestJWTGenerator() http.HandlerFunc {
 			return
 		}
 
-		var req map[string]interface{}
+		var req map[string]any
 		if err := json.Unmarshal(body, &req); err != nil {
 			http.Error(w, "Invalid JSON", http.StatusBadRequest)
 			return
@@ -1087,13 +1113,14 @@ func main() {
 	apiKeyProvider.AddAPIKey("ak_admin456", "admin456", "adminuser", "admin@example.com", []string{"admin"}, time.Now().Add(24*time.Hour))
 	authSystem.RegisterProvider("apikey", apiKeyProvider)
 
-	// HTTPハンドラー設定
-	http.HandleFunc("/auth", authSystem.HTTPHandler())
-	http.HandleFunc("/metrics", authSystem.MetricsHandler())
-	http.HandleFunc("/generate-jwt", authSystem.TestJWTGenerator())
+	// HTTPハンドラー設定（DefaultServeMuxではなくローカルなmuxに登録する）
+	mux := http.NewServeMux()
+	mux.HandleFunc("/auth", authSystem.HTTPHandler())
+	mux.HandleFunc("/metrics", authSystem.MetricsHandler())
+	mux.HandleFunc("/generate-jwt", authSystem.TestJWTGenerator())
 
 	// ヘルスチェックハンドラー
-	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(map[string]string{"status": "healthy"}); err != nil {
 			log.Printf("Failed to encode health response: %v", err)
@@ -1101,7 +1128,7 @@ func main() {
 	})
 
 	// テスト用ページ
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		html := `
 <!DOCTYPE html>
 <html>
@@ -1230,7 +1257,7 @@ func main() {
 	log.Println("  - OAuth2 (mock implementation)")
 	log.Println("  - API Key (ak_test123, ak_admin456)")
 
-	if err := http.ListenAndServe(":8080", nil); err != nil {
+	if err := http.ListenAndServe(":8080", mux); err != nil {
 		log.Fatalf("Server failed to start: %v", err)
 	}
 }

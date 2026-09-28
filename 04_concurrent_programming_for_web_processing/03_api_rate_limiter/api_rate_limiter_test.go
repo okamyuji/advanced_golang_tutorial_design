@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -60,9 +61,6 @@ func TestLimiterStartAndShutdown(t *testing.T) {
 		t.Fatalf("Failed to start limiter: %v", err)
 	}
 
-	// 少し待機
-	time.Sleep(100 * time.Millisecond)
-
 	// 二重開始はエラーになることを確認
 	err = limiter.Start()
 	if err == nil {
@@ -96,7 +94,7 @@ func TestBasicRateLimit(t *testing.T) {
 		BurstWindow: 10 * time.Second,
 		UserTiers:   []string{"basic"},
 		Endpoints:   []string{"/api/test"},
-		Methods:     []string{"GET"},
+		Methods:     []string{http.MethodGet},
 		Priority:    1,
 	}
 
@@ -119,7 +117,7 @@ func TestBasicRateLimit(t *testing.T) {
 		ClientID:    "test_client",
 		APIKey:      "test_key",
 		Endpoint:    "/api/test",
-		Method:      "GET",
+		Method:      http.MethodGet,
 		UserTier:    "basic",
 		ClientIP:    "127.0.0.1",
 		RequestTime: time.Now(),
@@ -174,7 +172,7 @@ func TestRuleMatching(t *testing.T) {
 			Window:    1 * time.Hour,
 			UserTiers: []string{"premium"},
 			Endpoints: []string{"/api/*"},
-			Methods:   []string{"GET", "POST"},
+			Methods:   []string{http.MethodGet, http.MethodPost},
 			Priority:  1,
 		},
 		{
@@ -183,7 +181,7 @@ func TestRuleMatching(t *testing.T) {
 			Window:    1 * time.Hour,
 			UserTiers: []string{"basic"},
 			Endpoints: []string{"/api/*"},
-			Methods:   []string{"GET", "POST"},
+			Methods:   []string{http.MethodGet, http.MethodPost},
 			Priority:  2,
 		},
 		{
@@ -192,7 +190,7 @@ func TestRuleMatching(t *testing.T) {
 			Window:    1 * time.Minute,
 			UserTiers: []string{"basic", "premium", "guest"},
 			Endpoints: []string{"/public/*"},
-			Methods:   []string{"GET"},
+			Methods:   []string{http.MethodGet},
 			Priority:  3,
 		},
 	}
@@ -215,7 +213,7 @@ func TestRuleMatching(t *testing.T) {
 		ClientID:    "premium_client",
 		UserTier:    "premium",
 		Endpoint:    "/api/data",
-		Method:      "GET",
+		Method:      http.MethodGet,
 		RequestTime: time.Now(),
 	}
 
@@ -226,8 +224,6 @@ func TestRuleMatching(t *testing.T) {
 
 	if !result.Allowed {
 		t.Logf("Premium user request was blocked: %+v", result)
-		// プレミアムユーザーがブロックされる場合は処理時間が必要な可能性
-		time.Sleep(100 * time.Millisecond)
 	}
 	if result.LimitRule != "premium_users" && result.LimitRule != "premium_users_burst" {
 		t.Errorf("Expected premium_users or premium_users_burst rule, got %s", result.LimitRule)
@@ -238,7 +234,7 @@ func TestRuleMatching(t *testing.T) {
 		ClientID:    "basic_client",
 		UserTier:    "basic",
 		Endpoint:    "/api/data",
-		Method:      "GET",
+		Method:      http.MethodGet,
 		RequestTime: time.Now(),
 	}
 
@@ -249,8 +245,6 @@ func TestRuleMatching(t *testing.T) {
 
 	if !result.Allowed {
 		t.Logf("Basic user request was blocked: %+v", result)
-		// ベーシックユーザーがブロックされる場合は処理時間が必要な可能性
-		time.Sleep(100 * time.Millisecond)
 	}
 	if result.LimitRule != "basic_users" && result.LimitRule != "basic_users_burst" {
 		t.Errorf("Expected basic_users or basic_users_burst rule, got %s", result.LimitRule)
@@ -270,7 +264,7 @@ func TestBurstLimit(t *testing.T) {
 		BurstWindow: 10 * time.Second, // 10秒間隔
 		UserTiers:   []string{"basic"},
 		Endpoints:   []string{"/api/burst"},
-		Methods:     []string{"POST"},
+		Methods:     []string{http.MethodPost},
 		Priority:    1,
 	}
 
@@ -291,12 +285,12 @@ func TestBurstLimit(t *testing.T) {
 		ClientID:    "burst_client",
 		UserTier:    "basic",
 		Endpoint:    "/api/burst",
-		Method:      "POST",
+		Method:      http.MethodPost,
 		RequestTime: time.Now(),
 	}
 
 	// バースト制限内のリクエスト（許可されるべき）
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		result, err := limiter.CheckRateLimit(request)
 		if err != nil {
 			t.Fatalf("Burst request %d failed: %v", i, err)
@@ -332,7 +326,7 @@ func TestConcurrentRateLimit(t *testing.T) {
 		BurstWindow: 10 * time.Second,
 		UserTiers:   []string{"basic"},
 		Endpoints:   []string{"/api/concurrent"},
-		Methods:     []string{"GET"},
+		Methods:     []string{http.MethodGet},
 		Priority:    1,
 	}
 
@@ -351,42 +345,40 @@ func TestConcurrentRateLimit(t *testing.T) {
 
 	const numRequests = 10
 	var wg sync.WaitGroup
-	wg.Add(numRequests)
-
-	allowedCount := int32(0)
-	blockedCount := int32(0)
+	// 各goroutineが自分のスロットにだけ書き込むため、結果集計に追加のロックは不要
+	allowed := make([]bool, numRequests)
 
 	// 複数のgoroutineで並行リクエスト
-	for i := 0; i < numRequests; i++ {
-		go func(id int) {
-			defer wg.Done()
-
+	for i := range numRequests {
+		wg.Go(func() {
 			request := &RateLimitRequest{
 				ClientID:    "concurrent_client",
 				UserTier:    "basic",
 				Endpoint:    "/api/concurrent",
-				Method:      "GET",
+				Method:      http.MethodGet,
 				RequestTime: time.Now(),
 			}
 
 			result, err := limiter.CheckRateLimit(request)
 			if err != nil {
-				t.Errorf("Concurrent request %d failed: %v", id, err)
+				t.Errorf("Concurrent request %d failed: %v", i, err)
 				return
 			}
 
-			if result.Allowed {
-				allowedCount++
-			} else {
-				blockedCount++
-			}
-		}(i)
+			allowed[i] = result.Allowed
+		})
 	}
 
 	wg.Wait()
 
-	// 処理時間を与える
-	time.Sleep(200 * time.Millisecond)
+	var allowedCount, blockedCount int
+	for _, ok := range allowed {
+		if ok {
+			allowedCount++
+		} else {
+			blockedCount++
+		}
+	}
 
 	// 統計確認
 	stats := limiter.GetStats()
@@ -418,7 +410,7 @@ func TestHTTPMiddleware(t *testing.T) {
 		BurstWindow: 10 * time.Second,
 		UserTiers:   []string{"basic"},
 		Endpoints:   []string{"/test"},
-		Methods:     []string{"GET"},
+		Methods:     []string{http.MethodGet},
 		Priority:    1,
 	}
 
@@ -447,7 +439,7 @@ func TestHTTPMiddleware(t *testing.T) {
 	middlewareHandler := limiter.HTTPMiddleware(testHandler)
 
 	// 最初のリクエスト（許可されるべき）
-	req1 := httptest.NewRequest("GET", "/test", nil)
+	req1 := httptest.NewRequest(http.MethodGet, "/test", nil)
 	req1.Header.Set("X-API-Key", "test_key")
 	req1.Header.Set("X-User-Tier", "basic")
 	req1.Header.Set("X-Client-ID", "test_client")
@@ -460,7 +452,7 @@ func TestHTTPMiddleware(t *testing.T) {
 	}
 
 	// 2番目のリクエスト（拒否されるべき）
-	req2 := httptest.NewRequest("GET", "/test", nil)
+	req2 := httptest.NewRequest(http.MethodGet, "/test", nil)
 	req2.Header.Set("X-API-Key", "test_key")
 	req2.Header.Set("X-User-Tier", "basic")
 	req2.Header.Set("X-Client-ID", "test_client")
@@ -481,62 +473,58 @@ func TestHTTPMiddleware(t *testing.T) {
 
 // TestBucketCleanup バケットクリーンアップをテストします
 func TestBucketCleanup(t *testing.T) {
-	config := NewLimiterConfig()
-	config.CleanupInterval = 100 * time.Millisecond // 短いクリーンアップ間隔
-	config.BucketTTL = 200 * time.Millisecond       // 短いTTL
+	synctest.Test(t, func(t *testing.T) {
+		config := NewLimiterConfig()
+		config.CleanupInterval = 100 * time.Millisecond // 短いクリーンアップ間隔
+		config.BucketTTL = 200 * time.Millisecond       // 短いTTL
 
-	limiter := NewAPIRateLimiter(config)
+		limiter := NewAPIRateLimiter(config)
 
-	err := limiter.Start()
-	if err != nil {
-		t.Fatalf("Failed to start limiter: %v", err)
-	}
-	defer func() {
-		if err := limiter.Shutdown(1 * time.Second); err != nil {
-			t.Logf("Failed to shutdown limiter: %v", err)
+		err := limiter.Start()
+		if err != nil {
+			t.Fatalf("Failed to start limiter: %v", err)
 		}
-	}()
+		defer func() {
+			if err := limiter.Shutdown(1 * time.Second); err != nil {
+				t.Logf("Failed to shutdown limiter: %v", err)
+			}
+		}()
 
-	// バケットを作成するためにデフォルトルールにマッチするリクエストを作成
-	request := &RateLimitRequest{
-		ClientID:    "cleanup_test_client",
-		UserTier:    "free",
-		Endpoint:    "/api/users",
-		Method:      "GET",
-		RequestTime: time.Now(),
-	}
+		// バケットを作成するためにデフォルトルールにマッチするリクエストを作成
+		request := &RateLimitRequest{
+			ClientID:    "cleanup_test_client",
+			UserTier:    "free",
+			Endpoint:    "/api/users",
+			Method:      http.MethodGet,
+			RequestTime: time.Now(),
+		}
 
-	_, err = limiter.CheckRateLimit(request)
-	if err != nil {
-		t.Fatalf("Rate limit check failed: %v", err)
-	}
+		_, err = limiter.CheckRateLimit(request)
+		if err != nil {
+			t.Fatalf("Rate limit check failed: %v", err)
+		}
 
-	// 処理時間を与える
-	time.Sleep(100 * time.Millisecond)
+		// バケットが存在することを確認
+		limiter.bucketsMu.RLock()
+		bucketCount := len(limiter.buckets)
+		limiter.bucketsMu.RUnlock()
 
-	// バケットが存在することを確認
-	limiter.bucketsMu.RLock()
-	bucketCount := len(limiter.buckets)
-	limiter.bucketsMu.RUnlock()
+		if bucketCount == 0 {
+			t.Fatal("CheckRateLimit did not create a bucket")
+		}
 
-	// バケットが作成されていない場合はテストをスキップ
-	if bucketCount == 0 {
-		t.Skip("No bucket was created - skipping cleanup test")
-	}
+		// TTL（200ms）が過ぎ、次のクリーンアップが走るまで仮想時計を進める
+		synctest.Sleep(300 * time.Millisecond)
 
-	// TTLが過ぎるまで待機
-	time.Sleep(300 * time.Millisecond)
+		// クリーンアップ後、バケットが削除されることを確認
+		limiter.bucketsMu.RLock()
+		bucketCountAfter := len(limiter.buckets)
+		limiter.bucketsMu.RUnlock()
 
-	// クリーンアップ後、バケットが削除されることを確認
-	limiter.bucketsMu.RLock()
-	bucketCountAfter := len(limiter.buckets)
-	limiter.bucketsMu.RUnlock()
-
-	if bucketCountAfter >= bucketCount {
-		t.Logf("Bucket count before: %d, after: %d", bucketCount, bucketCountAfter)
-		// クリーンアップが実行されない場合があるため、warningレベルに変更
-		t.Log("Warning: Expected bucket to be cleaned up, but it may not have been due to timing")
-	}
+		if bucketCountAfter != 0 {
+			t.Errorf("Expected all buckets to be cleaned up, got %d (before: %d)", bucketCountAfter, bucketCount)
+		}
+	})
 }
 
 // TestWorkerStats ワーカー統計をテストします
@@ -557,12 +545,12 @@ func TestWorkerStats(t *testing.T) {
 	}()
 
 	// 複数のリクエストを送信
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		request := &RateLimitRequest{
 			ClientID:    "worker_test_client",
 			UserTier:    "basic",
 			Endpoint:    "/api/worker",
-			Method:      "GET",
+			Method:      http.MethodGet,
 			RequestTime: time.Now(),
 		}
 
@@ -572,12 +560,9 @@ func TestWorkerStats(t *testing.T) {
 		}
 	}
 
-	// 処理時間を与える
-	time.Sleep(200 * time.Millisecond)
-
 	// ワーカー統計を確認
 	stats := limiter.GetStats()
-	workerStats := stats["worker_stats"].(map[string]interface{})
+	workerStats := stats["worker_stats"].(map[string]any)
 
 	if len(workerStats) != 2 {
 		t.Errorf("Expected 2 workers in stats, got %d", len(workerStats))
@@ -586,7 +571,7 @@ func TestWorkerStats(t *testing.T) {
 	// 少なくとも1つのワーカーが処理していることを確認
 	foundActiveWorker := false
 	for _, workerStat := range workerStats {
-		workerData := workerStat.(map[string]interface{})
+		workerData := workerStat.(map[string]any)
 		processed := workerData["processed_requests"].(int64)
 		if processed > 0 {
 			foundActiveWorker = true
@@ -637,7 +622,7 @@ func TestCustomRule(t *testing.T) {
 		BurstWindow: 10 * time.Second,
 		UserTiers:   []string{"custom"},
 		Endpoints:   []string{"/custom"},
-		Methods:     []string{"POST"},
+		Methods:     []string{http.MethodPost},
 		Priority:    1,
 	}
 
@@ -658,7 +643,7 @@ func TestCustomRule(t *testing.T) {
 		ClientID:    "custom_client",
 		UserTier:    "custom",
 		Endpoint:    "/custom",
-		Method:      "POST",
+		Method:      http.MethodPost,
 		RequestTime: time.Now(),
 	}
 
@@ -688,7 +673,7 @@ func TestEndpointPattern(t *testing.T) {
 		BurstWindow: 10 * time.Second,
 		UserTiers:   []string{"basic"},
 		Endpoints:   []string{"/api/v1/*", "/public/*"},
-		Methods:     []string{"GET", "POST"},
+		Methods:     []string{http.MethodGet, http.MethodPost},
 		Priority:    1,
 	}
 
@@ -722,7 +707,7 @@ func TestEndpointPattern(t *testing.T) {
 			ClientID:    "pattern_client",
 			UserTier:    "basic",
 			Endpoint:    tc.endpoint,
-			Method:      "GET",
+			Method:      http.MethodGet,
 			RequestTime: time.Now(),
 		}
 
@@ -749,7 +734,7 @@ func TestNoMatchingRule(t *testing.T) {
 		Window:    1 * time.Minute,
 		UserTiers: []string{"premium"},
 		Endpoints: []string{"/premium/api"},
-		Methods:   []string{"GET"},
+		Methods:   []string{http.MethodGet},
 		Priority:  1,
 	}
 
@@ -771,7 +756,7 @@ func TestNoMatchingRule(t *testing.T) {
 		ClientID:    "nomatch_client",
 		UserTier:    "basic", // premiumではない
 		Endpoint:    "/api/test",
-		Method:      "GET",
+		Method:      http.MethodGet,
 		RequestTime: time.Now(),
 	}
 
@@ -786,6 +771,52 @@ func TestNoMatchingRule(t *testing.T) {
 	}
 	if result.LimitRule != "no_rule" && result.LimitRule != "" {
 		t.Errorf("Expected empty rule name or 'no_rule', got %s", result.LimitRule)
+	}
+}
+
+// TestConcurrentCheckAndShutdown 投入とShutdownを並行させてもpanicせず、
+// 停止後のCheckRateLimitがエラーになることを確認する回帰テスト。
+func TestConcurrentCheckAndShutdown(t *testing.T) {
+	for iter := range 50 {
+		config := NewLimiterConfig()
+		config.WorkerCount = 2
+		config.RequestBufferSize = 8
+
+		limiter := NewAPIRateLimiter(config)
+		if err := limiter.Start(); err != nil {
+			t.Fatalf("iter %d: failed to start: %v", iter, err)
+		}
+
+		var wg sync.WaitGroup
+		for range 20 {
+			wg.Go(func() {
+				request := &RateLimitRequest{
+					ClientID:    "shutdown_race_client",
+					UserTier:    "basic",
+					Endpoint:    "/api/race",
+					Method:      http.MethodGet,
+					RequestTime: time.Now(),
+				}
+				_, _ = limiter.CheckRateLimit(request)
+			})
+		}
+
+		if err := limiter.Shutdown(2 * time.Second); err != nil {
+			t.Fatalf("iter %d: shutdown failed: %v", iter, err)
+		}
+		wg.Wait()
+
+		// 停止後の投入はエラーになる
+		request := &RateLimitRequest{
+			ClientID:    "shutdown_race_client",
+			UserTier:    "basic",
+			Endpoint:    "/api/race",
+			Method:      http.MethodGet,
+			RequestTime: time.Now(),
+		}
+		if _, err := limiter.CheckRateLimit(request); err == nil {
+			t.Errorf("iter %d: expected error checking rate limit after shutdown", iter)
+		}
 	}
 }
 
@@ -810,12 +841,11 @@ func BenchmarkRateLimitCheck(b *testing.B) {
 		ClientID:    "bench_client",
 		UserTier:    "basic",
 		Endpoint:    "/api/bench",
-		Method:      "GET",
+		Method:      http.MethodGet,
 		RequestTime: time.Now(),
 	}
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, err := limiter.CheckRateLimit(request)
 		if err != nil {
 			b.Fatalf("Benchmark failed: %v", err)

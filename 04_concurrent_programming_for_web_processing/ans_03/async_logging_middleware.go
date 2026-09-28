@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -26,7 +27,7 @@ type LogEntry struct {
 	ResponseSize int64     `json:"response_size"`
 }
 
-// LogMetrics ログ処理のメトリクス
+// LogMetrics ログ処理のメトリクスのスナップショットです（JSON出力・GetMetrics戻り値用）
 type LogMetrics struct {
 	TotalRequests     int64 `json:"total_requests"`
 	ProcessedLogs     int64 `json:"processed_logs"`
@@ -38,6 +39,18 @@ type LogMetrics struct {
 	CurrentQueueDepth int64 `json:"current_queue_depth"`
 }
 
+// logMetricsCounters 実行中に複数goroutineから更新される生カウンターです。
+// 型付きatomicで保持し、GetMetricsで読み取り専用のLogMetricsへスナップショットします。
+type logMetricsCounters struct {
+	totalRequests     atomic.Int64
+	processedLogs     atomic.Int64
+	droppedLogs       atomic.Int64
+	queueSize         atomic.Int64
+	batchWrites       atomic.Int64
+	failedWrites      atomic.Int64
+	currentQueueDepth atomic.Int64
+}
+
 // AsyncLoggingMiddleware 非同期ログ収集ミドルウェア
 type AsyncLoggingMiddleware struct {
 	logQueue      chan LogEntry
@@ -45,11 +58,10 @@ type AsyncLoggingMiddleware struct {
 	flushInterval time.Duration
 	maxQueueSize  int
 	outputFile    string
-	metrics       LogMetrics
+	metrics       logMetricsCounters
 	ctx           context.Context
 	cancel        context.CancelFunc
 	wg            sync.WaitGroup
-	mu            sync.RWMutex
 	retryAttempts int
 	retryDelay    time.Duration
 	backupQueue   []LogEntry
@@ -74,12 +86,10 @@ func NewAsyncLoggingMiddleware(config LoggingConfig) *AsyncLoggingMiddleware {
 	}
 
 	// ログ処理ワーカーを開始
-	middleware.wg.Add(1)
-	go middleware.logProcessor()
+	middleware.wg.Go(middleware.logProcessor)
 
 	// メトリクス更新ワーカーを開始
-	middleware.wg.Add(1)
-	go middleware.metricsUpdater()
+	middleware.wg.Go(middleware.metricsUpdater)
 
 	return middleware
 }
@@ -126,13 +136,22 @@ func (alm *AsyncLoggingMiddleware) Middleware(next http.Handler) http.Handler {
 			ResponseSize: wrapped.responseSize,
 		}
 
-		// 非同期でログキューに送信
+		// 非同期でログキューに送信。停止後はキューイングせずバックアップへ直接回す。
+		if alm.ctx.Err() != nil {
+			alm.backupMu.Lock()
+			if len(alm.backupQueue) < alm.maxQueueSize {
+				alm.backupQueue = append(alm.backupQueue, logEntry)
+			}
+			alm.backupMu.Unlock()
+			return
+		}
+
 		select {
 		case alm.logQueue <- logEntry:
-			atomic.AddInt64(&alm.metrics.TotalRequests, 1)
+			alm.metrics.totalRequests.Add(1)
 		default:
 			// キューが満杯の場合はドロップ
-			atomic.AddInt64(&alm.metrics.DroppedLogs, 1)
+			alm.metrics.droppedLogs.Add(1)
 
 			// バックアップキューに保存（ベストエフォート）
 			alm.backupMu.Lock()
@@ -164,24 +183,31 @@ func (rw *responseWriter) Write(b []byte) (int, error) {
 
 // logProcessor ログを並行処理してバッチ書き込み
 func (alm *AsyncLoggingMiddleware) logProcessor() {
-	defer alm.wg.Done()
-
-	ticker := time.NewTicker(alm.flushInterval)
-	defer ticker.Stop()
+	// フィールドに保持せずStop/Resetも使わないため、Go 1.23以降はGCが回収できるtime.Tickでよい
+	tick := time.Tick(alm.flushInterval)
 
 	batch := make([]LogEntry, 0, alm.batchSize)
 
 	for {
 		select {
 		case <-alm.ctx.Done():
-			// 残っているログを処理してから終了
+			// selectの抽選でDone側が先に選ばれても、キューに残ったログを
+			// 吸い出してから書き込む。そうしないとcancel直前のログが失われる。
+			for drained := false; !drained; {
+				select {
+				case logEntry := <-alm.logQueue:
+					batch = append(batch, logEntry)
+				default:
+					drained = true
+				}
+			}
 			alm.processBatch(batch)
 			alm.processBackupQueue()
 			return
 
 		case logEntry := <-alm.logQueue:
 			batch = append(batch, logEntry)
-			atomic.AddInt64(&alm.metrics.QueueSize, -1)
+			alm.metrics.queueSize.Add(-1)
 
 			// バッチサイズに達したら書き込み
 			if len(batch) >= alm.batchSize {
@@ -189,7 +215,7 @@ func (alm *AsyncLoggingMiddleware) logProcessor() {
 				batch = batch[:0] // スライスをリセット
 			}
 
-		case <-ticker.C:
+		case <-tick:
 			// 定期的なフラッシュ
 			if len(batch) > 0 {
 				alm.processBatch(batch)
@@ -209,11 +235,11 @@ func (alm *AsyncLoggingMiddleware) processBatch(batch []LogEntry) {
 	}
 
 	// リトライ付きで書き込み処理
-	for attempt := 0; attempt <= alm.retryAttempts; attempt++ {
+	for attempt := range alm.retryAttempts + 1 {
 		if err := alm.writeLogs(batch); err != nil {
 			if attempt == alm.retryAttempts {
 				// 最終的に失敗した場合
-				atomic.AddInt64(&alm.metrics.FailedWrites, 1)
+				alm.metrics.failedWrites.Add(1)
 				log.Printf("ログ書き込み失敗（最終試行）: %v", err)
 
 				// バックアップキューに保存
@@ -233,8 +259,8 @@ func (alm *AsyncLoggingMiddleware) processBatch(batch []LogEntry) {
 		}
 
 		// 成功した場合
-		atomic.AddInt64(&alm.metrics.ProcessedLogs, int64(len(batch)))
-		atomic.AddInt64(&alm.metrics.BatchWrites, 1)
+		alm.metrics.processedLogs.Add(int64(len(batch)))
+		alm.metrics.batchWrites.Add(1)
 		return
 	}
 }
@@ -272,24 +298,22 @@ func (alm *AsyncLoggingMiddleware) processBackupQueue() {
 
 	// バックアップキューのログを再試行
 	if err := alm.writeLogs(alm.backupQueue); err == nil {
-		atomic.AddInt64(&alm.metrics.ProcessedLogs, int64(len(alm.backupQueue)))
+		recovered := len(alm.backupQueue)
+		alm.metrics.processedLogs.Add(int64(recovered))
 		alm.backupQueue = alm.backupQueue[:0] // クリア
-		log.Printf("バックアップキューからログ復旧完了: %d件", len(alm.backupQueue))
+		log.Printf("バックアップキューからログ復旧完了: %d件", recovered)
 	}
 }
 
 // metricsUpdater メトリクスを定期更新
 func (alm *AsyncLoggingMiddleware) metricsUpdater() {
-	defer alm.wg.Done()
-
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
+	tick := time.Tick(10 * time.Second)
 
 	for {
 		select {
 		case <-alm.ctx.Done():
 			return
-		case <-ticker.C:
+		case <-tick:
 			alm.updateMetrics()
 		}
 	}
@@ -297,35 +321,29 @@ func (alm *AsyncLoggingMiddleware) metricsUpdater() {
 
 // updateMetrics メトリクスを更新
 func (alm *AsyncLoggingMiddleware) updateMetrics() {
-	alm.mu.Lock()
-	defer alm.mu.Unlock()
-
 	// 現在のキュー深度を更新
-	atomic.StoreInt64(&alm.metrics.CurrentQueueDepth, int64(len(alm.logQueue)))
+	alm.metrics.currentQueueDepth.Store(int64(len(alm.logQueue)))
 
 	// メトリクスを定期的にログ出力
 	log.Printf("ログメトリクス - 処理済み: %d, ドロップ: %d, キュー深度: %d, バッチ書き込み: %d, 失敗: %d",
-		atomic.LoadInt64(&alm.metrics.ProcessedLogs),
-		atomic.LoadInt64(&alm.metrics.DroppedLogs),
-		atomic.LoadInt64(&alm.metrics.CurrentQueueDepth),
-		atomic.LoadInt64(&alm.metrics.BatchWrites),
-		atomic.LoadInt64(&alm.metrics.FailedWrites),
+		alm.metrics.processedLogs.Load(),
+		alm.metrics.droppedLogs.Load(),
+		alm.metrics.currentQueueDepth.Load(),
+		alm.metrics.batchWrites.Load(),
+		alm.metrics.failedWrites.Load(),
 	)
 }
 
-// GetMetrics 現在のメトリクスを取得
+// GetMetrics 現在のメトリクスのスナップショットを取得します
 func (alm *AsyncLoggingMiddleware) GetMetrics() LogMetrics {
-	alm.mu.RLock()
-	defer alm.mu.RUnlock()
-
 	return LogMetrics{
-		TotalRequests:     atomic.LoadInt64(&alm.metrics.TotalRequests),
-		ProcessedLogs:     atomic.LoadInt64(&alm.metrics.ProcessedLogs),
-		DroppedLogs:       atomic.LoadInt64(&alm.metrics.DroppedLogs),
-		QueueSize:         atomic.LoadInt64(&alm.metrics.QueueSize),
-		BatchWrites:       atomic.LoadInt64(&alm.metrics.BatchWrites),
-		FailedWrites:      atomic.LoadInt64(&alm.metrics.FailedWrites),
-		CurrentQueueDepth: atomic.LoadInt64(&alm.metrics.CurrentQueueDepth),
+		TotalRequests:     alm.metrics.totalRequests.Load(),
+		ProcessedLogs:     alm.metrics.processedLogs.Load(),
+		DroppedLogs:       alm.metrics.droppedLogs.Load(),
+		QueueSize:         alm.metrics.queueSize.Load(),
+		BatchWrites:       alm.metrics.batchWrites.Load(),
+		FailedWrites:      alm.metrics.failedWrites.Load(),
+		CurrentQueueDepth: alm.metrics.currentQueueDepth.Load(),
 	}
 }
 
@@ -385,7 +403,7 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 
-		response := map[string]interface{}{
+		response := map[string]any{
 			"message": "成功",
 			"path":    r.URL.Path,
 			"method":  r.Method,
@@ -418,7 +436,7 @@ func main() {
 
 	// グレースフルシャットダウンの設定
 	go func() {
-		if err := server.ListenAndServe(); err != http.ErrServerClosed {
+		if err := server.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("サーバー起動エラー: %v", err)
 		}
 	}()
@@ -427,7 +445,7 @@ func main() {
 	go func() {
 		time.Sleep(2 * time.Second) // サーバー起動まで待機
 
-		for i := 0; i < 1000; i++ {
+		for i := range 1000 {
 			go func(id int) {
 				resp, err := http.Get(fmt.Sprintf("http://localhost:8080/api/test/%d", id))
 				if err == nil {

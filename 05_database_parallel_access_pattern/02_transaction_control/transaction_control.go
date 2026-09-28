@@ -5,15 +5,17 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
-	"math/rand"
+	"math/rand/v2"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
 )
 
 // TxConfig トランザクション設定です
@@ -42,11 +44,11 @@ type TransactionManager struct {
 // TransactionStats トランザクション統計です
 type TransactionStats struct {
 	mu                sync.RWMutex
-	totalTransactions int64
-	committedTx       int64
-	rolledBackTx      int64
-	deadlockCount     int64
-	retryCount        int64
+	totalTransactions atomic.Int64
+	committedTx       atomic.Int64
+	rolledBackTx      atomic.Int64
+	deadlockCount     atomic.Int64
+	retryCount        atomic.Int64
 	avgTxDuration     time.Duration
 }
 
@@ -61,7 +63,7 @@ func NewTransactionManager(db *sql.DB) *TransactionManager {
 // ExecuteTransaction トランザクションを実行します
 func (tm *TransactionManager) ExecuteTransaction(ctx context.Context, config *TxConfig, fn func(*sql.Tx) error) error {
 	start := time.Now()
-	atomic.AddInt64(&tm.stats.totalTransactions, 1)
+	tm.stats.totalTransactions.Add(1)
 
 	defer func() {
 		elapsed := time.Since(start)
@@ -88,21 +90,18 @@ func (tm *TransactionManager) executeWithRetry(ctx context.Context, config *TxCo
 	var lastErr error
 	retryDelay := config.RetryPolicy.InitialDelay
 
-	for attempt := 0; attempt <= config.RetryPolicy.MaxRetries; attempt++ {
+	for attempt := range config.RetryPolicy.MaxRetries + 1 {
 		if attempt > 0 {
 			// リトライ前の待機
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
 			case <-time.After(retryDelay):
-				atomic.AddInt64(&tm.stats.retryCount, 1)
+				tm.stats.retryCount.Add(1)
 			}
 
 			// 指数バックオフ
-			retryDelay = time.Duration(float64(retryDelay) * config.RetryPolicy.BackoffFactor)
-			if retryDelay > config.RetryPolicy.MaxDelay {
-				retryDelay = config.RetryPolicy.MaxDelay
-			}
+			retryDelay = min(time.Duration(float64(retryDelay)*config.RetryPolicy.BackoffFactor), config.RetryPolicy.MaxDelay)
 		}
 
 		lastErr = tm.executeSingleTransaction(ctx, config, fn)
@@ -116,7 +115,7 @@ func (tm *TransactionManager) executeWithRetry(ctx context.Context, config *TxCo
 		}
 
 		if tm.isDeadlockError(lastErr) {
-			atomic.AddInt64(&tm.stats.deadlockCount, 1)
+			tm.stats.deadlockCount.Add(1)
 		}
 
 		log.Printf("Transaction failed (attempt %d/%d): %v", attempt+1, config.RetryPolicy.MaxRetries+1, lastErr)
@@ -132,36 +131,36 @@ func (tm *TransactionManager) executeSingleTransaction(ctx context.Context, conf
 		ReadOnly:  config.ReadOnly,
 	})
 	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %v", err)
+		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
 
 	// パニック回復とロールバック
 	defer func() {
 		if r := recover(); r != nil {
-			if err := tx.Rollback(); err != nil {
+			if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
 				log.Printf("Failed to rollback transaction during panic: %v", err)
 			}
-			atomic.AddInt64(&tm.stats.rolledBackTx, 1)
+			tm.stats.rolledBackTx.Add(1)
 			panic(r) // パニックを再発生
 		}
 	}()
 
 	// トランザクション処理実行
 	if err := fn(tx); err != nil {
-		if rollbackErr := tx.Rollback(); rollbackErr != nil {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
 			log.Printf("Rollback failed: %v", rollbackErr)
 		}
-		atomic.AddInt64(&tm.stats.rolledBackTx, 1)
+		tm.stats.rolledBackTx.Add(1)
 		return err
 	}
 
 	// コミット
 	if err := tx.Commit(); err != nil {
-		atomic.AddInt64(&tm.stats.rolledBackTx, 1)
-		return fmt.Errorf("failed to commit transaction: %v", err)
+		tm.stats.rolledBackTx.Add(1)
+		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
-	atomic.AddInt64(&tm.stats.committedTx, 1)
+	tm.stats.committedTx.Add(1)
 	return nil
 }
 
@@ -172,22 +171,16 @@ func (tm *TransactionManager) isRetryableError(err error, retryConfig *RetryConf
 	}
 
 	errStr := strings.ToLower(err.Error())
-	for _, retryableErr := range retryConfig.RetryableErrors {
-		if strings.Contains(errStr, strings.ToLower(retryableErr)) {
-			return true
-		}
-	}
-
-	return false
+	return slices.ContainsFunc(retryConfig.RetryableErrors, func(retryableErr string) bool {
+		return strings.Contains(errStr, strings.ToLower(retryableErr))
+	})
 }
 
-// isDeadlockError デッドロックエラーかチェックします
+// isDeadlockError デッドロックエラーかチェックします。
+// エラー文字列はlib/pqの版で変わるので、PostgreSQLのSQLSTATE（40P01）で判定する
 func (tm *TransactionManager) isDeadlockError(err error) bool {
-	if err == nil {
-		return false
-	}
-	errStr := strings.ToLower(err.Error())
-	return strings.Contains(errStr, "deadlock") || strings.Contains(errStr, "40P01")
+	pqErr, ok := errors.AsType[*pq.Error](err)
+	return ok && pqErr.Code == "40P01"
 }
 
 // updateTxDuration トランザクション実行時間を更新します
@@ -195,7 +188,7 @@ func (tm *TransactionManager) updateTxDuration(elapsed time.Duration) {
 	tm.stats.mu.Lock()
 	defer tm.stats.mu.Unlock()
 
-	totalTx := atomic.LoadInt64(&tm.stats.totalTransactions)
+	totalTx := tm.stats.totalTransactions.Load()
 	if totalTx == 1 {
 		tm.stats.avgTxDuration = elapsed
 	} else {
@@ -212,11 +205,11 @@ func (tm *TransactionManager) GetStats() TransactionStatsSnapshot {
 	defer tm.stats.mu.RUnlock()
 
 	return TransactionStatsSnapshot{
-		TotalTransactions: atomic.LoadInt64(&tm.stats.totalTransactions),
-		CommittedTx:       atomic.LoadInt64(&tm.stats.committedTx),
-		RolledBackTx:      atomic.LoadInt64(&tm.stats.rolledBackTx),
-		DeadlockCount:     atomic.LoadInt64(&tm.stats.deadlockCount),
-		RetryCount:        atomic.LoadInt64(&tm.stats.retryCount),
+		TotalTransactions: tm.stats.totalTransactions.Load(),
+		CommittedTx:       tm.stats.committedTx.Load(),
+		RolledBackTx:      tm.stats.rolledBackTx.Load(),
+		DeadlockCount:     tm.stats.deadlockCount.Load(),
+		RetryCount:        tm.stats.retryCount.Load(),
 		AvgTxDuration:     tm.stats.avgTxDuration,
 	}
 }
@@ -243,7 +236,7 @@ func NewOptimisticLockManager(tm *TransactionManager) *OptimisticLockManager {
 
 // UpdateWithOptimisticLock 楽観的ロック付きで更新します
 func (olm *OptimisticLockManager) UpdateWithOptimisticLock(ctx context.Context, tableName string, id int64,
-	updateFields map[string]interface{}) error {
+	updateFields map[string]any) error {
 
 	config := &TxConfig{
 		IsolationLevel: sql.LevelReadCommitted,
@@ -267,12 +260,12 @@ func (olm *OptimisticLockManager) UpdateWithOptimisticLock(ctx context.Context, 
 		query := fmt.Sprintf("SELECT version FROM %s WHERE id = $1", tableName)
 		err := tx.QueryRowContext(ctx, query, id).Scan(&currentVersion)
 		if err != nil {
-			return fmt.Errorf("failed to get current version: %v", err)
+			return fmt.Errorf("failed to get current version: %w", err)
 		}
 
 		// 更新実行
 		setParts := make([]string, 0, len(updateFields))
-		args := make([]interface{}, 0, len(updateFields)+2)
+		args := make([]any, 0, len(updateFields)+2)
 		argIndex := 1
 
 		for field, value := range updateFields {
@@ -294,12 +287,12 @@ func (olm *OptimisticLockManager) UpdateWithOptimisticLock(ctx context.Context, 
 
 		result, err := tx.ExecContext(ctx, updateQuery, args...)
 		if err != nil {
-			return fmt.Errorf("failed to execute update: %v", err)
+			return fmt.Errorf("failed to execute update: %w", err)
 		}
 
 		rowsAffected, err := result.RowsAffected()
 		if err != nil {
-			return fmt.Errorf("failed to get rows affected: %v", err)
+			return fmt.Errorf("failed to get rows affected: %w", err)
 		}
 
 		if rowsAffected == 0 {
@@ -347,7 +340,7 @@ func (im *InventoryManager) ReserveInventory(ctx context.Context, productID int6
 			"SELECT quantity, reserved_quantity, version FROM inventory WHERE product_id = $1 AND warehouse_id = $2",
 			productID, warehouseID).Scan(&currentQty, &reservedQty, &version)
 		if err != nil {
-			return fmt.Errorf("failed to get inventory: %v", err)
+			return fmt.Errorf("failed to get inventory: %w", err)
 		}
 
 		availableQty := currentQty - reservedQty
@@ -360,12 +353,12 @@ func (im *InventoryManager) ReserveInventory(ctx context.Context, productID int6
 			"UPDATE inventory SET reserved_quantity = reserved_quantity + $1, version = version + 1 WHERE product_id = $2 AND warehouse_id = $3 AND version = $4",
 			quantity, productID, warehouseID, version)
 		if err != nil {
-			return fmt.Errorf("failed to update inventory: %v", err)
+			return fmt.Errorf("failed to update inventory: %w", err)
 		}
 
 		rowsAffected, err := result.RowsAffected()
 		if err != nil {
-			return fmt.Errorf("failed to get rows affected: %v", err)
+			return fmt.Errorf("failed to get rows affected: %w", err)
 		}
 
 		if rowsAffected == 0 {
@@ -380,32 +373,29 @@ func (im *InventoryManager) ReserveInventory(ctx context.Context, productID int6
 // ProcessConcurrentOrders 並行注文処理をシミュレートします
 func (im *InventoryManager) ProcessConcurrentOrders(ctx context.Context, productID int64, warehouseID int64, orderCount int) {
 	var wg sync.WaitGroup
-	successCount := int64(0)
-	failureCount := int64(0)
+	var successCount, failureCount atomic.Int64
 
-	for i := 0; i < orderCount; i++ {
-		wg.Add(1)
-		go func(orderID int) {
-			defer wg.Done()
-
+	for i := range orderCount {
+		orderID := i + 1
+		wg.Go(func() {
 			// ランダムな数量で注文
-			quantity := rand.Intn(5) + 1
+			quantity := rand.IntN(5) + 1
 
 			err := im.ReserveInventory(ctx, productID, warehouseID, quantity)
 			if err != nil {
-				atomic.AddInt64(&failureCount, 1)
+				failureCount.Add(1)
 				log.Printf("Order %d failed: %v", orderID, err)
 			} else {
-				atomic.AddInt64(&successCount, 1)
+				successCount.Add(1)
 				log.Printf("Order %d succeeded: reserved %d units", orderID, quantity)
 			}
-		}(i + 1)
+		})
 	}
 
 	wg.Wait()
 
 	log.Printf("Concurrent order processing completed: Success=%d, Failure=%d",
-		atomic.LoadInt64(&successCount), atomic.LoadInt64(&failureCount))
+		successCount.Load(), failureCount.Load())
 }
 
 // 使用例とテスト用のmain関数
@@ -456,12 +446,9 @@ func testOptimisticLock(tm *TransactionManager) {
 	productID := int64(1)
 
 	// 並行で同じ商品を更新
-	for i := 0; i < 5; i++ {
-		wg.Add(1)
-		go func(workerID int) {
-			defer wg.Done()
-
-			updateFields := map[string]interface{}{
+	for workerID := range 5 {
+		wg.Go(func() {
+			updateFields := map[string]any{
 				"price": 1000.0 + float64(workerID*100),
 			}
 
@@ -471,7 +458,7 @@ func testOptimisticLock(tm *TransactionManager) {
 			} else {
 				log.Printf("Worker %d: Update succeeded", workerID)
 			}
-		}(i)
+		})
 	}
 
 	wg.Wait()

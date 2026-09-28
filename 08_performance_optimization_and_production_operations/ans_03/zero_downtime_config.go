@@ -11,13 +11,24 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"maps"
+	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"slices"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
+)
+
+var (
+	errAlreadyStarted = errors.New("設定更新システムは開始済みです")
+	errSystemStopped  = errors.New("設定更新システムは停止済みです")
 )
 
 // ZeroDowntimeConfigSystem ゼロダウンタイム設定更新システム
@@ -33,11 +44,13 @@ type ZeroDowntimeConfigSystem struct {
 	validator       *ConfigValidator
 	rollbackManager *AutoRollbackManager
 
-	// システム状態
-	isRunning        bool
+	// システム状態。stateMu は Start/Stop の多重呼び出しを排他する
+	stateMu          sync.Mutex
+	running          bool
+	stopped          bool
 	startTime        time.Time
 	lastConfigUpdate time.Time
-	updateCount      int64
+	updateCount      atomic.Int64
 
 	// 制御チャンネル
 	stopChan   chan struct{}
@@ -50,25 +63,26 @@ type ZeroDowntimeConfigSystem struct {
 
 // HotReloadConfigManager ホットリロード設定管理器
 type HotReloadConfigManager struct {
-	configFile      string
-	backupDir       string
-	currentConfig   *ApplicationConfig
+	configFile string
+	backupDir  string
+	// currentConfig 読み手はロックなしで Load し、差し替えは Store で1回に行う
+	currentConfig   atomic.Pointer[ApplicationConfig]
 	pendingConfig   *ApplicationConfig
 	watchers        map[string]*FileWatcher
-	mutex           sync.RWMutex
+	mutex           sync.RWMutex // pendingConfig と、pendingConfig から currentConfig への昇格を守る
 	reloadCallbacks []ConfigReloadCallback
 }
 
 // ApplicationConfig アプリケーション設定
 type ApplicationConfig struct {
-	Version        string                 `json:"version"`
-	Timestamp      time.Time              `json:"timestamp"`
-	Checksum       string                 `json:"checksum"`
-	Server         *ServerConfig          `json:"server"`
-	Database       *DatabaseConfig        `json:"database"`
-	Logging        *LoggingConfig         `json:"logging"`
-	Features       map[string]bool        `json:"features"`
-	CustomSettings map[string]interface{} `json:"custom_settings"`
+	Version        string          `json:"version"`
+	Timestamp      time.Time       `json:"timestamp"`
+	Checksum       string          `json:"checksum"`
+	Server         *ServerConfig   `json:"server"`
+	Database       *DatabaseConfig `json:"database"`
+	Logging        *LoggingConfig  `json:"logging"`
+	Features       map[string]bool `json:"features"`
+	CustomSettings map[string]any  `json:"custom_settings"`
 }
 
 // ServerConfig サーバー設定
@@ -94,7 +108,6 @@ type DatabaseConfig struct {
 	QueryTimeout   time.Duration `json:"query_timeout"`
 	SSLMode        string        `json:"ssl_mode"`
 }
-
 
 // LoggingConfig ログ設定
 type LoggingConfig struct {
@@ -123,7 +136,7 @@ type ConfigVersionController struct {
 	versions       []*ConfigVersion
 	currentVersion string
 	maxVersions    int
-	versionCounter int64
+	versionCounter atomic.Int64
 	mutex          sync.RWMutex
 }
 
@@ -165,11 +178,11 @@ type SuccessCriteria struct {
 
 // ValidationRule 検証ルール
 type ValidationRule struct {
-	Name       string                 `json:"name"`
-	Type       string                 `json:"type"`
-	Parameters map[string]interface{} `json:"parameters"`
-	Required   bool                   `json:"required"`
-	ErrorLevel string                 `json:"error_level"`
+	Name       string         `json:"name"`
+	Type       string         `json:"type"`
+	Parameters map[string]any `json:"parameters"`
+	Required   bool           `json:"required"`
+	ErrorLevel string         `json:"error_level"`
 }
 
 // RollbackTrigger ロールバックトリガー
@@ -210,8 +223,44 @@ type TrafficSplitter struct {
 	currentPercent int
 	targetPercent  int
 	isActive       bool
-	requestCounter int64
+	requestCounter atomic.Int64
 	mutex          sync.RWMutex
+}
+
+// TrafficSplitterSnapshot API で返すトラフィック分散状態
+type TrafficSplitterSnapshot struct {
+	CurrentPercent int   `json:"current_percent"`
+	TargetPercent  int   `json:"target_percent"`
+	IsActive       bool  `json:"is_active"`
+	RequestCount   int64 `json:"request_count"`
+}
+
+// snapshot 現在の状態を JSON にできる値として返す
+func (ts *TrafficSplitter) snapshot() TrafficSplitterSnapshot {
+	ts.mutex.RLock()
+	defer ts.mutex.RUnlock()
+	return TrafficSplitterSnapshot{
+		CurrentPercent: ts.currentPercent,
+		TargetPercent:  ts.targetPercent,
+		IsActive:       ts.isActive,
+		RequestCount:   ts.requestCounter.Load(),
+	}
+}
+
+// set 分散状態を更新する
+func (ts *TrafficSplitter) set(currentPercent, targetPercent int, isActive bool) {
+	ts.mutex.Lock()
+	defer ts.mutex.Unlock()
+	ts.currentPercent = currentPercent
+	ts.targetPercent = targetPercent
+	ts.isActive = isActive
+}
+
+// setTarget 目標比率だけを更新する
+func (ts *TrafficSplitter) setTarget(targetPercent int) {
+	ts.mutex.Lock()
+	defer ts.mutex.Unlock()
+	ts.targetPercent = targetPercent
 }
 
 // RolloutProgressMonitor ロールアウト進捗監視器
@@ -230,16 +279,16 @@ type ConfigAuditLogger struct {
 
 // AuditEntry 監査エントリ
 type AuditEntry struct {
-	ID            string                 `json:"id"`
-	Timestamp     time.Time              `json:"timestamp"`
-	Action        string                 `json:"action"`
-	ConfigVersion string                 `json:"config_version"`
-	ChangedBy     string                 `json:"changed_by"`
-	ChangeReason  string                 `json:"change_reason"`
-	Changes       map[string]interface{} `json:"changes"`
-	Result        string                 `json:"result"`
-	ErrorMessage  string                 `json:"error_message,omitempty"`
-	RolloutID     string                 `json:"rollout_id,omitempty"`
+	ID            string         `json:"id"`
+	Timestamp     time.Time      `json:"timestamp"`
+	Action        string         `json:"action"`
+	ConfigVersion string         `json:"config_version"`
+	ChangedBy     string         `json:"changed_by"`
+	ChangeReason  string         `json:"change_reason"`
+	Changes       map[string]any `json:"changes"`
+	Result        string         `json:"result"`
+	ErrorMessage  string         `json:"error_message,omitempty"`
+	RolloutID     string         `json:"rollout_id,omitempty"`
 }
 
 // ConfigHealthChecker 設定ヘルスチェッカー
@@ -270,7 +319,7 @@ type ConfigValidator struct {
 }
 
 // ValidatorFunc 検証関数
-type ValidatorFunc func(config *ApplicationConfig, params map[string]interface{}) error
+type ValidatorFunc func(config *ApplicationConfig, params map[string]any) error
 
 // AutoRollbackManager 自動ロールバック管理器
 type AutoRollbackManager struct {
@@ -283,16 +332,16 @@ type AutoRollbackManager struct {
 
 // RollbackEvent ロールバックイベント
 type RollbackEvent struct {
-	ID           string                 `json:"id"`
-	Timestamp    time.Time              `json:"timestamp"`
-	Trigger      string                 `json:"trigger"`
-	FromVersion  string                 `json:"from_version"`
-	ToVersion    string                 `json:"to_version"`
-	Reason       string                 `json:"reason"`
-	Automatic    bool                   `json:"automatic"`
-	Success      bool                   `json:"success"`
-	ErrorMessage string                 `json:"error_message,omitempty"`
-	Metadata     map[string]interface{} `json:"metadata"`
+	ID           string         `json:"id"`
+	Timestamp    time.Time      `json:"timestamp"`
+	Trigger      string         `json:"trigger"`
+	FromVersion  string         `json:"from_version"`
+	ToVersion    string         `json:"to_version"`
+	Reason       string         `json:"reason"`
+	Automatic    bool           `json:"automatic"`
+	Success      bool           `json:"success"`
+	ErrorMessage string         `json:"error_message,omitempty"`
+	Metadata     map[string]any `json:"metadata"`
 }
 
 // FileWatcher ファイル監視器
@@ -381,13 +430,14 @@ func NewZeroDowntimeConfigSystem(configFile string) *ZeroDowntimeConfigSystem {
 	}
 
 	// API エンドポイント設定
-	mux.HandleFunc("/api/config", system.configAPIHandler)
-	mux.HandleFunc("/api/config/reload", system.reloadAPIHandler)
-	mux.HandleFunc("/api/config/rollback", system.rollbackAPIHandler)
-	mux.HandleFunc("/api/config/versions", system.versionsAPIHandler)
-	mux.HandleFunc("/api/config/audit", system.auditAPIHandler)
-	mux.HandleFunc("/api/config/health", system.healthAPIHandler)
-	mux.HandleFunc("/api/rollout/status", system.rolloutStatusAPIHandler)
+	mux.HandleFunc("GET /api/config", system.configGetAPIHandler)
+	mux.HandleFunc("POST /api/config", system.configPostAPIHandler)
+	mux.HandleFunc("POST /api/config/reload", system.reloadAPIHandler)
+	mux.HandleFunc("POST /api/config/rollback", system.rollbackAPIHandler)
+	mux.HandleFunc("GET /api/config/versions", system.versionsAPIHandler)
+	mux.HandleFunc("GET /api/config/audit", system.auditAPIHandler)
+	mux.HandleFunc("GET /api/config/health", system.healthAPIHandler)
+	mux.HandleFunc("GET /api/rollout/status", system.rolloutStatusAPIHandler)
 
 	// デフォルトのヘルスチェック追加
 	system.addDefaultHealthChecks()
@@ -403,7 +453,15 @@ func NewZeroDowntimeConfigSystem(configFile string) *ZeroDowntimeConfigSystem {
 
 // Start システム開始
 func (zcs *ZeroDowntimeConfigSystem) Start(ctx context.Context) error {
-	zcs.isRunning = true
+	zcs.stateMu.Lock()
+	defer zcs.stateMu.Unlock()
+	// stopChan は一度 close すると戻せないので、停止後の再開も受け付けない
+	if zcs.stopped {
+		return errSystemStopped
+	}
+	if zcs.running {
+		return errAlreadyStarted
+	}
 	zcs.startTime = time.Now()
 
 	fmt.Println("ゼロダウンタイム設定更新システム開始")
@@ -418,43 +476,50 @@ func (zcs *ZeroDowntimeConfigSystem) Start(ctx context.Context) error {
 		return fmt.Errorf("初期設定読み込みエラー: %w", err)
 	}
 
-	// ファイル監視開始
-	if err := zcs.startFileWatching(ctx); err != nil {
-		return fmt.Errorf("ファイル監視開始エラー: %w", err)
+	// ポートの確保はここで行い、失敗を呼び出し側に返す
+	listener, err := net.Listen("tcp", zcs.httpServer.Addr)
+	if err != nil {
+		return fmt.Errorf("APIサーバー起動エラー: %w", err)
 	}
 
+	// ファイル監視開始
+	zcs.startFileWatching(ctx)
+
 	// 設定更新処理開始
-	zcs.wg.Add(1)
-	go zcs.configUpdateLoop(ctx)
+	zcs.wg.Go(func() { zcs.configUpdateLoop(ctx) })
 
 	// ヘルスチェック開始
-	zcs.wg.Add(1)
-	go zcs.healthCheckLoop(ctx)
+	zcs.wg.Go(func() { zcs.healthCheckLoop(ctx) })
 
 	// ロールアウト監視開始
-	zcs.wg.Add(1)
-	go zcs.rolloutMonitoringLoop(ctx)
+	zcs.wg.Go(func() { zcs.rolloutMonitoringLoop(ctx) })
 
 	// 自動ロールバック監視開始
-	zcs.wg.Add(1)
-	go zcs.autoRollbackLoop(ctx)
+	zcs.wg.Go(func() { zcs.autoRollbackLoop(ctx) })
 
 	// HTTPサーバー開始
-	go func() {
-		fmt.Printf("設定管理APIサーバー開始: %s\n", zcs.httpServer.Addr)
-		if err := zcs.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	fmt.Printf("設定管理APIサーバー開始: %s\n", listener.Addr())
+	zcs.wg.Go(func() {
+		if err := zcs.httpServer.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			fmt.Printf("APIサーバーエラー: %v\n", err)
 		}
-	}()
+	})
 
+	zcs.running = true
 	return nil
 }
 
-// Stop システム停止
+// Stop システム停止。二度目以降の呼び出しは何もしない
 func (zcs *ZeroDowntimeConfigSystem) Stop() error {
-	fmt.Println("ゼロダウンタイム設定更新システム停止中...")
+	zcs.stateMu.Lock()
+	defer zcs.stateMu.Unlock()
+	if !zcs.running {
+		return nil
+	}
+	zcs.running = false
+	zcs.stopped = true
 
-	zcs.isRunning = false
+	fmt.Println("ゼロダウンタイム設定更新システム停止中...")
 	close(zcs.stopChan)
 
 	// HTTPサーバー停止
@@ -499,9 +564,7 @@ func (zcs *ZeroDowntimeConfigSystem) loadInitialConfig() error {
 		return fmt.Errorf("設定検証エラー: %w", err)
 	}
 
-	zcs.configManager.mutex.Lock()
-	zcs.configManager.currentConfig = &config
-	zcs.configManager.mutex.Unlock()
+	zcs.configManager.currentConfig.Store(&config)
 
 	// バージョン記録
 	zcs.versionController.addVersion(&config, "initial_load", "system")
@@ -548,7 +611,7 @@ func (zcs *ZeroDowntimeConfigSystem) createDefaultConfig() error {
 			"feature_b": false,
 			"feature_c": true,
 		},
-		CustomSettings: map[string]interface{}{
+		CustomSettings: map[string]any{
 			"max_retry_count": 3,
 			"batch_size":      1000,
 			"enable_metrics":  true,
@@ -566,9 +629,7 @@ func (zcs *ZeroDowntimeConfigSystem) createDefaultConfig() error {
 
 	defaultConfig.Checksum = zcs.calculateChecksum(configData)
 
-	zcs.configManager.mutex.Lock()
-	zcs.configManager.currentConfig = defaultConfig
-	zcs.configManager.mutex.Unlock()
+	zcs.configManager.currentConfig.Store(defaultConfig)
 
 	fmt.Println("デフォルト設定ファイルを作成しました")
 	return nil
@@ -582,6 +643,14 @@ func (zcs *ZeroDowntimeConfigSystem) calculateChecksum(data []byte) string {
 
 // validateConfig 設定検証
 func (zcs *ZeroDowntimeConfigSystem) validateConfig(config *ApplicationConfig) error {
+	// server と database は API から欠けた状態で届きうるので、参照前に確かめる
+	if config.Server == nil {
+		return errors.New("サーバー設定がありません")
+	}
+	if config.Database == nil {
+		return errors.New("データベース設定がありません")
+	}
+
 	// 基本的な検証
 	if config.Server.Port <= 0 || config.Server.Port > 65535 {
 		return fmt.Errorf("無効なサーバーポート: %d", config.Server.Port)
@@ -611,7 +680,7 @@ func (zcs *ZeroDowntimeConfigSystem) validateConfig(config *ApplicationConfig) e
 }
 
 // startFileWatching ファイル監視開始
-func (zcs *ZeroDowntimeConfigSystem) startFileWatching(ctx context.Context) error {
+func (zcs *ZeroDowntimeConfigSystem) startFileWatching(ctx context.Context) {
 	watcher := &FileWatcher{
 		filePath: zcs.configManager.configFile,
 		interval: 1 * time.Second,
@@ -642,20 +711,18 @@ func (zcs *ZeroDowntimeConfigSystem) startFileWatching(ctx context.Context) erro
 	zcs.configManager.watchers["config"] = watcher
 
 	// 監視ループ開始
-	go zcs.fileWatchLoop(ctx, watcher)
+	zcs.wg.Go(func() { zcs.fileWatchLoop(ctx, watcher) })
 
 	fmt.Printf("ファイル監視開始: %s\n", watcher.filePath)
-	return nil
 }
 
 // fileWatchLoop ファイル監視ループ
 func (zcs *ZeroDowntimeConfigSystem) fileWatchLoop(ctx context.Context, watcher *FileWatcher) {
-	ticker := time.NewTicker(watcher.interval)
-	defer ticker.Stop()
+	tick := time.Tick(watcher.interval)
 
 	for {
 		select {
-		case <-ticker.C:
+		case <-tick:
 			if zcs.checkFileChange(watcher) {
 				watcher.callback(watcher.filePath)
 			}
@@ -714,8 +781,6 @@ func (zcs *ZeroDowntimeConfigSystem) stopFileWatching() {
 
 // configUpdateLoop 設定更新処理ループ
 func (zcs *ZeroDowntimeConfigSystem) configUpdateLoop(ctx context.Context) {
-	defer zcs.wg.Done()
-
 	for {
 		select {
 		case event := <-zcs.updateChan:
@@ -736,16 +801,25 @@ func (zcs *ZeroDowntimeConfigSystem) configUpdateLoop(ctx context.Context) {
 func (zcs *ZeroDowntimeConfigSystem) processConfigUpdate(event *ConfigUpdateEvent) error {
 	fmt.Printf("設定更新処理開始: %s\n", event.Type)
 
-	// 新しい設定読み込み
-	newConfig, err := zcs.loadConfigFromFile()
-	if err != nil {
-		return fmt.Errorf("設定ファイル読み込みエラー: %w", err)
+	// API から届いた設定があればそれを使い、なければファイルから読む
+	newConfig := event.NewConfig
+	if newConfig != nil {
+		data, err := json.Marshal(newConfig)
+		if err != nil {
+			return fmt.Errorf("設定のエンコードエラー: %w", err)
+		}
+		newConfig.Checksum = zcs.calculateChecksum(data)
+		newConfig.Timestamp = time.Now()
+	} else {
+		var err error
+		newConfig, err = zcs.loadConfigFromFile()
+		if err != nil {
+			return fmt.Errorf("設定ファイル読み込みエラー: %w", err)
+		}
 	}
 
 	// 現在の設定を取得
-	zcs.configManager.mutex.RLock()
-	oldConfig := zcs.configManager.currentConfig
-	zcs.configManager.mutex.RUnlock()
+	oldConfig := zcs.configManager.currentConfig.Load()
 
 	event.OldConfig = oldConfig
 	event.NewConfig = newConfig
@@ -762,8 +836,7 @@ func (zcs *ZeroDowntimeConfigSystem) processConfigUpdate(event *ConfigUpdateEven
 	}
 
 	// バックアップ作成
-	_, err = zcs.createConfigBackup(oldConfig)
-	if err != nil {
+	if _, err := zcs.createConfigBackup(oldConfig); err != nil {
 		fmt.Printf("バックアップ作成警告: %v\n", err)
 	}
 
@@ -773,7 +846,7 @@ func (zcs *ZeroDowntimeConfigSystem) processConfigUpdate(event *ConfigUpdateEven
 	}
 
 	// 設定更新カウンター増加
-	atomic.AddInt64(&zcs.updateCount, 1)
+	zcs.updateCount.Add(1)
 	zcs.lastConfigUpdate = time.Now()
 
 	// 監査ログ記録
@@ -846,9 +919,7 @@ func (zcs *ZeroDowntimeConfigSystem) startCanaryRollout(newConfig *ApplicationCo
 	zcs.rolloutManager.currentRollout = execution
 
 	// トラフィック分散器初期化
-	zcs.rolloutManager.trafficSplitter.currentPercent = 0
-	zcs.rolloutManager.trafficSplitter.targetPercent = execution.Strategy.Stages[0].TrafficPercent
-	zcs.rolloutManager.trafficSplitter.isActive = true
+	zcs.rolloutManager.trafficSplitter.set(0, execution.Strategy.Stages[0].TrafficPercent, true)
 
 	// 段階的適用開始
 	if err := zcs.applyConfigGradually(newConfig, execution); err != nil {
@@ -867,9 +938,7 @@ func (zcs *ZeroDowntimeConfigSystem) applyConfigGradually(newConfig *Application
 	fmt.Printf("ロールアウト段階 %d: %s (%d%% トラフィック)\n", execution.CurrentStage+1, stage.Name, stage.TrafficPercent)
 
 	// トラフィック分散設定
-	zcs.rolloutManager.trafficSplitter.mutex.Lock()
-	zcs.rolloutManager.trafficSplitter.targetPercent = stage.TrafficPercent
-	zcs.rolloutManager.trafficSplitter.mutex.Unlock()
+	zcs.rolloutManager.trafficSplitter.setTarget(stage.TrafficPercent)
 
 	// 設定の一部適用（トラフィック比率に応じて）
 	if err := zcs.applyConfigPartially(newConfig, stage.TrafficPercent); err != nil {
@@ -889,9 +958,7 @@ func (zcs *ZeroDowntimeConfigSystem) applyConfigPartially(newConfig *Application
 
 	if trafficPercent >= 100 {
 		// 全トラフィックに適用
-		zcs.configManager.mutex.Lock()
-		zcs.configManager.currentConfig = newConfig
-		zcs.configManager.mutex.Unlock()
+		zcs.configManager.currentConfig.Store(newConfig)
 
 		// リロードコールバック実行
 		for _, callback := range zcs.configManager.reloadCallbacks {
@@ -915,14 +982,11 @@ func (zcs *ZeroDowntimeConfigSystem) applyConfigPartially(newConfig *Application
 
 // healthCheckLoop ヘルスチェックループ
 func (zcs *ZeroDowntimeConfigSystem) healthCheckLoop(ctx context.Context) {
-	defer zcs.wg.Done()
-
-	ticker := time.NewTicker(zcs.healthChecker.checkInterval)
-	defer ticker.Stop()
+	tick := time.Tick(zcs.healthChecker.checkInterval)
 
 	for {
 		select {
-		case <-ticker.C:
+		case <-tick:
 			zcs.performHealthChecks()
 
 		case <-ctx.Done():
@@ -935,23 +999,20 @@ func (zcs *ZeroDowntimeConfigSystem) healthCheckLoop(ctx context.Context) {
 
 // performHealthChecks ヘルスチェック実行
 func (zcs *ZeroDowntimeConfigSystem) performHealthChecks() {
-	zcs.healthChecker.mutex.Lock()
-	defer zcs.healthChecker.mutex.Unlock()
-
-	zcs.configManager.mutex.RLock()
-	currentConfig := zcs.configManager.currentConfig
-	zcs.configManager.mutex.RUnlock()
-
+	currentConfig := zcs.configManager.currentConfig.Load()
 	if currentConfig == nil {
 		return
 	}
 
+	zcs.healthChecker.mutex.RLock()
+	checks := maps.Clone(zcs.healthChecker.checks)
+	zcs.healthChecker.mutex.RUnlock()
+
 	allHealthy := true
+	results := make(map[string]*HealthCheckResult, len(checks))
 
-	for name, check := range zcs.healthChecker.checks {
+	for name, check := range checks {
 		startTime := time.Now()
-
-		_, cancel := context.WithTimeout(context.Background(), zcs.healthChecker.timeout)
 
 		result := &HealthCheckResult{
 			Name:      name,
@@ -970,12 +1031,15 @@ func (zcs *ZeroDowntimeConfigSystem) performHealthChecks() {
 			result.Status = "healthy"
 		}
 
-		zcs.healthChecker.lastCheckResults[name] = result
-		cancel()
+		results[name] = result
 	}
 
+	zcs.healthChecker.mutex.Lock()
+	maps.Copy(zcs.healthChecker.lastCheckResults, results)
+	zcs.healthChecker.mutex.Unlock()
+
+	// 失敗時の処理はロールバック判定で healthChecker.mutex を取り直すので、ロックを外してから呼ぶ
 	if !allHealthy {
-		// ヘルスチェック失敗時の処理
 		zcs.handleHealthCheckFailure()
 	}
 }
@@ -984,10 +1048,10 @@ func (zcs *ZeroDowntimeConfigSystem) performHealthChecks() {
 func (zcs *ZeroDowntimeConfigSystem) handleHealthCheckFailure() {
 	// 進行中のロールアウトがある場合は停止を検討
 	zcs.rolloutManager.mutex.RLock()
-	currentRollout := zcs.rolloutManager.currentRollout
+	inProgress := zcs.rolloutManager.currentRollout != nil && zcs.rolloutManager.currentRollout.Status == "in_progress"
 	zcs.rolloutManager.mutex.RUnlock()
 
-	if currentRollout != nil && currentRollout.Status == "in_progress" {
+	if inProgress {
 		fmt.Println("ヘルスチェック失敗により、ロールアウトを一時停止します")
 
 		// 自動ロールバックトリガーをチェック
@@ -997,14 +1061,11 @@ func (zcs *ZeroDowntimeConfigSystem) handleHealthCheckFailure() {
 
 // rolloutMonitoringLoop ロールアウト監視ループ
 func (zcs *ZeroDowntimeConfigSystem) rolloutMonitoringLoop(ctx context.Context) {
-	defer zcs.wg.Done()
-
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
+	tick := time.Tick(30 * time.Second)
 
 	for {
 		select {
-		case <-ticker.C:
+		case <-tick:
 			zcs.monitorRolloutProgress()
 
 		case <-ctx.Done():
@@ -1016,12 +1077,12 @@ func (zcs *ZeroDowntimeConfigSystem) rolloutMonitoringLoop(ctx context.Context) 
 }
 
 // monitorRolloutProgress ロールアウト進捗監視
+// ロールアウトの状態は API やロールバック判定からも読まれるので、更新は rolloutManager.mutex の中で行う
 func (zcs *ZeroDowntimeConfigSystem) monitorRolloutProgress() {
-	zcs.rolloutManager.mutex.RLock()
+	zcs.rolloutManager.mutex.Lock()
 	currentRollout := zcs.rolloutManager.currentRollout
-	zcs.rolloutManager.mutex.RUnlock()
-
 	if currentRollout == nil || currentRollout.Status != "in_progress" {
+		zcs.rolloutManager.mutex.Unlock()
 		return
 	}
 
@@ -1038,9 +1099,12 @@ func (zcs *ZeroDowntimeConfigSystem) monitorRolloutProgress() {
 			zcs.completeRollout(currentRollout)
 		}
 	}
+	timedOut := currentRollout.Status == "in_progress" &&
+		time.Since(currentRollout.StartTime) > currentRollout.Strategy.MaxDuration
+	zcs.rolloutManager.mutex.Unlock()
 
-	// タイムアウトチェック
-	if time.Since(currentRollout.StartTime) > currentRollout.Strategy.MaxDuration {
+	// タイムアウトチェック（ロールバックは rolloutManager.mutex を自分で取る）
+	if timedOut {
 		fmt.Println("ロールアウトがタイムアウトしました")
 		zcs.triggerAutoRollback("timeout", "ロールアウトがタイムアウトしました")
 	}
@@ -1049,7 +1113,7 @@ func (zcs *ZeroDowntimeConfigSystem) monitorRolloutProgress() {
 // updateRolloutMetrics ロールアウトメトリクス更新
 func (zcs *ZeroDowntimeConfigSystem) updateRolloutMetrics(rollout *RolloutExecution) {
 	// 簡略化のため、模擬メトリクスを生成
-	rollout.Metrics.TotalRequests = atomic.LoadInt64(&zcs.rolloutManager.trafficSplitter.requestCounter)
+	rollout.Metrics.TotalRequests = zcs.rolloutManager.trafficSplitter.requestCounter.Load()
 	rollout.Metrics.SuccessfulRequests = rollout.Metrics.TotalRequests * 95 / 100 // 95% 成功率を仮定
 	rollout.Metrics.FailedRequests = rollout.Metrics.TotalRequests - rollout.Metrics.SuccessfulRequests
 
@@ -1095,18 +1159,15 @@ func (zcs *ZeroDowntimeConfigSystem) checkSuccessCriteria(rollout *RolloutExecut
 	return true
 }
 
-// promoteToNextStage 次段階への昇格
+// promoteToNextStage 次段階への昇格。呼び出し側が rolloutManager.mutex を持つ
 func (zcs *ZeroDowntimeConfigSystem) promoteToNextStage(rollout *RolloutExecution) {
-	zcs.rolloutManager.mutex.Lock()
-	defer zcs.rolloutManager.mutex.Unlock()
-
 	rollout.CurrentStage++
 	nextStage := rollout.Strategy.Stages[rollout.CurrentStage]
 
 	fmt.Printf("次段階に昇格: %s (%d%% トラフィック)\n", nextStage.Name, nextStage.TrafficPercent)
 
 	// トラフィック分散更新
-	zcs.rolloutManager.trafficSplitter.targetPercent = nextStage.TrafficPercent
+	zcs.rolloutManager.trafficSplitter.setTarget(nextStage.TrafficPercent)
 
 	// 設定の適用範囲拡大
 	zcs.configManager.mutex.RLock()
@@ -1120,41 +1181,35 @@ func (zcs *ZeroDowntimeConfigSystem) promoteToNextStage(rollout *RolloutExecutio
 	}
 }
 
-// completeRollout ロールアウト完了
+// completeRollout ロールアウト完了。呼び出し側が rolloutManager.mutex を持つ
 func (zcs *ZeroDowntimeConfigSystem) completeRollout(rollout *RolloutExecution) {
-	zcs.rolloutManager.mutex.Lock()
-	defer zcs.rolloutManager.mutex.Unlock()
-
 	rollout.Status = "completed"
 
 	// 全トラフィックに適用
 	zcs.configManager.mutex.Lock()
 	if zcs.configManager.pendingConfig != nil {
-		zcs.configManager.currentConfig = zcs.configManager.pendingConfig
+		zcs.configManager.currentConfig.Store(zcs.configManager.pendingConfig)
 		zcs.configManager.pendingConfig = nil
 	}
 	zcs.configManager.mutex.Unlock()
 
 	// トラフィック分散終了
-	zcs.rolloutManager.trafficSplitter.isActive = false
-	zcs.rolloutManager.trafficSplitter.currentPercent = 100
+	target := zcs.rolloutManager.trafficSplitter.snapshot().TargetPercent
+	zcs.rolloutManager.trafficSplitter.set(100, target, false)
 
 	fmt.Printf("ロールアウト完了: %s\n", rollout.ID)
 
 	// 監査ログ記録
-	zcs.auditLogger.logAction("rollout_completed", zcs.configManager.currentConfig, "system", "カナリアリリース完了", "success", "")
+	zcs.auditLogger.logAction("rollout_completed", zcs.configManager.currentConfig.Load(), "system", "カナリアリリース完了", "success", "")
 }
 
 // autoRollbackLoop 自動ロールバックループ
 func (zcs *ZeroDowntimeConfigSystem) autoRollbackLoop(ctx context.Context) {
-	defer zcs.wg.Done()
-
-	ticker := time.NewTicker(zcs.rollbackManager.checkInterval)
-	defer ticker.Stop()
+	tick := time.Tick(zcs.rollbackManager.checkInterval)
 
 	for {
 		select {
-		case <-ticker.C:
+		case <-tick:
 			if zcs.rollbackManager.isEnabled {
 				zcs.checkRollbackTriggers()
 			}
@@ -1191,8 +1246,8 @@ func (zcs *ZeroDowntimeConfigSystem) evaluateRollbackTrigger(trigger *RollbackTr
 	switch trigger.Type {
 	case "error_rate":
 		zcs.rolloutManager.mutex.RLock()
+		defer zcs.rolloutManager.mutex.RUnlock()
 		currentRollout := zcs.rolloutManager.currentRollout
-		zcs.rolloutManager.mutex.RUnlock()
 
 		if currentRollout != nil && currentRollout.Metrics.ErrorRate > trigger.Threshold {
 			return true
@@ -1200,8 +1255,8 @@ func (zcs *ZeroDowntimeConfigSystem) evaluateRollbackTrigger(trigger *RollbackTr
 
 	case "response_time":
 		zcs.rolloutManager.mutex.RLock()
+		defer zcs.rolloutManager.mutex.RUnlock()
 		currentRollout := zcs.rolloutManager.currentRollout
-		zcs.rolloutManager.mutex.RUnlock()
 
 		if currentRollout != nil {
 			thresholdMs := trigger.Threshold
@@ -1213,8 +1268,11 @@ func (zcs *ZeroDowntimeConfigSystem) evaluateRollbackTrigger(trigger *RollbackTr
 
 	case "health_check_failure":
 		zcs.healthChecker.mutex.RLock()
-		results := zcs.healthChecker.lastCheckResults
+		results := maps.Clone(zcs.healthChecker.lastCheckResults)
 		zcs.healthChecker.mutex.RUnlock()
+		if len(results) == 0 {
+			return false
+		}
 
 		failureCount := 0
 		for _, result := range results {
@@ -1280,7 +1338,7 @@ func (zcs *ZeroDowntimeConfigSystem) triggerAutoRollback(triggerName, reason str
 	zcs.rollbackManager.mutex.Unlock()
 
 	// 監査ログ記録
-	zcs.auditLogger.logAction("auto_rollback", zcs.configManager.currentConfig, "system", reason, "success", "")
+	zcs.auditLogger.logAction("auto_rollback", zcs.configManager.currentConfig.Load(), "system", reason, "success", "")
 
 	fmt.Println("自動ロールバック完了")
 }
@@ -1304,16 +1362,12 @@ func (zcs *ZeroDowntimeConfigSystem) rollbackToPreviousVersion(triggerName, reas
 
 	// 設定復元
 	zcs.configManager.mutex.Lock()
-	zcs.configManager.currentConfig = previousVersion.Config
+	zcs.configManager.currentConfig.Store(previousVersion.Config)
 	zcs.configManager.pendingConfig = nil
 	zcs.configManager.mutex.Unlock()
 
 	// トラフィック分散リセット
-	zcs.rolloutManager.trafficSplitter.mutex.Lock()
-	zcs.rolloutManager.trafficSplitter.isActive = false
-	zcs.rolloutManager.trafficSplitter.currentPercent = 100
-	zcs.rolloutManager.trafficSplitter.targetPercent = 100
-	zcs.rolloutManager.trafficSplitter.mutex.Unlock()
+	zcs.rolloutManager.trafficSplitter.set(100, 100, false)
 
 	// リロードコールバック実行
 	for _, callback := range zcs.configManager.reloadCallbacks {
@@ -1372,7 +1426,7 @@ func (zcs *ZeroDowntimeConfigSystem) addDefaultValidationRules() {
 			Type:       "port_validation",
 			Required:   true,
 			ErrorLevel: "error",
-			Parameters: map[string]interface{}{
+			Parameters: map[string]any{
 				"min_port": 1,
 				"max_port": 65535,
 			},
@@ -1382,7 +1436,7 @@ func (zcs *ZeroDowntimeConfigSystem) addDefaultValidationRules() {
 			Type:       "timeout_validation",
 			Required:   true,
 			ErrorLevel: "warning",
-			Parameters: map[string]interface{}{
+			Parameters: map[string]any{
 				"min_timeout": "1s",
 				"max_timeout": "300s",
 			},
@@ -1390,10 +1444,10 @@ func (zcs *ZeroDowntimeConfigSystem) addDefaultValidationRules() {
 	}
 
 	// カスタム検証関数登録
-	zcs.validator.customValidators["port_validation"] = func(config *ApplicationConfig, params map[string]interface{}) error {
+	zcs.validator.customValidators["port_validation"] = func(config *ApplicationConfig, params map[string]any) error {
 		// パラメータの型を安全に変換
 		var minPort, maxPort int
-		
+
 		switch v := params["min_port"].(type) {
 		case int:
 			minPort = v
@@ -1402,7 +1456,7 @@ func (zcs *ZeroDowntimeConfigSystem) addDefaultValidationRules() {
 		default:
 			minPort = 1
 		}
-		
+
 		switch v := params["max_port"].(type) {
 		case int:
 			maxPort = v
@@ -1423,7 +1477,7 @@ func (zcs *ZeroDowntimeConfigSystem) addDefaultValidationRules() {
 		return nil
 	}
 
-	zcs.validator.customValidators["timeout_validation"] = func(config *ApplicationConfig, params map[string]interface{}) error {
+	zcs.validator.customValidators["timeout_validation"] = func(config *ApplicationConfig, params map[string]any) error {
 		// タイムアウト値の妥当性チェック（簡略化）
 		if config.Server.ReadTimeout < 1*time.Second {
 			return fmt.Errorf("読み取りタイムアウトが短すぎます: %v", config.Server.ReadTimeout)
@@ -1487,7 +1541,7 @@ func (vcr *ConfigVersionController) addVersion(config *ApplicationConfig, reason
 		vcr.versions = vcr.versions[1:]
 	}
 
-	atomic.AddInt64(&vcr.versionCounter, 1)
+	vcr.versionCounter.Add(1)
 }
 
 // 監査ログメソッド群
@@ -1509,7 +1563,7 @@ func (cal *ConfigAuditLogger) logAction(action string, config *ApplicationConfig
 
 	if config != nil {
 		entry.ConfigVersion = config.Version
-		entry.Changes = map[string]interface{}{
+		entry.Changes = map[string]any{
 			"version":   config.Version,
 			"checksum":  config.Checksum,
 			"timestamp": config.Timestamp,
@@ -1557,60 +1611,72 @@ func (cal *ConfigAuditLogger) writeToFile(entry *AuditEntry) {
 
 // HTTP API ハンドラー群
 
-// configAPIHandler 設定APIハンドラー
-func (zcs *ZeroDowntimeConfigSystem) configAPIHandler(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case "GET":
-		zcs.configManager.mutex.RLock()
-		config := zcs.configManager.currentConfig
-		zcs.configManager.mutex.RUnlock()
-
-		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(config); err != nil {
-			fmt.Printf("設定エンコードエラー: %v\n", err)
-		}
-
-	case "POST":
-		var newConfig ApplicationConfig
-		if err := json.NewDecoder(r.Body).Decode(&newConfig); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-
-		event := &ConfigUpdateEvent{
-			Type:      "api_update",
-			Timestamp: time.Now(),
-			NewConfig: &newConfig,
-			Source:    "api",
-			UserID:    r.Header.Get("X-User-ID"),
-			Reason:    r.Header.Get("X-Change-Reason"),
-		}
-
-		select {
-		case zcs.updateChan <- event:
-			w.WriteHeader(http.StatusAccepted)
-			if err := json.NewEncoder(w).Encode(map[string]string{
-				"status":  "accepted",
-				"message": "設定更新を受け付けました",
-			}); err != nil {
-				fmt.Printf("受付応答エンコードエラー: %v\n", err)
-			}
-		default:
-			http.Error(w, "設定更新キューが満杯です", http.StatusServiceUnavailable)
-		}
-
+// isStopped Stop 済みかどうか
+func (zcs *ZeroDowntimeConfigSystem) isStopped() bool {
+	select {
+	case <-zcs.stopChan:
+		return true
 	default:
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return false
+	}
+}
+
+// enqueueUpdate 設定更新イベントをキューに入れる。停止後や満杯のときはエラーを返す
+func (zcs *ZeroDowntimeConfigSystem) enqueueUpdate(event *ConfigUpdateEvent) error {
+	if zcs.isStopped() {
+		return errSystemStopped
+	}
+	select {
+	case zcs.updateChan <- event:
+		return nil
+	default:
+		return errors.New("設定更新キューが満杯です")
+	}
+}
+
+// configGetAPIHandler 設定取得APIハンドラー
+func (zcs *ZeroDowntimeConfigSystem) configGetAPIHandler(w http.ResponseWriter, r *http.Request) {
+	config := zcs.configManager.currentConfig.Load()
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(config); err != nil {
+		fmt.Printf("設定エンコードエラー: %v\n", err)
+	}
+}
+
+// configPostAPIHandler 設定更新APIハンドラー
+func (zcs *ZeroDowntimeConfigSystem) configPostAPIHandler(w http.ResponseWriter, r *http.Request) {
+	var newConfig ApplicationConfig
+	if err := json.NewDecoder(r.Body).Decode(&newConfig); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	event := &ConfigUpdateEvent{
+		Type:      "api_update",
+		Timestamp: time.Now(),
+		NewConfig: &newConfig,
+		Source:    "api",
+		UserID:    r.Header.Get("X-User-ID"),
+		Reason:    r.Header.Get("X-Change-Reason"),
+	}
+
+	if err := zcs.enqueueUpdate(event); err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	if err := json.NewEncoder(w).Encode(map[string]string{
+		"status":  "accepted",
+		"message": "設定更新を受け付けました",
+	}); err != nil {
+		fmt.Printf("受付応答エンコードエラー: %v\n", err)
 	}
 }
 
 // reloadAPIHandler リロードAPIハンドラー
 func (zcs *ZeroDowntimeConfigSystem) reloadAPIHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
 	event := &ConfigUpdateEvent{
 		Type:      "manual_reload",
 		Timestamp: time.Now(),
@@ -1619,27 +1685,21 @@ func (zcs *ZeroDowntimeConfigSystem) reloadAPIHandler(w http.ResponseWriter, r *
 		Reason:    "手動リロード要求",
 	}
 
-	select {
-	case zcs.updateChan <- event:
-		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(map[string]string{
-			"status":  "success",
-			"message": "設定リロードを開始しました",
-		}); err != nil {
-			fmt.Printf("リロード応答エンコードエラー: %v\n", err)
-		}
-	default:
-		http.Error(w, "設定更新キューが満杯です", http.StatusServiceUnavailable)
+	if err := zcs.enqueueUpdate(event); err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(map[string]string{
+		"status":  "success",
+		"message": "設定リロードを開始しました",
+	}); err != nil {
+		fmt.Printf("リロード応答エンコードエラー: %v\n", err)
 	}
 }
 
 // rollbackAPIHandler ロールバックAPIハンドラー
 func (zcs *ZeroDowntimeConfigSystem) rollbackAPIHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
 	reason := r.Header.Get("X-Rollback-Reason")
 	if reason == "" {
 		reason = "手動ロールバック要求"
@@ -1662,7 +1722,7 @@ func (zcs *ZeroDowntimeConfigSystem) rollbackAPIHandler(w http.ResponseWriter, r
 // versionsAPIHandler バージョンAPIハンドラー
 func (zcs *ZeroDowntimeConfigSystem) versionsAPIHandler(w http.ResponseWriter, r *http.Request) {
 	zcs.versionController.mutex.RLock()
-	versions := zcs.versionController.versions
+	versions := slices.Clone(zcs.versionController.versions)
 	zcs.versionController.mutex.RUnlock()
 
 	w.Header().Set("Content-Type", "application/json")
@@ -1674,7 +1734,7 @@ func (zcs *ZeroDowntimeConfigSystem) versionsAPIHandler(w http.ResponseWriter, r
 // auditAPIHandler 監査APIハンドラー
 func (zcs *ZeroDowntimeConfigSystem) auditAPIHandler(w http.ResponseWriter, r *http.Request) {
 	zcs.auditLogger.mutex.RLock()
-	entries := zcs.auditLogger.auditEntries
+	entries := slices.Clone(zcs.auditLogger.auditEntries)
 	zcs.auditLogger.mutex.RUnlock()
 
 	w.Header().Set("Content-Type", "application/json")
@@ -1686,7 +1746,7 @@ func (zcs *ZeroDowntimeConfigSystem) auditAPIHandler(w http.ResponseWriter, r *h
 // healthAPIHandler ヘルスAPIハンドラー
 func (zcs *ZeroDowntimeConfigSystem) healthAPIHandler(w http.ResponseWriter, r *http.Request) {
 	zcs.healthChecker.mutex.RLock()
-	results := zcs.healthChecker.lastCheckResults
+	results := maps.Clone(zcs.healthChecker.lastCheckResults)
 	zcs.healthChecker.mutex.RUnlock()
 
 	overallStatus := "healthy"
@@ -1697,7 +1757,7 @@ func (zcs *ZeroDowntimeConfigSystem) healthAPIHandler(w http.ResponseWriter, r *
 		}
 	}
 
-	response := map[string]interface{}{
+	response := map[string]any{
 		"overall_status": overallStatus,
 		"checks":         results,
 		"timestamp":      time.Now(),
@@ -1714,14 +1774,20 @@ func (zcs *ZeroDowntimeConfigSystem) healthAPIHandler(w http.ResponseWriter, r *
 
 // rolloutStatusAPIHandler ロールアウトステータスAPIハンドラー
 func (zcs *ZeroDowntimeConfigSystem) rolloutStatusAPIHandler(w http.ResponseWriter, r *http.Request) {
+	// 監視ループが更新し続けるので、ロックの中で値として写し取ってからエンコードする
+	var currentRollout *RolloutExecution
 	zcs.rolloutManager.mutex.RLock()
-	currentRollout := zcs.rolloutManager.currentRollout
-	trafficSplitter := zcs.rolloutManager.trafficSplitter
+	if r := zcs.rolloutManager.currentRollout; r != nil {
+		rollout := *r
+		metrics := *r.Metrics
+		rollout.Metrics = &metrics
+		currentRollout = &rollout
+	}
 	zcs.rolloutManager.mutex.RUnlock()
 
-	response := map[string]interface{}{
+	response := map[string]any{
 		"current_rollout":   currentRollout,
-		"traffic_splitting": trafficSplitter,
+		"traffic_splitting": zcs.rolloutManager.trafficSplitter.snapshot(),
 		"timestamp":         time.Now(),
 	}
 
@@ -1735,7 +1801,8 @@ func main() {
 	// ゼロダウンタイム設定更新システムを作成
 	configSystem := NewZeroDowntimeConfigSystem("app_config.json")
 
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	// システム開始
 	if err := configSystem.Start(ctx); err != nil {
@@ -1755,8 +1822,11 @@ func main() {
 	fmt.Println("- GET  /api/rollout/status   (ロールアウト状況)")
 	fmt.Println("\nCtrl+Cで停止")
 
-	// 30秒間実行
-	time.Sleep(30 * time.Second)
+	// 30秒間、または Ctrl+C を受けるまで実行
+	select {
+	case <-ctx.Done():
+	case <-time.After(30 * time.Second):
+	}
 
 	// システム停止
 	if err := configSystem.Stop(); err != nil {

@@ -3,11 +3,15 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"runtime"
+	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -40,9 +44,8 @@ func TestNewProfilingSystem(t *testing.T) {
 }
 
 func TestProfilingSystemStartStop(t *testing.T) {
-	profiler := NewProfilingSystem(8082, 1*time.Second, 1*time.Hour)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	profiler := NewProfilingSystem(0, 1*time.Second, 1*time.Hour)
+	ctx := t.Context()
 
 	// システム開始
 	err := profiler.StartProfiling(ctx)
@@ -50,12 +53,21 @@ func TestProfilingSystemStartStop(t *testing.T) {
 		t.Fatalf("StartProfiling failed: %v", err)
 	}
 
-	if !profiler.running {
+	if !profiler.running.Load() {
 		t.Error("Expected running to be true after StartProfiling")
 	}
 
-	// 少し待機してプロファイル収集を確認
-	time.Sleep(2 * time.Second)
+	// 起動したサーバーに実際に届くことを確認
+	resp, err := http.Get("http://" + profiler.listenAddr() + "/health")
+	if err != nil {
+		t.Fatalf("GET /health failed: %v", err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Errorf("Close failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("Expected status 200, got %d", resp.StatusCode)
+	}
 
 	// システム停止
 	err = profiler.Stop()
@@ -63,7 +75,7 @@ func TestProfilingSystemStartStop(t *testing.T) {
 		t.Fatalf("Stop failed: %v", err)
 	}
 
-	if profiler.running {
+	if profiler.running.Load() {
 		t.Error("Expected running to be false after Stop")
 	}
 }
@@ -130,10 +142,9 @@ func TestCollectGoroutineInfo(t *testing.T) {
 		t.Error("GoroutineInfo.Count should be positive")
 	}
 
-	// 簡略化された推定値の妥当性確認
-	expectedTotal := info.Running + info.Waiting + info.Sleeping + info.Blocked + info.Syscall
-	if expectedTotal > info.Count {
-		t.Errorf("Sum of goroutine states (%d) exceeds total count (%d)", expectedTotal, info.Count)
+	// 呼び出している goroutine 自身が実行中なので、少なくとも1になる
+	if info.Running < 1 {
+		t.Errorf("Running = %d, want >= 1", info.Running)
 	}
 }
 
@@ -200,7 +211,7 @@ func TestCleanupOldData(t *testing.T) {
 
 func TestHealthHandler(t *testing.T) {
 	profiler := NewProfilingSystem(8087, 30*time.Second, 24*time.Hour)
-	profiler.running = true
+	profiler.running.Store(true)
 
 	req := httptest.NewRequest("GET", "/health", nil)
 	w := httptest.NewRecorder()
@@ -211,7 +222,7 @@ func TestHealthHandler(t *testing.T) {
 		t.Errorf("Expected status 200, got %d", w.Code)
 	}
 
-	var response map[string]interface{}
+	var response map[string]any
 	err := json.NewDecoder(w.Body).Decode(&response)
 	if err != nil {
 		t.Fatalf("Failed to decode response: %v", err)
@@ -238,7 +249,7 @@ func TestMetricsHandler(t *testing.T) {
 		t.Errorf("Expected status 200, got %d", w.Code)
 	}
 
-	var response map[string]interface{}
+	var response map[string]any
 	err := json.NewDecoder(w.Body).Decode(&response)
 	if err != nil {
 		t.Fatalf("Failed to decode response: %v", err)
@@ -261,7 +272,7 @@ func TestProfilesHandler(t *testing.T) {
 		GoroutineInfo: &GoroutineInfo{
 			Count: 10,
 		},
-		Metrics: map[string]interface{}{
+		Metrics: map[string]any{
 			"test": "value",
 		},
 	}
@@ -318,12 +329,7 @@ func TestAlertsHandler(t *testing.T) {
 func TestSaveCPUProfile(t *testing.T) {
 	profiler := NewProfilingSystem(8091, 30*time.Second, 24*time.Hour)
 
-	filename := "test_cpu_profile.out"
-	defer func() {
-		if err := os.Remove(filename); err != nil {
-			t.Logf("Failed to remove test file: %v", err)
-		}
-	}() // テスト後にファイル削除
+	filename := filepath.Join(t.TempDir(), "test_cpu_profile.out")
 
 	err := profiler.SaveCPUProfile(filename, 100*time.Millisecond)
 	if err != nil {
@@ -339,12 +345,7 @@ func TestSaveCPUProfile(t *testing.T) {
 func TestSaveMemProfile(t *testing.T) {
 	profiler := NewProfilingSystem(8092, 30*time.Second, 24*time.Hour)
 
-	filename := "test_mem_profile.out"
-	defer func() {
-		if err := os.Remove(filename); err != nil {
-			t.Logf("Failed to remove test file: %v", err)
-		}
-	}() // テスト後にファイル削除
+	filename := filepath.Join(t.TempDir(), "test_mem_profile.out")
 
 	err := profiler.SaveMemProfile(filename)
 	if err != nil {
@@ -371,8 +372,9 @@ func TestCheckPerformanceAlerts(t *testing.T) {
 		},
 	}
 
-	// アラート判定実行（エラーが発生しないことを確認）
-	profiler.checkPerformanceAlerts(normalData)
+	if alerts := profiler.checkPerformanceAlerts(normalData); len(alerts) != 0 {
+		t.Errorf("Expected no alerts, got %+v", alerts)
+	}
 
 	// アラートが発生するデータ
 	alertData := &ProfileData{
@@ -385,15 +387,15 @@ func TestCheckPerformanceAlerts(t *testing.T) {
 		},
 	}
 
-	// アラート判定実行（エラーが発生しないことを確認）
-	profiler.checkPerformanceAlerts(alertData)
+	if alerts := profiler.checkPerformanceAlerts(alertData); len(alerts) != 2 {
+		t.Errorf("Expected 2 alerts (memory, goroutine), got %+v", alerts)
+	}
 }
 
 func BenchmarkCollectProfiles(b *testing.B) {
 	profiler := NewProfilingSystem(8094, 30*time.Second, 24*time.Hour)
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		profiler.collectProfiles()
 	}
 }
@@ -401,11 +403,140 @@ func BenchmarkCollectProfiles(b *testing.B) {
 func BenchmarkCollectGoroutineInfo(b *testing.B) {
 	profiler := NewProfilingSystem(8095, 30*time.Second, 24*time.Hour)
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		info := profiler.collectGoroutineInfo()
 		if info == nil {
 			b.Fatal("collectGoroutineInfo returned nil")
 		}
+	}
+}
+
+// TestStartStopConcurrentWithHandlers 開始・停止とハンドラーを並行させても panic せず、二重の停止も安全なことを確かめる
+func TestStartStopConcurrentWithHandlers(t *testing.T) {
+	for range 50 {
+		profiler := NewProfilingSystem(0, 10*time.Millisecond, time.Hour)
+		if err := profiler.StartProfiling(t.Context()); err != nil {
+			t.Fatalf("StartProfiling failed: %v", err)
+		}
+
+		var wg sync.WaitGroup
+		wg.Go(func() {
+			profiler.healthHandler(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/health", nil))
+		})
+		wg.Go(func() {
+			profiler.profilesHandler(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/profiles", nil))
+		})
+		if err := profiler.Stop(); err != nil {
+			t.Fatalf("Stop failed: %v", err)
+		}
+		wg.Wait()
+		if err := profiler.Stop(); err != nil {
+			t.Fatalf("二度目の Stop がエラーを返した: %v", err)
+		}
+	}
+}
+
+// TestStartProfilingReportsListenError ポートが使用中なら StartProfiling がエラーを返すことを確かめる
+func TestStartProfilingReportsListenError(t *testing.T) {
+	busy, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatalf("Listen failed: %v", err)
+	}
+	defer func() {
+		if err := busy.Close(); err != nil {
+			t.Errorf("Close failed: %v", err)
+		}
+	}()
+	port := busy.Addr().(*net.TCPAddr).Port
+
+	profiler := NewProfilingSystem(port, time.Hour, time.Hour)
+	err = profiler.StartProfiling(t.Context())
+	if stopErr := profiler.Stop(); stopErr != nil {
+		t.Errorf("Stop failed: %v", stopErr)
+	}
+	if err == nil {
+		t.Fatal("使用中のポートでも StartProfiling がエラーを返さない")
+	}
+}
+
+// TestProfilesHandlerReturnsLatestTen /profiles が新しい順に最大10件を返すことを確かめる
+func TestProfilesHandlerReturnsLatestTen(t *testing.T) {
+	profiler := NewProfilingSystem(0, time.Hour, time.Hour)
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	for i := range 15 {
+		ts := base.Add(time.Duration(i) * time.Second)
+		profiler.profiles[ts.Format(time.RFC3339)] = &ProfileData{Timestamp: ts}
+	}
+
+	w := httptest.NewRecorder()
+	profiler.profilesHandler(w, httptest.NewRequest(http.MethodGet, "/profiles", nil))
+
+	var response []*ProfileData
+	if err := json.NewDecoder(w.Body).Decode(&response); err != nil {
+		t.Fatalf("Decode failed: %v", err)
+	}
+	if len(response) != 10 {
+		t.Fatalf("Expected 10 profiles, got %d", len(response))
+	}
+	for i, profile := range response {
+		want := base.Add(time.Duration(14-i) * time.Second)
+		if !profile.Timestamp.Equal(want) {
+			t.Fatalf("response[%d] = %v, want %v", i, profile.Timestamp, want)
+		}
+	}
+}
+
+// TestProfileCollectionLoopCollectsPeriodically 収集ループが間隔ごとにプロファイルを記録することを確かめる
+func TestProfileCollectionLoopCollectsPeriodically(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		profiler := NewProfilingSystem(0, time.Second, time.Hour)
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan struct{})
+		go func() {
+			profiler.profileCollectionLoop(ctx)
+			close(done)
+		}()
+
+		time.Sleep(3500 * time.Millisecond)
+		synctest.Wait()
+
+		profiler.mutex.RLock()
+		got := len(profiler.profiles)
+		profiler.mutex.RUnlock()
+		if got != 3 {
+			t.Errorf("Expected 3 profiles after 3.5s, got %d", got)
+		}
+
+		cancel()
+		<-done
+	})
+}
+
+// TestCollectGoroutineInfoReflectsStates goroutine の状態別の数が実際の状態を反映することを確かめる
+func TestCollectGoroutineInfoReflectsStates(t *testing.T) {
+	profiler := NewProfilingSystem(0, time.Hour, time.Hour)
+
+	const blocked = 200
+	release := make(chan struct{})
+	var wg sync.WaitGroup
+	for range blocked {
+		wg.Go(func() { <-release })
+	}
+	defer func() {
+		close(release)
+		wg.Wait()
+	}()
+	// 全員がチャネル待ちに入るまで待つ（メトリクスは近似値なので、条件を満たすまで読み直す）
+	deadline := time.Now().Add(5 * time.Second)
+	info := profiler.collectGoroutineInfo()
+	for info.Waiting < blocked && time.Now().Before(deadline) {
+		runtime.Gosched()
+		info = profiler.collectGoroutineInfo()
+	}
+	if info.Waiting < blocked {
+		t.Errorf("Waiting = %d, want >= %d", info.Waiting, blocked)
+	}
+	if info.Running > runtime.GOMAXPROCS(0) {
+		t.Errorf("Running = %d は GOMAXPROCS(%d) を超えない", info.Running, runtime.GOMAXPROCS(0))
 	}
 }

@@ -4,11 +4,13 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"runtime"
 	"sync"
 	"time"
 
 	"grpc-concurrent-programming/client"
+	"grpc-concurrent-programming/security"
 	"grpc-concurrent-programming/server"
 )
 
@@ -16,7 +18,7 @@ func main() {
 	// サーバー設定
 	serverConfig := server.ServerConfig{
 		Port:                  8080,
-		MaxWorkers:            runtime.NumCPU() * 8,
+		MaxWorkers:            runtime.GOMAXPROCS(0) * 8,
 		MaxConcurrentStreams:  1000,
 		MaxReceiveMessageSize: 4 * 1024 * 1024, // 4MB
 		MaxSendMessageSize:    4 * 1024 * 1024, // 4MB
@@ -29,15 +31,24 @@ func main() {
 		EnableTLS:             false, // デモ用にはTLS無効
 	}
 
+	// Listenを先に済ませるので、Serveの開始を待たずにクライアントから接続できる
+	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", serverConfig.Port))
+	if err != nil {
+		log.Fatalf("リスナー作成エラー: %v", err)
+	}
+
 	// サーバーを別ゴルーチンで起動
 	go func() {
-		if err := server.StartHighPerformanceServer(serverConfig); err != nil {
+		if err := server.Serve(lis, serverConfig); err != nil {
 			log.Fatalf("サーバー起動エラー: %v", err)
 		}
 	}()
 
-	// サーバー起動待機
-	time.Sleep(2 * time.Second)
+	// サーバーはすべてのRPCでJWTを要求するので、デモ用のトークンを発行する
+	authToken, err := security.GenerateJWT("demo-user", "admin")
+	if err != nil {
+		log.Fatalf("JWTトークン生成エラー: %v", err)
+	}
 
 	// クライアント設定
 	clientConfig := client.ClientConfig{
@@ -56,7 +67,7 @@ func main() {
 		CircuitBreakerThreshold: 5,
 		CircuitBreakerTimeout:   30 * time.Second,
 		EnableTLS:               false, // デモ用にはTLS無効
-		AuthToken:               "",    // デモ用には認証無し
+		AuthToken:               authToken,
 	}
 
 	// クライアント作成
@@ -64,7 +75,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("クライアント作成エラー: %v", err)
 	}
-	defer grpcClient.Close()
+	defer func() {
+		if err := grpcClient.Close(); err != nil {
+			log.Printf("クライアント終了エラー: %v", err)
+		}
+	}()
 
 	// 各種RPCパターンの実行例
 	runBasicUnaryExample(grpcClient)
@@ -113,25 +128,19 @@ func runStreamingExamples(grpcClient *client.HighPerformanceGRPCClient) {
 	var wg sync.WaitGroup
 
 	// Server Streaming例
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		runServerStreamingExample(grpcClient)
-	}()
+	})
 
 	// Client Streaming例
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		runClientStreamingExample(grpcClient)
-	}()
+	})
 
 	// Bidirectional Streaming例
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		runBidirectionalStreamingExample(grpcClient)
-	}()
+	})
 
 	wg.Wait()
 }
@@ -173,7 +182,7 @@ func runClientStreamingExample(_ *client.HighPerformanceGRPCClient) {
 
 	// 一括作成するユーザーデータ準備
 	const userCount = 5
-	for i := 0; i < userCount; i++ {
+	for i := range userCount {
 		// 実際の実装では、適切な型変換を行います
 		fmt.Printf("Client Streaming: ユーザー%d を準備中\n", i+1)
 	}
@@ -198,7 +207,9 @@ func runBidirectionalStreamingExample(grpcClient *client.HighPerformanceGRPCClie
 	fmt.Println("実際の実装では双方向でメッセージの送受信を行います")
 
 	// ストリームを閉じる
-	stream.CloseSend()
+	if err := stream.CloseSend(); err != nil {
+		fmt.Printf("Bidirectional Streaming終了エラー: %v\n", err)
+	}
 }
 
 // runConcurrentRequestExample 並行リクエスト例を実行します
@@ -211,12 +222,9 @@ func runConcurrentRequestExample(grpcClient *client.HighPerformanceGRPCClient) {
 	var wg sync.WaitGroup
 	startTime := time.Now()
 
-	for i := 0; i < numGoroutines; i++ {
-		wg.Add(1)
-		go func(goroutineID int) {
-			defer wg.Done()
-
-			for j := 0; j < requestsPerGoroutine; j++ {
+	for goroutineID := range numGoroutines {
+		wg.Go(func() {
+			for j := range requestsPerGoroutine {
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 
 				userID := int64((goroutineID * requestsPerGoroutine) + j + 1)
@@ -231,7 +239,7 @@ func runConcurrentRequestExample(grpcClient *client.HighPerformanceGRPCClient) {
 				cancel()
 				time.Sleep(10 * time.Millisecond) // 少し間隔を空ける
 			}
-		}(i)
+		})
 	}
 
 	wg.Wait()

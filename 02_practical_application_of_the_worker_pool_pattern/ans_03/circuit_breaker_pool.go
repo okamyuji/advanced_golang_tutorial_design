@@ -5,14 +5,14 @@ import (
 	"fmt"
 	"log"
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-// CircuitStateはサーキットブレーカーの状態です
+// CircuitState サーキットブレーカーの状態です
 type CircuitState int
 
 const (
@@ -21,7 +21,7 @@ const (
 	CircuitHalfOpen
 )
 
-// HTTPTaskはHTTPリクエストタスクです
+// HTTPTask HTTPリクエストタスクです
 type HTTPTask struct {
 	ID         int
 	URL        string
@@ -33,7 +33,7 @@ type HTTPTask struct {
 	RetryCount int
 }
 
-// HTTPResultはHTTP結果です
+// HTTPResult HTTP結果です
 type HTTPResult struct {
 	TaskID     int
 	StatusCode int
@@ -45,12 +45,12 @@ type HTTPResult struct {
 	WorkerID   int
 }
 
-// CircuitBreakerはサーキットブレーカーです
+// CircuitBreaker サーキットブレーカーです
 type CircuitBreaker struct {
 	mu                  sync.RWMutex
 	state               CircuitState
-	failureCount        int64
-	successCount        int64
+	failureCount        atomic.Int64
+	successCount        atomic.Int64
 	consecutiveFailures int64
 	lastFailureTime     time.Time
 	lastSuccessTime     time.Time
@@ -62,7 +62,7 @@ type CircuitBreaker struct {
 	halfOpenCalls    int64
 }
 
-// HTTPWorkerPoolはサーキットブレーカー付きHTTPワーカープールです
+// HTTPWorkerPool サーキットブレーカー付きHTTPワーカープールです
 type HTTPWorkerPool struct {
 	// 基本設定
 	workerCount int
@@ -85,25 +85,25 @@ type HTTPWorkerPool struct {
 	stats *HTTPStats
 }
 
-// HTTPWorkerはHTTPワーカーです
+// HTTPWorker HTTPワーカーです
 type HTTPWorker struct {
 	ID   int
 	pool *HTTPWorkerPool
 }
 
-// HTTPStatsはHTTP統計です
+// HTTPStats HTTP統計です
 type HTTPStats struct {
 	mu                  sync.RWMutex
-	totalRequests       int64
-	successfulRequests  int64
-	failedRequests      int64
-	retryRequests       int64
-	circuitOpenCount    int64
+	totalRequests       atomic.Int64
+	successfulRequests  atomic.Int64
+	failedRequests      atomic.Int64
+	retryRequests       atomic.Int64
+	circuitOpenCount    atomic.Int64
 	averageResponseTime time.Duration
 	statusCodeCounts    map[int]int64
 }
 
-// NewCircuitBreakerは新しいサーキットブレーカーを作成します
+// NewCircuitBreaker 新しいサーキットブレーカーを作成します
 func NewCircuitBreaker(failureThreshold int64, recoveryTimeout time.Duration) *CircuitBreaker {
 	return &CircuitBreaker{
 		state:            CircuitClosed,
@@ -113,7 +113,7 @@ func NewCircuitBreaker(failureThreshold int64, recoveryTimeout time.Duration) *C
 	}
 }
 
-// CanExecuteは実行可能かチェックします
+// CanExecute 実行可能かチェックします
 func (cb *CircuitBreaker) CanExecute() bool {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
@@ -136,12 +136,12 @@ func (cb *CircuitBreaker) CanExecute() bool {
 	return false
 }
 
-// RecordSuccessは成功を記録します
+// RecordSuccess 成功を記録します
 func (cb *CircuitBreaker) RecordSuccess() {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
-	atomic.AddInt64(&cb.successCount, 1)
+	cb.successCount.Add(1)
 	cb.consecutiveFailures = 0
 	cb.lastSuccessTime = time.Now()
 
@@ -154,12 +154,12 @@ func (cb *CircuitBreaker) RecordSuccess() {
 	}
 }
 
-// RecordFailureは失敗を記録します
+// RecordFailure 失敗を記録します
 func (cb *CircuitBreaker) RecordFailure() {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
-	atomic.AddInt64(&cb.failureCount, 1)
+	cb.failureCount.Add(1)
 	cb.consecutiveFailures++
 	cb.lastFailureTime = time.Now()
 
@@ -175,25 +175,25 @@ func (cb *CircuitBreaker) RecordFailure() {
 	}
 }
 
-// GetStateは現在の状態を取得します
+// GetState 現在の状態を取得します
 func (cb *CircuitBreaker) GetState() CircuitState {
 	cb.mu.RLock()
 	defer cb.mu.RUnlock()
 	return cb.state
 }
 
-// GetStatsは統計を取得します
+// GetStats 統計を取得します
 func (cb *CircuitBreaker) GetStats() (int64, int64, CircuitState) {
 	cb.mu.RLock()
 	defer cb.mu.RUnlock()
 
-	success := atomic.LoadInt64(&cb.successCount)
-	failure := atomic.LoadInt64(&cb.failureCount)
+	success := cb.successCount.Load()
+	failure := cb.failureCount.Load()
 
 	return success, failure, cb.state
 }
 
-// NewHTTPWorkerPoolは新しいHTTPワーカープールを作成します
+// NewHTTPWorkerPool 新しいHTTPワーカープールを作成します
 func NewHTTPWorkerPool(workerCount int) *HTTPWorkerPool {
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -225,39 +225,33 @@ func NewHTTPWorkerPool(workerCount int) *HTTPWorkerPool {
 	}
 }
 
-// StartはHTTPワーカープールを開始します
+// Start HTTPワーカープールを開始します
 func (hwp *HTTPWorkerPool) Start() error {
 	// HTTPワーカーを開始
-	for i := 0; i < hwp.workerCount; i++ {
+	for i := range hwp.workerCount {
 		worker := &HTTPWorker{
 			ID:   i,
 			pool: hwp,
 		}
 
-		hwp.wg.Add(1)
-		go worker.run()
+		hwp.wg.Go(worker.run)
 	}
 
 	// リトライ処理を開始
-	hwp.wg.Add(1)
-	go hwp.retryHandler()
+	hwp.wg.Go(hwp.retryHandler)
 
 	// 結果処理を開始
-	hwp.wg.Add(1)
-	go hwp.resultHandler()
+	hwp.wg.Go(hwp.resultHandler)
 
 	// 統計レポートを開始
-	hwp.wg.Add(1)
-	go hwp.statsReporter()
+	hwp.wg.Go(hwp.statsReporter)
 
 	log.Printf("HTTP worker pool started with %d workers", hwp.workerCount)
 	return nil
 }
 
-// runはワーカーのメインループです
+// run ワーカーのメインループです
 func (hw *HTTPWorker) run() {
-	defer hw.pool.wg.Done()
-
 	for {
 		select {
 		case <-hw.pool.ctx.Done():
@@ -274,7 +268,7 @@ func (hw *HTTPWorker) run() {
 	}
 }
 
-// executeHTTPTaskはHTTPタスクを実行します
+// executeHTTPTask HTTPタスクを実行します
 func (hw *HTTPWorker) executeHTTPTask(task HTTPTask) HTTPResult {
 	start := time.Now()
 
@@ -289,7 +283,7 @@ func (hw *HTTPWorker) executeHTTPTask(task HTTPTask) HTTPResult {
 		result.Success = false
 		result.Error = fmt.Errorf("circuit breaker is open")
 		result.Duration = time.Since(start)
-		atomic.AddInt64(&hw.pool.stats.circuitOpenCount, 1)
+		hw.pool.stats.circuitOpenCount.Add(1)
 
 		// サーキットブレーカーが開いている場合、リトライしない
 		return result
@@ -299,7 +293,7 @@ func (hw *HTTPWorker) executeHTTPTask(task HTTPTask) HTTPResult {
 	req, err := http.NewRequestWithContext(hw.pool.ctx, task.Method, task.URL, nil)
 	if err != nil {
 		result.Success = false
-		result.Error = fmt.Errorf("failed to create request: %v", err)
+		result.Error = fmt.Errorf("failed to create request: %w", err)
 		result.Duration = time.Since(start)
 		hw.pool.circuitBreaker.RecordFailure()
 		return result
@@ -321,7 +315,7 @@ func (hw *HTTPWorker) executeHTTPTask(task HTTPTask) HTTPResult {
 	resp, err := hw.pool.client.Do(req)
 	if err != nil {
 		result.Success = false
-		result.Error = fmt.Errorf("HTTP request failed: %v", err)
+		result.Error = fmt.Errorf("HTTP request failed: %w", err)
 		result.Duration = time.Since(start)
 		hw.pool.circuitBreaker.RecordFailure()
 
@@ -361,7 +355,7 @@ func (hw *HTTPWorker) executeHTTPTask(task HTTPTask) HTTPResult {
 	return result
 }
 
-// scheduleRetryはリトライをスケジュールします
+// scheduleRetry リトライをスケジュールします
 func (hw *HTTPWorker) scheduleRetry(task HTTPTask, err error) {
 	if task.RetryCount >= task.MaxRetries {
 		log.Printf("Max retries exceeded for task %d (error: %v)", task.ID, err)
@@ -372,16 +366,12 @@ func (hw *HTTPWorker) scheduleRetry(task HTTPTask, err error) {
 	retryTask.RetryCount++
 
 	// 指数バックオフでリトライ遅延を計算
-	backoffDelay := time.Duration(math.Pow(2, float64(retryTask.RetryCount))) * time.Second
-	if backoffDelay > 30*time.Second {
-		backoffDelay = 30 * time.Second
-	}
+	backoffDelay := min(time.Duration(math.Pow(2, float64(retryTask.RetryCount)))*time.Second, 30*time.Second)
 
 	// ジッターを追加してサンダリングハード問題を回避
-	jitter := time.Duration(rand.Intn(1000)) * time.Millisecond
-	backoffDelay += jitter
+	backoffDelay += rand.N(1000 * time.Millisecond)
 
-	atomic.AddInt64(&hw.pool.stats.retryRequests, 1)
+	hw.pool.stats.retryRequests.Add(1)
 
 	go func() {
 		select {
@@ -397,10 +387,8 @@ func (hw *HTTPWorker) scheduleRetry(task HTTPTask, err error) {
 	}()
 }
 
-// retryHandlerはリトライを処理します
+// retryHandler リトライを処理します
 func (hwp *HTTPWorkerPool) retryHandler() {
-	defer hwp.wg.Done()
-
 	for {
 		select {
 		case <-hwp.ctx.Done():
@@ -416,18 +404,22 @@ func (hwp *HTTPWorkerPool) retryHandler() {
 			case <-hwp.ctx.Done():
 				return
 			default:
-				// taskQueueが満杯または閉じられている場合はドロップ
+				// taskQueueが満杯の場合はドロップ
 				log.Printf("Dropping retry task %d: queue full or closed", retryTask.ID)
 			}
 		}
 	}
 }
 
-// SubmitTaskはタスクを追加します
+// SubmitTask タスクを追加します
 func (hwp *HTTPWorkerPool) SubmitTask(task HTTPTask) error {
+	// 停止後の投入を拒否する。キューはcloseせず、読む側はctxのキャンセルで止める
+	if hwp.ctx.Err() != nil {
+		return fmt.Errorf("pool is shutting down")
+	}
 	select {
 	case hwp.taskQueue <- task:
-		atomic.AddInt64(&hwp.stats.totalRequests, 1)
+		hwp.stats.totalRequests.Add(1)
 		return nil
 	case <-hwp.ctx.Done():
 		return fmt.Errorf("pool is shutting down")
@@ -436,10 +428,8 @@ func (hwp *HTTPWorkerPool) SubmitTask(task HTTPTask) error {
 	}
 }
 
-// resultHandlerは結果を処理します
+// resultHandler 結果を処理します
 func (hwp *HTTPWorkerPool) resultHandler() {
-	defer hwp.wg.Done()
-
 	for {
 		select {
 		case <-hwp.ctx.Done():
@@ -450,15 +440,15 @@ func (hwp *HTTPWorkerPool) resultHandler() {
 	}
 }
 
-// updateStatsは統計を更新します
+// updateStats 統計を更新します
 func (hwp *HTTPWorkerPool) updateStats(result HTTPResult) {
 	hwp.stats.mu.Lock()
 	defer hwp.stats.mu.Unlock()
 
 	if result.Success {
-		atomic.AddInt64(&hwp.stats.successfulRequests, 1)
+		hwp.stats.successfulRequests.Add(1)
 	} else {
-		atomic.AddInt64(&hwp.stats.failedRequests, 1)
+		hwp.stats.failedRequests.Add(1)
 	}
 
 	if result.StatusCode > 0 {
@@ -466,38 +456,35 @@ func (hwp *HTTPWorkerPool) updateStats(result HTTPResult) {
 	}
 
 	// 平均応答時間を更新
-	total := atomic.LoadInt64(&hwp.stats.totalRequests)
+	total := hwp.stats.totalRequests.Load()
 	hwp.stats.averageResponseTime = time.Duration(
 		(int64(hwp.stats.averageResponseTime)*total + int64(result.Duration)) / (total + 1))
 }
 
-// statsReporterは統計を定期的に報告します
+// statsReporter 統計を定期的に報告します
 func (hwp *HTTPWorkerPool) statsReporter() {
-	defer hwp.wg.Done()
-
-	ticker := time.NewTicker(15 * time.Second)
-	defer ticker.Stop()
+	tick := time.Tick(15 * time.Second)
 
 	for {
 		select {
 		case <-hwp.ctx.Done():
 			return
-		case <-ticker.C:
+		case <-tick:
 			hwp.printStats()
 		}
 	}
 }
 
-// printStatsは統計を出力します
+// printStats 統計を出力します
 func (hwp *HTTPWorkerPool) printStats() {
 	hwp.stats.mu.RLock()
 	defer hwp.stats.mu.RUnlock()
 
-	total := atomic.LoadInt64(&hwp.stats.totalRequests)
-	successful := atomic.LoadInt64(&hwp.stats.successfulRequests)
-	failed := atomic.LoadInt64(&hwp.stats.failedRequests)
-	retries := atomic.LoadInt64(&hwp.stats.retryRequests)
-	circuitOpen := atomic.LoadInt64(&hwp.stats.circuitOpenCount)
+	total := hwp.stats.totalRequests.Load()
+	successful := hwp.stats.successfulRequests.Load()
+	failed := hwp.stats.failedRequests.Load()
+	retries := hwp.stats.retryRequests.Load()
+	circuitOpen := hwp.stats.circuitOpenCount.Load()
 
 	successRate := float64(0)
 	if total > 0 {
@@ -524,18 +511,14 @@ func (hwp *HTTPWorkerPool) printStats() {
 	}
 }
 
-// Shutdownはプールを停止します
+// Shutdown プールを停止します
 func (hwp *HTTPWorkerPool) Shutdown(timeout time.Duration) error {
 	log.Println("Starting HTTP worker pool shutdown...")
 
-	// 1. 新しいタスクの受付を停止
-	close(hwp.taskQueue)
-	close(hwp.retryQueue)
-
-	// 2. ワーカーに停止シグナルを送信
+	// 1. ワーカーに停止シグナルを送信
 	hwp.cancel()
 
-	// 3. ワーカーの終了を待機
+	// 2. ワーカーの終了を待機
 	done := make(chan struct{})
 	go func() {
 		hwp.wg.Wait()
@@ -551,11 +534,11 @@ func (hwp *HTTPWorkerPool) Shutdown(timeout time.Duration) error {
 	}
 }
 
-// GetStatsは統計を取得します
+// GetStats 統計を取得します
 func (hwp *HTTPWorkerPool) GetStats() (int64, int64, int64, float64) {
-	total := atomic.LoadInt64(&hwp.stats.totalRequests)
-	successful := atomic.LoadInt64(&hwp.stats.successfulRequests)
-	failed := atomic.LoadInt64(&hwp.stats.failedRequests)
+	total := hwp.stats.totalRequests.Load()
+	successful := hwp.stats.successfulRequests.Load()
+	failed := hwp.stats.failedRequests.Load()
 
 	successRate := float64(0)
 	if total > 0 {
@@ -597,7 +580,7 @@ func main() {
 				task := HTTPTask{
 					ID:         taskID,
 					URL:        url,
-					Method:     "GET",
+					Method:     http.MethodGet,
 					Headers:    map[string]string{"User-Agent": "CircuitBreakerPool/1.0"},
 					Timeout:    10 * time.Second,
 					MaxRetries: 3,
