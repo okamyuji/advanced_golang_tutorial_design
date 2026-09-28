@@ -9,7 +9,7 @@ import (
 	"maps"
 	"net"
 	"net/http"
-	_ "net/http/pprof"
+	httppprof "net/http/pprof"
 	"os"
 	"runtime"
 	"runtime/metrics"
@@ -95,6 +95,12 @@ func NewProfilingSystem(port int, profileInterval, dataRetention time.Duration) 
 	}
 
 	// カスタムエンドポイントを追加
+	// net/http/pprof を import するだけでは DefaultServeMux にしか登録されないので、この mux に明示的に登録する
+	mux.HandleFunc("/debug/pprof/", httppprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", httppprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", httppprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", httppprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", httppprof.Trace)
 	mux.HandleFunc("/health", ps.healthHandler)
 	mux.HandleFunc("/metrics", ps.metricsHandler)
 	mux.HandleFunc("/profiles", ps.profilesHandler)

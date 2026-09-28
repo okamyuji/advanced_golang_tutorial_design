@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -560,5 +561,35 @@ func TestStartProfiling_ListensOnLoopbackOnly(t *testing.T) {
 	}
 	if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() {
 		t.Errorf("待ち受けアドレス = %q, 期待値 ループバックアドレス", host)
+	}
+}
+
+// サーバーは独自の ServeMux を使うので、pprof のハンドラーが実際に届くかを確かめる
+func TestStartProfiling_ServesPprofIndex(t *testing.T) {
+	profiler := NewProfilingSystem(0, 1*time.Second, 1*time.Hour)
+	if err := profiler.StartProfiling(t.Context()); err != nil {
+		t.Fatalf("StartProfiling failed: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := profiler.Stop(); err != nil {
+			t.Errorf("Stop failed: %v", err)
+		}
+	})
+
+	for _, path := range []string{"/debug/pprof/", "/debug/pprof/goroutine?debug=1"} {
+		resp, err := http.Get("http://" + profiler.listenAddr() + path)
+		if err != nil {
+			t.Fatalf("GET %s failed: %v", path, err)
+		}
+		// 読み切らずに閉じると次のリクエストが新しい接続を開き、Shutdown がその接続を最大5秒待つ
+		if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+			t.Errorf("本文の読み取りに失敗: %v", err)
+		}
+		if err := resp.Body.Close(); err != nil {
+			t.Errorf("Close failed: %v", err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("GET %s = %d, 期待値 200", path, resp.StatusCode)
+		}
 	}
 }
