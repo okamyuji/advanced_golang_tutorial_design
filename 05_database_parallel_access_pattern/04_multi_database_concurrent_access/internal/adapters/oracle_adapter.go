@@ -346,7 +346,7 @@ func (o *OracleAdapter) GetUsersByAgeRange(ctx context.Context, minAge, maxAge i
 		if email, ok := row["EMAIL"].(string); ok {
 			user.Email = email
 		}
-		user.Age = int(oracleInt64(row["AGE"]))
+		user.Age = oracleInt(row["AGE"])
 		// Query が time.Time を文字列に変換して返すので、ここで戻す
 		if createdAt, ok := row["CREATED_AT"].(string); ok {
 			if t, err := time.Parse("2006-01-02 15:04:05", createdAt); err == nil {
@@ -534,6 +534,18 @@ func oracleInt64(v any) int64 {
 		return x
 	case string:
 		n, _ := strconv.ParseInt(x, 10, 64)
+		return n
+	}
+	return 0
+}
+
+// oracleInt oracleInt64 の int 版。文字列は Atoi で直接 int に読むので、64ビットからの縮小変換が起きない
+func oracleInt(v any) int {
+	switch x := v.(type) {
+	case int64:
+		return int(x)
+	case string:
+		n, _ := strconv.Atoi(x)
 		return n
 	}
 	return 0

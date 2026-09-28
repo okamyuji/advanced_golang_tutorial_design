@@ -21,3 +21,23 @@ func TestOracleInt64_ParsesNumberReturnedAsString(t *testing.T) {
 		})
 	}
 }
+
+func TestOracleInt_ParsesAgeWithoutIntegerConversion(t *testing.T) {
+	tests := []struct {
+		name string
+		in   any
+		want int
+	}{
+		{"文字列の数値", "21", 21},
+		{"int64 はそのまま", int64(40), 40},
+		{"数値でない文字列は0", "abc", 0},
+		{"nil は0", nil, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := oracleInt(tt.in); got != tt.want {
+				t.Errorf("oracleInt(%v) = %d, 期待値 %d", tt.in, got, tt.want)
+			}
+		})
+	}
+}
