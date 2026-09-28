@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -438,7 +440,8 @@ func TestStartStopConcurrentWithHandlers(t *testing.T) {
 
 // TestStartProfilingReportsListenError ポートが使用中なら StartProfiling がエラーを返すことを確かめる
 func TestStartProfilingReportsListenError(t *testing.T) {
-	busy, err := net.Listen("tcp", ":0")
+	// サーバーと同じアドレスで塞ぐ。macOS では ":0" で塞いでも 127.0.0.1 の同じポートを bind できてしまう
+	busy, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("Listen failed: %v", err)
 	}
@@ -538,5 +541,206 @@ func TestCollectGoroutineInfoReflectsStates(t *testing.T) {
 	}
 	if info.Running > runtime.GOMAXPROCS(0) {
 		t.Errorf("Running = %d は GOMAXPROCS(%d) を超えない", info.Running, runtime.GOMAXPROCS(0))
+	}
+}
+
+// pprof はメモリの中身やスタックを返すので、同じマシンからしか届かないようにする
+func TestStartProfiling_ListensOnLoopbackOnly(t *testing.T) {
+	profiler := NewProfilingSystem(0, 1*time.Second, 1*time.Hour)
+	if err := profiler.StartProfiling(t.Context()); err != nil {
+		t.Fatalf("StartProfiling failed: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := profiler.Stop(); err != nil {
+			t.Errorf("Stop failed: %v", err)
+		}
+	})
+
+	host, _, err := net.SplitHostPort(profiler.listenAddr())
+	if err != nil {
+		t.Fatalf("SplitHostPort failed: %v", err)
+	}
+	if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() {
+		t.Errorf("待ち受けアドレス = %q, 期待値 ループバックアドレス", host)
+	}
+}
+
+// サーバーは独自の ServeMux を使うので、pprof のハンドラーが実際に届くかを確かめる
+func TestStartProfiling_ServesPprofIndex(t *testing.T) {
+	profiler := NewProfilingSystem(0, 1*time.Second, 1*time.Hour)
+	if err := profiler.StartProfiling(t.Context()); err != nil {
+		t.Fatalf("StartProfiling failed: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := profiler.Stop(); err != nil {
+			t.Errorf("Stop failed: %v", err)
+		}
+	})
+
+	for _, path := range []string{"/debug/pprof/", "/debug/pprof/goroutine?debug=1"} {
+		resp, err := http.Get("http://" + profiler.listenAddr() + path)
+		if err != nil {
+			t.Fatalf("GET %s failed: %v", path, err)
+		}
+		// 読み切らずに閉じると次のリクエストが新しい接続を開き、Shutdown がその接続を最大5秒待つ
+		if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+			t.Errorf("本文の読み取りに失敗: %v", err)
+		}
+		if err := resp.Body.Close(); err != nil {
+			t.Errorf("Close failed: %v", err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("GET %s = %d, 期待値 200", path, resp.StatusCode)
+		}
+	}
+}
+
+// startForTest ポート0で起動し、テスト終了時に止める
+func startForTest(t *testing.T, profiler *ProfilingSystem) {
+	t.Helper()
+	if err := profiler.StartProfiling(t.Context()); err != nil {
+		t.Fatalf("StartProfiling failed: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := profiler.Stop(); err != nil {
+			t.Errorf("Stop failed: %v", err)
+		}
+	})
+}
+
+// DNS rebinding では、ブラウザが攻撃者のドメイン名のまま 127.0.0.1 に接続してくる
+func TestServer_RejectsForeignHostHeader(t *testing.T) {
+	profiler := NewProfilingSystem(0, time.Hour, time.Hour)
+	startForTest(t, profiler)
+
+	tests := []struct {
+		host string
+		want int
+	}{
+		{"evil.example", http.StatusForbidden},
+		{"evil.example:8080", http.StatusForbidden},
+		{profiler.listenAddr(), http.StatusOK},
+		{"localhost", http.StatusOK},
+	}
+	for _, tt := range tests {
+		t.Run(tt.host, func(t *testing.T) {
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://"+profiler.listenAddr()+"/debug/pprof/cmdline", nil)
+			if err != nil {
+				t.Fatalf("NewRequest failed: %v", err)
+			}
+			req.Host = tt.host
+			if got := getStatus(t, req); got != tt.want {
+				t.Errorf("Host %q = %d, 期待値 %d", tt.host, got, tt.want)
+			}
+		})
+	}
+}
+
+// ヘッダーを送らない接続は ReadHeaderTimeout で切られる
+func TestServer_ClosesConnectionWithoutHeaders(t *testing.T) {
+	profiler := NewProfilingSystem(0, time.Hour, time.Hour)
+	if profiler.httpServer.ReadHeaderTimeout <= 0 {
+		t.Fatalf("ReadHeaderTimeout の既定値 = %v, 期待値 0より大きい値", profiler.httpServer.ReadHeaderTimeout)
+	}
+	// 既定値のままだとテストが遅いので、動作だけを短い値で確かめる
+	profiler.httpServer.ReadHeaderTimeout = 100 * time.Millisecond
+	startForTest(t, profiler)
+
+	conn, err := net.Dial("tcp", profiler.listenAddr())
+	if err != nil {
+		t.Fatalf("Dial failed: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	if err := conn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline failed: %v", err)
+	}
+	if _, err := conn.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Errorf("Read の結果 = %v, 期待値 io.EOF（サーバーが接続を切る）", err)
+	}
+}
+
+// pprof は seconds の分だけ書き込み期限を延ばすので、長すぎる要求はこちらで断る
+func TestServer_RejectsTooLongProfileAndTrace(t *testing.T) {
+	profiler := NewProfilingSystem(0, time.Hour, time.Hour)
+	startForTest(t, profiler)
+
+	for _, path := range []string{"/debug/pprof/profile?seconds=600", "/debug/pprof/trace?seconds=600"} {
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://"+profiler.listenAddr()+path, nil)
+		if err != nil {
+			t.Fatalf("NewRequest failed: %v", err)
+		}
+		if got := getStatus(t, req); got != http.StatusBadRequest {
+			t.Errorf("%s の応答 = %d, 期待値 400", path, got)
+		}
+	}
+}
+
+// net/http/pprof は import 時に DefaultServeMux へ登録するので、別のコードが nil ハンドラーで待ち受けても pprof が出ないようにする
+func TestDefaultServeMux_DoesNotServePprof(t *testing.T) {
+	rec := httptest.NewRecorder()
+	http.DefaultServeMux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/debug/pprof/", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("DefaultServeMux の /debug/pprof/ = %d, 期待値 404", rec.Code)
+	}
+}
+
+// getStatus 応答を読み切ってステータスだけを返す。5秒で返らなければ長い計測が始まったとみなして失敗させる
+func getStatus(t *testing.T, req *http.Request) int {
+	t.Helper()
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	if err != nil {
+		t.Fatalf("%s が5秒以内に返らない: %v", req.URL, err)
+	}
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		t.Errorf("本文の読み取りに失敗: %v", err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Errorf("Close failed: %v", err)
+	}
+	return resp.StatusCode
+}
+
+// Index 経由の差分プロファイル（heap?seconds=N など）も seconds の分だけ待つので、全経路で上限を掛ける
+func TestServer_LimitsSecondsOnEveryPprofPath(t *testing.T) {
+	profiler := NewProfilingSystem(0, time.Hour, time.Hour)
+	startForTest(t, profiler)
+
+	for _, q := range []string{"/debug/pprof/heap?seconds=600", "/debug/pprof/goroutine?seconds=600", "/debug/pprof/trace?seconds=NaN"} {
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://"+profiler.listenAddr()+q, nil)
+		if err != nil {
+			t.Fatalf("NewRequest failed: %v", err)
+		}
+		if got := getStatus(t, req); got != http.StatusBadRequest {
+			t.Errorf("%s = %d, 期待値 400", q, got)
+		}
+	}
+}
+
+// 別サイトのページが <img> などでブラウザに要求を送らせても、計測を起動させない
+func TestServer_RejectsCrossSiteBrowserRequest(t *testing.T) {
+	profiler := NewProfilingSystem(0, time.Hour, time.Hour)
+	startForTest(t, profiler)
+
+	for _, tt := range []struct {
+		site string
+		want int
+	}{
+		{"cross-site", http.StatusForbidden},
+		// ブラウザはポートを区別しないので、同じマシンの別ポートのアプリも same-site になる
+		{"same-site", http.StatusForbidden},
+		{"same-origin", http.StatusOK},
+		{"none", http.StatusOK},
+		{"", http.StatusOK},
+	} {
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://"+profiler.listenAddr()+"/debug/pprof/cmdline", nil)
+		if err != nil {
+			t.Fatalf("NewRequest failed: %v", err)
+		}
+		if tt.site != "" {
+			req.Header.Set("Sec-Fetch-Site", tt.site)
+		}
+		if got := getStatus(t, req); got != tt.want {
+			t.Errorf("Sec-Fetch-Site %q = %d, 期待値 %d", tt.site, got, tt.want)
+		}
 	}
 }

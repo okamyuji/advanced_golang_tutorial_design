@@ -7,18 +7,26 @@ import (
 	"fmt"
 	"log"
 	"maps"
+	"math"
 	"net"
 	"net/http"
-	_ "net/http/pprof"
+	httppprof "net/http/pprof"
 	"os"
 	"runtime"
 	"runtime/metrics"
 	"runtime/pprof"
 	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+// net/http/pprof は import した時点で DefaultServeMux に登録する。この init は import 先の init より後に動くので、
+// ここで空の mux に差し替えておけば、別のコードが nil ハンドラーで全インターフェースに待ち受けても pprof は出ない
+func init() {
+	http.DefaultServeMux = http.NewServeMux()
+}
 
 var (
 	errAlreadyRunning = errors.New("プロファイリングは実行中です")
@@ -84,8 +92,13 @@ func NewProfilingSystem(port int, profileInterval, dataRetention time.Duration) 
 
 	ps := &ProfilingSystem{
 		httpServer: &http.Server{
-			Addr:    fmt.Sprintf(":%d", port),
-			Handler: mux,
+			// pprof はメモリの中身やスタックを返すので、外部から届かないループバックだけで待ち受ける
+			Addr:              fmt.Sprintf("127.0.0.1:%d", port),
+			Handler:           localRequestsOnly(limitSeconds(mux)),
+			ReadHeaderTimeout: 5 * time.Second,
+			// pprof は seconds の分だけ書き込み期限を自分で延ばすので、長さは limitSeconds で抑える
+			WriteTimeout: 60 * time.Second,
+			IdleTimeout:  60 * time.Second,
 		},
 		profileInterval: profileInterval,
 		dataRetention:   dataRetention,
@@ -94,12 +107,58 @@ func NewProfilingSystem(port int, profileInterval, dataRetention time.Duration) 
 	}
 
 	// カスタムエンドポイントを追加
+	// net/http/pprof を import するだけでは DefaultServeMux にしか登録されないので、この mux に明示的に登録する
+	mux.HandleFunc("/debug/pprof/", httppprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", httppprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", httppprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", httppprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", httppprof.Trace)
 	mux.HandleFunc("/health", ps.healthHandler)
 	mux.HandleFunc("/metrics", ps.metricsHandler)
 	mux.HandleFunc("/profiles", ps.profilesHandler)
 	mux.HandleFunc("/alerts", ps.alertsHandler)
 
 	return ps
+}
+
+// maxProfileSeconds seconds に指定できる秒数の上限。pprof 自身には上限がなく、長い要求は Stop でも止まらない
+const maxProfileSeconds = 60
+
+// limitSeconds seconds が数値でないか maxProfileSeconds を超える要求を400で断る。
+// profile と trace だけでなく、Index 経由の差分プロファイル（heap?seconds=N など）も seconds の分だけ待つので、全経路に掛ける
+func limitSeconds(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if v := r.FormValue("seconds"); v != "" {
+			// NaN は比較がすべて偽になり、上限の判定をすり抜けるので明示的に弾く
+			if sec, err := strconv.ParseFloat(v, 64); err != nil || math.IsNaN(sec) || sec > maxProfileSeconds {
+				http.Error(w, fmt.Sprintf("seconds は %d 以下の数値にしてください", maxProfileSeconds), http.StatusBadRequest)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// localRequestsOnly 同じマシンの人が直接送った要求だけを通す。
+// ループバックで待ち受けても、DNS rebinding ではブラウザが攻撃者のドメイン名のまま接続してくる。
+// Host がループバックでも、別のページは <img> などでブラウザに要求を送らせられる。
+// ブラウザはサイトの判定でポートを区別しないので、同じマシンの別ポートのアプリから来る same-site も断る
+func localRequestsOnly(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if site := r.Header.Get("Sec-Fetch-Site"); site == "cross-site" || site == "same-site" {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		host, _, err := net.SplitHostPort(r.Host)
+		if err != nil {
+			host = r.Host // ポートを含まない Host
+		}
+		if ip := net.ParseIP(host); host != "localhost" && (ip == nil || !ip.IsLoopback()) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // StartProfiling プロファイリング開始。ポートを確保できなければエラーを返す
