@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"maps"
+	"math"
 	"net"
 	"net/http"
 	httppprof "net/http/pprof"
@@ -93,9 +94,9 @@ func NewProfilingSystem(port int, profileInterval, dataRetention time.Duration) 
 		httpServer: &http.Server{
 			// pprof はメモリの中身やスタックを返すので、外部から届かないループバックだけで待ち受ける
 			Addr:              fmt.Sprintf("127.0.0.1:%d", port),
-			Handler:           loopbackHostOnly(mux),
+			Handler:           localRequestsOnly(limitSeconds(mux)),
 			ReadHeaderTimeout: 5 * time.Second,
-			// pprof の profile と trace は seconds の分だけ書き込み期限を自分で延ばすので、長さは maxProfileSeconds で抑える
+			// pprof は seconds の分だけ書き込み期限を自分で延ばすので、長さは limitSeconds で抑える
 			WriteTimeout: 60 * time.Second,
 			IdleTimeout:  60 * time.Second,
 		},
@@ -109,9 +110,9 @@ func NewProfilingSystem(port int, profileInterval, dataRetention time.Duration) 
 	// net/http/pprof を import するだけでは DefaultServeMux にしか登録されないので、この mux に明示的に登録する
 	mux.HandleFunc("/debug/pprof/", httppprof.Index)
 	mux.HandleFunc("/debug/pprof/cmdline", httppprof.Cmdline)
-	mux.Handle("/debug/pprof/profile", limitSeconds(http.HandlerFunc(httppprof.Profile)))
+	mux.HandleFunc("/debug/pprof/profile", httppprof.Profile)
 	mux.HandleFunc("/debug/pprof/symbol", httppprof.Symbol)
-	mux.Handle("/debug/pprof/trace", limitSeconds(http.HandlerFunc(httppprof.Trace)))
+	mux.HandleFunc("/debug/pprof/trace", httppprof.Trace)
 	mux.HandleFunc("/health", ps.healthHandler)
 	mux.HandleFunc("/metrics", ps.metricsHandler)
 	mux.HandleFunc("/profiles", ps.profilesHandler)
@@ -120,24 +121,33 @@ func NewProfilingSystem(port int, profileInterval, dataRetention time.Duration) 
 	return ps
 }
 
-// maxProfileSeconds profile と trace に指定できる秒数の上限。pprof 自身には上限がなく、長い要求は Stop でも止まらない
+// maxProfileSeconds seconds に指定できる秒数の上限。pprof 自身には上限がなく、長い要求は Stop でも止まらない
 const maxProfileSeconds = 60
 
-// limitSeconds seconds パラメータが maxProfileSeconds を超える要求を400で断る
+// limitSeconds seconds が数値でないか maxProfileSeconds を超える要求を400で断る。
+// profile と trace だけでなく、Index 経由の差分プロファイル（heap?seconds=N など）も seconds の分だけ待つので、全経路に掛ける
 func limitSeconds(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if sec, err := strconv.ParseFloat(r.FormValue("seconds"), 64); err == nil && sec > maxProfileSeconds {
-			http.Error(w, fmt.Sprintf("seconds は %d 以下にしてください", maxProfileSeconds), http.StatusBadRequest)
-			return
+		if v := r.FormValue("seconds"); v != "" {
+			// NaN は比較がすべて偽になり、上限の判定をすり抜けるので明示的に弾く
+			if sec, err := strconv.ParseFloat(v, 64); err != nil || math.IsNaN(sec) || sec > maxProfileSeconds {
+				http.Error(w, fmt.Sprintf("seconds は %d 以下の数値にしてください", maxProfileSeconds), http.StatusBadRequest)
+				return
+			}
 		}
 		next.ServeHTTP(w, r)
 	})
 }
 
-// loopbackHostOnly Host ヘッダーがループバックを指さない要求を403で断る。
-// ループバックで待ち受けても、DNS rebinding ではブラウザが攻撃者のドメイン名のまま接続してくるため
-func loopbackHostOnly(next http.Handler) http.Handler {
+// localRequestsOnly 同じマシンの人が直接送った要求だけを通す。
+// ループバックで待ち受けても、DNS rebinding ではブラウザが攻撃者のドメイン名のまま接続してくる。
+// Host がループバックでも、別サイトのページは <img> などでブラウザに要求を送らせられる
+func localRequestsOnly(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Sec-Fetch-Site") == "cross-site" {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
 		host, _, err := net.SplitHostPort(r.Host)
 		if err != nil {
 			host = r.Host // ポートを含まない Host

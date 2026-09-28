@@ -629,18 +629,8 @@ func TestServer_RejectsForeignHostHeader(t *testing.T) {
 				t.Fatalf("NewRequest failed: %v", err)
 			}
 			req.Host = tt.host
-			resp, err := http.DefaultClient.Do(req)
-			if err != nil {
-				t.Fatalf("GET failed: %v", err)
-			}
-			if _, err := io.Copy(io.Discard, resp.Body); err != nil {
-				t.Errorf("本文の読み取りに失敗: %v", err)
-			}
-			if err := resp.Body.Close(); err != nil {
-				t.Errorf("Close failed: %v", err)
-			}
-			if resp.StatusCode != tt.want {
-				t.Errorf("Host %q = %d, 期待値 %d", tt.host, resp.StatusCode, tt.want)
+			if got := getStatus(t, req); got != tt.want {
+				t.Errorf("Host %q = %d, 期待値 %d", tt.host, got, tt.want)
 			}
 		})
 	}
@@ -674,20 +664,13 @@ func TestServer_RejectsTooLongProfileAndTrace(t *testing.T) {
 	profiler := NewProfilingSystem(0, time.Hour, time.Hour)
 	startForTest(t, profiler)
 
-	client := &http.Client{Timeout: 5 * time.Second}
 	for _, path := range []string{"/debug/pprof/profile?seconds=600", "/debug/pprof/trace?seconds=600"} {
-		resp, err := client.Get("http://" + profiler.listenAddr() + path)
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://"+profiler.listenAddr()+path, nil)
 		if err != nil {
-			t.Fatalf("%s が5秒以内に断られず、600秒の計測が始まった: %v", path, err)
+			t.Fatalf("NewRequest failed: %v", err)
 		}
-		if _, err := io.Copy(io.Discard, resp.Body); err != nil {
-			t.Errorf("本文の読み取りに失敗: %v", err)
-		}
-		if err := resp.Body.Close(); err != nil {
-			t.Errorf("Close failed: %v", err)
-		}
-		if resp.StatusCode != http.StatusBadRequest {
-			t.Errorf("%s の応答 = %d, 期待値 400", path, resp.StatusCode)
+		if got := getStatus(t, req); got != http.StatusBadRequest {
+			t.Errorf("%s の応答 = %d, 期待値 400", path, got)
 		}
 	}
 }
@@ -698,5 +681,59 @@ func TestDefaultServeMux_DoesNotServePprof(t *testing.T) {
 	http.DefaultServeMux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/debug/pprof/", nil))
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("DefaultServeMux の /debug/pprof/ = %d, 期待値 404", rec.Code)
+	}
+}
+
+// getStatus 応答を読み切ってステータスだけを返す。5秒で返らなければ長い計測が始まったとみなして失敗させる
+func getStatus(t *testing.T, req *http.Request) int {
+	t.Helper()
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	if err != nil {
+		t.Fatalf("%s が5秒以内に返らない: %v", req.URL, err)
+	}
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		t.Errorf("本文の読み取りに失敗: %v", err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Errorf("Close failed: %v", err)
+	}
+	return resp.StatusCode
+}
+
+// Index 経由の差分プロファイル（heap?seconds=N など）も seconds の分だけ待つので、全経路で上限を掛ける
+func TestServer_LimitsSecondsOnEveryPprofPath(t *testing.T) {
+	profiler := NewProfilingSystem(0, time.Hour, time.Hour)
+	startForTest(t, profiler)
+
+	for _, q := range []string{"/debug/pprof/heap?seconds=600", "/debug/pprof/goroutine?seconds=600", "/debug/pprof/trace?seconds=NaN"} {
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://"+profiler.listenAddr()+q, nil)
+		if err != nil {
+			t.Fatalf("NewRequest failed: %v", err)
+		}
+		if got := getStatus(t, req); got != http.StatusBadRequest {
+			t.Errorf("%s = %d, 期待値 400", q, got)
+		}
+	}
+}
+
+// 別サイトのページが <img> などでブラウザに要求を送らせても、計測を起動させない
+func TestServer_RejectsCrossSiteBrowserRequest(t *testing.T) {
+	profiler := NewProfilingSystem(0, time.Hour, time.Hour)
+	startForTest(t, profiler)
+
+	for _, tt := range []struct {
+		site string
+		want int
+	}{{"cross-site", http.StatusForbidden}, {"none", http.StatusOK}, {"", http.StatusOK}} {
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://"+profiler.listenAddr()+"/debug/pprof/cmdline", nil)
+		if err != nil {
+			t.Fatalf("NewRequest failed: %v", err)
+		}
+		if tt.site != "" {
+			req.Header.Set("Sec-Fetch-Site", tt.site)
+		}
+		if got := getStatus(t, req); got != tt.want {
+			t.Errorf("Sec-Fetch-Site %q = %d, 期待値 %d", tt.site, got, tt.want)
+		}
 	}
 }
