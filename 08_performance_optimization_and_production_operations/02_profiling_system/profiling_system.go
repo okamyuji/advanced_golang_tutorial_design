@@ -15,10 +15,17 @@ import (
 	"runtime/metrics"
 	"runtime/pprof"
 	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+// net/http/pprof は import した時点で DefaultServeMux に登録する。この init は import 先の init より後に動くので、
+// ここで空の mux に差し替えておけば、別のコードが nil ハンドラーで全インターフェースに待ち受けても pprof は出ない
+func init() {
+	http.DefaultServeMux = http.NewServeMux()
+}
 
 var (
 	errAlreadyRunning = errors.New("プロファイリングは実行中です")
@@ -85,8 +92,12 @@ func NewProfilingSystem(port int, profileInterval, dataRetention time.Duration) 
 	ps := &ProfilingSystem{
 		httpServer: &http.Server{
 			// pprof はメモリの中身やスタックを返すので、外部から届かないループバックだけで待ち受ける
-			Addr:    fmt.Sprintf("127.0.0.1:%d", port),
-			Handler: mux,
+			Addr:              fmt.Sprintf("127.0.0.1:%d", port),
+			Handler:           loopbackHostOnly(mux),
+			ReadHeaderTimeout: 5 * time.Second,
+			// pprof の profile と trace は seconds の分だけ書き込み期限を自分で延ばすので、長さは maxProfileSeconds で抑える
+			WriteTimeout: 60 * time.Second,
+			IdleTimeout:  60 * time.Second,
 		},
 		profileInterval: profileInterval,
 		dataRetention:   dataRetention,
@@ -98,15 +109,45 @@ func NewProfilingSystem(port int, profileInterval, dataRetention time.Duration) 
 	// net/http/pprof を import するだけでは DefaultServeMux にしか登録されないので、この mux に明示的に登録する
 	mux.HandleFunc("/debug/pprof/", httppprof.Index)
 	mux.HandleFunc("/debug/pprof/cmdline", httppprof.Cmdline)
-	mux.HandleFunc("/debug/pprof/profile", httppprof.Profile)
+	mux.Handle("/debug/pprof/profile", limitSeconds(http.HandlerFunc(httppprof.Profile)))
 	mux.HandleFunc("/debug/pprof/symbol", httppprof.Symbol)
-	mux.HandleFunc("/debug/pprof/trace", httppprof.Trace)
+	mux.Handle("/debug/pprof/trace", limitSeconds(http.HandlerFunc(httppprof.Trace)))
 	mux.HandleFunc("/health", ps.healthHandler)
 	mux.HandleFunc("/metrics", ps.metricsHandler)
 	mux.HandleFunc("/profiles", ps.profilesHandler)
 	mux.HandleFunc("/alerts", ps.alertsHandler)
 
 	return ps
+}
+
+// maxProfileSeconds profile と trace に指定できる秒数の上限。pprof 自身には上限がなく、長い要求は Stop でも止まらない
+const maxProfileSeconds = 60
+
+// limitSeconds seconds パラメータが maxProfileSeconds を超える要求を400で断る
+func limitSeconds(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if sec, err := strconv.ParseFloat(r.FormValue("seconds"), 64); err == nil && sec > maxProfileSeconds {
+			http.Error(w, fmt.Sprintf("seconds は %d 以下にしてください", maxProfileSeconds), http.StatusBadRequest)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// loopbackHostOnly Host ヘッダーがループバックを指さない要求を403で断る。
+// ループバックで待ち受けても、DNS rebinding ではブラウザが攻撃者のドメイン名のまま接続してくるため
+func loopbackHostOnly(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host, _, err := net.SplitHostPort(r.Host)
+		if err != nil {
+			host = r.Host // ポートを含まない Host
+		}
+		if ip := net.ParseIP(host); host != "localhost" && (ip == nil || !ip.IsLoopback()) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // StartProfiling プロファイリング開始。ポートを確保できなければエラーを返す
