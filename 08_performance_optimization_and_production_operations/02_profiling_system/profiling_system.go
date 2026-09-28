@@ -84,7 +84,8 @@ func NewProfilingSystem(port int, profileInterval, dataRetention time.Duration) 
 
 	ps := &ProfilingSystem{
 		httpServer: &http.Server{
-			Addr:    fmt.Sprintf(":%d", port),
+			// pprof はメモリの中身やスタックを返すので、外部から届かないループバックだけで待ち受ける
+			Addr:    fmt.Sprintf("127.0.0.1:%d", port),
 			Handler: mux,
 		},
 		profileInterval: profileInterval,

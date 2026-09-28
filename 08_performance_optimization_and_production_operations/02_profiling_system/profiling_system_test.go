@@ -438,7 +438,8 @@ func TestStartStopConcurrentWithHandlers(t *testing.T) {
 
 // TestStartProfilingReportsListenError ポートが使用中なら StartProfiling がエラーを返すことを確かめる
 func TestStartProfilingReportsListenError(t *testing.T) {
-	busy, err := net.Listen("tcp", ":0")
+	// サーバーと同じアドレスで塞ぐ。macOS では ":0" で塞いでも 127.0.0.1 の同じポートを bind できてしまう
+	busy, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("Listen failed: %v", err)
 	}
@@ -538,5 +539,26 @@ func TestCollectGoroutineInfoReflectsStates(t *testing.T) {
 	}
 	if info.Running > runtime.GOMAXPROCS(0) {
 		t.Errorf("Running = %d は GOMAXPROCS(%d) を超えない", info.Running, runtime.GOMAXPROCS(0))
+	}
+}
+
+// pprof はメモリの中身やスタックを返すので、同じマシンからしか届かないようにする
+func TestStartProfiling_ListensOnLoopbackOnly(t *testing.T) {
+	profiler := NewProfilingSystem(0, 1*time.Second, 1*time.Hour)
+	if err := profiler.StartProfiling(t.Context()); err != nil {
+		t.Fatalf("StartProfiling failed: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := profiler.Stop(); err != nil {
+			t.Errorf("Stop failed: %v", err)
+		}
+	})
+
+	host, _, err := net.SplitHostPort(profiler.listenAddr())
+	if err != nil {
+		t.Fatalf("SplitHostPort failed: %v", err)
+	}
+	if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() {
+		t.Errorf("待ち受けアドレス = %q, 期待値 ループバックアドレス", host)
 	}
 }
