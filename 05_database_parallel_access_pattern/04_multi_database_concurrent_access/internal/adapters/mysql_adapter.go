@@ -3,7 +3,10 @@ package adapters
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"log"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -51,14 +54,12 @@ func (m *MySQLAdapter) Connect(ctx context.Context, cfg config.DatabaseConfig) e
 	defer cancel()
 
 	if err := db.PingContext(ctxTimeout); err != nil {
-		db.Close()
-		return fmt.Errorf("MySQL接続テストエラー: %w", err)
+		return fmt.Errorf("MySQL接続テストエラー: %w", errors.Join(err, db.Close()))
 	}
 
 	// MySQL固有の設定を実行
 	if err := m.configureMySQLSession(ctx, db); err != nil {
-		db.Close()
-		return fmt.Errorf("MySQLセッション設定エラー: %w", err)
+		return fmt.Errorf("MySQLセッション設定エラー: %w", errors.Join(err, db.Close()))
 	}
 
 	m.db = db
@@ -87,7 +88,7 @@ func (m *MySQLAdapter) configureMySQLSession(ctx context.Context, db *sql.DB) er
 }
 
 // Query データを取得
-func (m *MySQLAdapter) Query(ctx context.Context, query string, args ...interface{}) (*QueryResult, error) {
+func (m *MySQLAdapter) Query(ctx context.Context, query string, args ...any) (*QueryResult, error) {
 	start := time.Now()
 
 	m.mutex.RLock()
@@ -105,7 +106,7 @@ func (m *MySQLAdapter) Query(ctx context.Context, query string, args ...interfac
 			DBType:  "MySQL",
 		}, nil
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 
 	columns, err := rows.Columns()
 	if err != nil {
@@ -116,10 +117,10 @@ func (m *MySQLAdapter) Query(ctx context.Context, query string, args ...interfac
 		}, nil
 	}
 
-	var results []map[string]interface{}
+	var results []map[string]any
 	for rows.Next() {
-		values := make([]interface{}, len(columns))
-		valuePtrs := make([]interface{}, len(columns))
+		values := make([]any, len(columns))
+		valuePtrs := make([]any, len(columns))
 		for i := range columns {
 			valuePtrs[i] = &values[i]
 		}
@@ -132,7 +133,7 @@ func (m *MySQLAdapter) Query(ctx context.Context, query string, args ...interfac
 			}, nil
 		}
 
-		row := make(map[string]interface{})
+		row := make(map[string]any)
 		for i, col := range columns {
 			// MySQL特有のデータ型変換
 			val := values[i]
@@ -168,7 +169,7 @@ func (m *MySQLAdapter) Query(ctx context.Context, query string, args ...interfac
 }
 
 // Execute データを変更
-func (m *MySQLAdapter) Execute(ctx context.Context, query string, args ...interface{}) (sql.Result, error) {
+func (m *MySQLAdapter) Execute(ctx context.Context, query string, args ...any) (sql.Result, error) {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
 
@@ -197,13 +198,17 @@ func (m *MySQLAdapter) Transaction(ctx context.Context, fn func(*sql.Tx) error) 
 
 	defer func() {
 		if r := recover(); r != nil {
-			tx.Rollback()
+			if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+				log.Printf("ロールバックエラー: %v", err)
+			}
 			panic(r)
 		}
 	}()
 
 	if err := fn(tx); err != nil {
-		tx.Rollback()
+		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+			return errors.Join(err, fmt.Errorf("ロールバックエラー: %w", rbErr))
+		}
 		return err
 	}
 
@@ -256,24 +261,24 @@ func (m *MySQLAdapter) CreateUser(ctx context.Context, user *models.User) (*mode
 	var existingID int64
 	checkQuery := `SELECT id FROM users WHERE email = ?`
 	err := m.db.QueryRowContext(ctx, checkQuery, user.Email).Scan(&existingID)
-	
-	if err != nil && err != sql.ErrNoRows {
+
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("存在チェックエラー: %w", err)
 	}
 
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		// レコードが存在しない場合はINSERT
 		insertQuery := `INSERT INTO users (name, email, age) VALUES (?, ?, ?)`
 		result, err := m.Execute(ctx, insertQuery, user.Name, user.Email, user.Age)
 		if err != nil {
 			return nil, fmt.Errorf("ユーザー作成エラー: %w", err)
 		}
-		
+
 		id, err := result.LastInsertId()
 		if err != nil {
 			return nil, fmt.Errorf("挿入ID取得エラー: %w", err)
 		}
-		
+
 		user.ID = id
 		user.CreatedAt = time.Now()
 		user.UpdatedAt = time.Now()
@@ -284,10 +289,10 @@ func (m *MySQLAdapter) CreateUser(ctx context.Context, user *models.User) (*mode
 		if err != nil {
 			return nil, fmt.Errorf("ユーザー更新エラー: %w", err)
 		}
-		
+
 		user.ID = existingID
 		user.UpdatedAt = time.Now()
-		
+
 		// created_atを取得
 		selectQuery := `SELECT created_at FROM users WHERE id = ?`
 		err = m.db.QueryRowContext(ctx, selectQuery, existingID).Scan(&user.CreatedAt)
@@ -312,6 +317,9 @@ func (m *MySQLAdapter) GetUsersByAgeRange(ctx context.Context, minAge, maxAge in
 	result, err := m.Query(ctx, query, minAge, maxAge)
 	if err != nil {
 		return nil, fmt.Errorf("年齢範囲クエリエラー: %w", err)
+	}
+	if result.Error != nil {
+		return nil, fmt.Errorf("年齢範囲クエリエラー: %w", result.Error)
 	}
 
 	var users []*models.User
@@ -354,15 +362,12 @@ func (m *MySQLAdapter) BulkInsertUsers(ctx context.Context, users []*models.User
 
 	// MySQL最適化: バッチサイズを制限
 	batchSize := 1000
-	for i := 0; i < len(users); i += batchSize {
-		end := i + batchSize
-		if end > len(users) {
-			end = len(users)
+	offset := 0
+	for batch := range slices.Chunk(users, batchSize) {
+		if err := m.insertBatch(ctx, batch); err != nil {
+			return fmt.Errorf("バッチ挿入エラー (batch %d-%d): %w", offset, offset+len(batch)-1, err)
 		}
-
-		if err := m.insertBatch(ctx, users[i:end]); err != nil {
-			return fmt.Errorf("バッチ挿入エラー (batch %d-%d): %w", i, end-1, err)
-		}
+		offset += len(batch)
 	}
 
 	return nil
@@ -375,7 +380,7 @@ func (m *MySQLAdapter) insertBatch(ctx context.Context, users []*models.User) er
 
 	// 動的にINSERT文を構築
 	query := "INSERT INTO users (name, email, age) VALUES "
-	values := make([]interface{}, 0, len(users)*3)
+	values := make([]any, 0, len(users)*3)
 	placeholders := make([]string, len(users))
 
 	for i, user := range users {

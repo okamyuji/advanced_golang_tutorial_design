@@ -4,6 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log"
+	"maps"
+	"slices"
 	"time"
 
 	"multi-db/internal/config"
@@ -12,18 +15,18 @@ import (
 
 // QueryResult クエリ結果構造体
 type QueryResult struct {
-	Data    []map[string]interface{} `json:"data"`
-	Error   error                    `json:"error"`
-	Elapsed time.Duration            `json:"elapsed"`
-	DBType  string                   `json:"db_type"`
+	Data    []map[string]any `json:"data"`
+	Error   error            `json:"error"`
+	Elapsed time.Duration    `json:"elapsed"`
+	DBType  string           `json:"db_type"`
 }
 
 // DBAdapter データベースアダプターインターフェース
 type DBAdapter interface {
 	// 基本的なデータベース操作
 	Connect(ctx context.Context, config config.DatabaseConfig) error
-	Query(ctx context.Context, query string, args ...interface{}) (*QueryResult, error)
-	Execute(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
+	Query(ctx context.Context, query string, args ...any) (*QueryResult, error)
+	Execute(ctx context.Context, query string, args ...any) (sql.Result, error)
 	Transaction(ctx context.Context, fn func(*sql.Tx) error) error
 	Close() error
 	Ping(ctx context.Context) error
@@ -64,11 +67,14 @@ func (r *AdapterRegistry) Create(dbType string) (DBAdapter, error) {
 
 // GetSupportedTypes サポートされているデータベースタイプを取得
 func (r *AdapterRegistry) GetSupportedTypes() []string {
-	var types []string
-	for dbType := range r.adapters {
-		types = append(types, dbType)
+	return slices.Sorted(maps.Keys(r.adapters))
+}
+
+// closeRows 読み終えた rows を閉じ、失敗したらログに残す
+func closeRows(rows *sql.Rows) {
+	if err := rows.Close(); err != nil {
+		log.Printf("rows のクローズエラー: %v", err)
 	}
-	return types
 }
 
 // デフォルトレジストリのインスタンス

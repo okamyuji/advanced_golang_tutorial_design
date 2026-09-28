@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-// DynamicWorkerPoolは動的負荷制御機能付きワーカープールです
+// DynamicWorkerPool 動的負荷制御機能付きワーカープールです
 type DynamicWorkerPool struct {
 	// 基本設定
 	minWorkers    int
@@ -23,7 +23,7 @@ type DynamicWorkerPool struct {
 
 	// ワーカー管理
 	workers  map[int]*DynamicWorker
-	workerID int64
+	workerID atomic.Int64
 	mu       sync.RWMutex
 
 	// 制御
@@ -34,19 +34,22 @@ type DynamicWorkerPool struct {
 	// 負荷監視
 	loadMonitor *LoadMonitor
 
+	// closed trueの後はtaskQueueへ送らない。muの書き込みロック中に切り替える
+	closed bool
+
 	// 設定
 	config *DynamicConfig
 }
 
-// DynamicTaskは動的プール用タスクです
+// DynamicTask 動的プール用タスクです
 type DynamicTask struct {
 	ID           int
-	Data         interface{}
-	Execute      func(interface{}) error
+	Data         any
+	Execute      func(any) error
 	CPUIntensive bool // CPU集約的かどうか
 }
 
-// DynamicResultは実行結果です
+// DynamicResult 実行結果です
 type DynamicResult struct {
 	TaskID   int
 	Success  bool
@@ -55,15 +58,16 @@ type DynamicResult struct {
 	WorkerID int
 }
 
-// DynamicWorkerは動的ワーカーです
+// DynamicWorker 動的ワーカーです
 type DynamicWorker struct {
 	ID           int
 	pool         *DynamicWorkerPool
-	lastActivity time.Time
-	taskCount    int64
+	lastActivity atomic.Int64  // 最後にタスクを受け取った時刻（UnixNano）
+	quit         chan struct{} // scaleDownがこのワーカーだけを止めるために閉じる
+	taskCount    atomic.Int64
 }
 
-// LoadMonitorは負荷監視を行います
+// LoadMonitor 負荷監視を行います
 type LoadMonitor struct {
 	mu             sync.RWMutex
 	cpuUsage       float64
@@ -72,7 +76,7 @@ type LoadMonitor struct {
 	maxHistorySize int
 }
 
-// DynamicConfigは動的制御の設定です
+// DynamicConfig 動的制御の設定です
 type DynamicConfig struct {
 	CPUHighThreshold   float64
 	CPULowThreshold    float64
@@ -83,7 +87,7 @@ type DynamicConfig struct {
 	WorkerIdleTimeout  time.Duration
 }
 
-// NewDynamicWorkerPoolは新しい動的ワーカープールを作成します
+// NewDynamicWorkerPool 新しい動的ワーカープールを作成します
 func NewDynamicWorkerPool(minWorkers, maxWorkers, queueSize int) *DynamicWorkerPool {
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -101,7 +105,7 @@ func NewDynamicWorkerPool(minWorkers, maxWorkers, queueSize int) *DynamicWorkerP
 			cpuHistory:     make([]float64, 0, 10),
 		},
 		config: &DynamicConfig{
-			CPUHighThreshold:   70.0,
+			CPUHighThreshold:   80.0,
 			CPULowThreshold:    50.0,
 			QueueHighThreshold: 80.0,
 			ScaleUpCooldown:    30 * time.Second,
@@ -112,32 +116,29 @@ func NewDynamicWorkerPool(minWorkers, maxWorkers, queueSize int) *DynamicWorkerP
 	}
 }
 
-// Startは動的ワーカープールを開始します
+// Start 動的ワーカープールを開始します
 func (dwp *DynamicWorkerPool) Start() error {
 	// 最小数のワーカーを開始
-	for i := 0; i < dwp.minWorkers; i++ {
+	for range dwp.minWorkers {
 		if err := dwp.addWorker(); err != nil {
-			return fmt.Errorf("failed to start initial worker: %v", err)
+			return fmt.Errorf("failed to start initial worker: %w", err)
 		}
 	}
 
 	// 結果処理を開始
-	dwp.wg.Add(1)
-	go dwp.resultHandler()
+	dwp.wg.Go(dwp.resultHandler)
 
 	// 負荷監視を開始
-	dwp.wg.Add(1)
-	go dwp.loadMonitor.monitor(dwp.ctx, dwp.config.LoadCheckInterval)
+	dwp.wg.Go(func() { dwp.loadMonitor.monitor(dwp.ctx, dwp.config.LoadCheckInterval) })
 
 	// 動的スケーリングを開始
-	dwp.wg.Add(1)
-	go dwp.dynamicScaler()
+	dwp.wg.Go(dwp.dynamicScaler)
 
 	log.Printf("Dynamic worker pool started with %d workers", dwp.minWorkers)
 	return nil
 }
 
-// addWorkerは新しいワーカーを追加します
+// addWorker 新しいワーカーを追加します
 func (dwp *DynamicWorkerPool) addWorker() error {
 	dwp.mu.Lock()
 	defer dwp.mu.Unlock()
@@ -146,22 +147,22 @@ func (dwp *DynamicWorkerPool) addWorker() error {
 		return fmt.Errorf("maximum workers limit reached")
 	}
 
-	workerID := int(atomic.AddInt64(&dwp.workerID, 1))
+	workerID := int(dwp.workerID.Add(1))
 	worker := &DynamicWorker{
-		ID:           workerID,
-		pool:         dwp,
-		lastActivity: time.Now(),
+		ID:   workerID,
+		pool: dwp,
+		quit: make(chan struct{}),
 	}
+	worker.lastActivity.Store(time.Now().UnixNano())
 
 	dwp.workers[workerID] = worker
 
-	dwp.wg.Add(1)
-	go worker.run()
+	dwp.wg.Go(worker.run)
 
 	return nil
 }
 
-// removeWorkerはワーカーを削除します
+// removeWorker ワーカーを削除します
 func (dwp *DynamicWorkerPool) removeWorker(workerID int) {
 	dwp.mu.Lock()
 	defer dwp.mu.Unlock()
@@ -169,9 +170,8 @@ func (dwp *DynamicWorkerPool) removeWorker(workerID int) {
 	delete(dwp.workers, workerID)
 }
 
-// runはワーカーのメインループです
+// run ワーカーのメインループです
 func (dw *DynamicWorker) run() {
-	defer dw.pool.wg.Done()
 	defer dw.pool.removeWorker(dw.ID)
 
 	idleTimer := time.NewTimer(dw.pool.config.WorkerIdleTimeout)
@@ -180,6 +180,9 @@ func (dw *DynamicWorker) run() {
 	for {
 		select {
 		case <-dw.pool.ctx.Done():
+			return
+		case <-dw.quit:
+			log.Printf("Worker %d stopped by scale down", dw.ID)
 			return
 		case <-idleTimer.C:
 			// アイドルタイムアウト（最小数は維持）
@@ -193,8 +196,11 @@ func (dw *DynamicWorker) run() {
 			}
 			idleTimer.Reset(dw.pool.config.WorkerIdleTimeout)
 
-		case task := <-dw.pool.taskQueue:
-			dw.lastActivity = time.Now()
+		case task, ok := <-dw.pool.taskQueue:
+			if !ok {
+				return
+			}
+			dw.lastActivity.Store(time.Now().UnixNano())
 			result := dw.executeTask(task)
 
 			select {
@@ -203,18 +209,16 @@ func (dw *DynamicWorker) run() {
 				return
 			}
 
-			if !idleTimer.Stop() {
-				<-idleTimer.C
-			}
+			// Go 1.23以降はResetの前にStopとチャネルの排出をしなくても古い値は届かない
 			idleTimer.Reset(dw.pool.config.WorkerIdleTimeout)
 		}
 	}
 }
 
-// executeTaskはタスクを実行します
+// executeTask タスクを実行します
 func (dw *DynamicWorker) executeTask(task DynamicTask) DynamicResult {
 	start := time.Now()
-	atomic.AddInt64(&dw.taskCount, 1)
+	dw.taskCount.Add(1)
 
 	result := DynamicResult{
 		TaskID:   task.ID,
@@ -242,22 +246,21 @@ func (dw *DynamicWorker) executeTask(task DynamicTask) DynamicResult {
 	return result
 }
 
-// monitorは負荷を監視します
+// monitor 負荷を監視します
 func (lm *LoadMonitor) monitor(ctx context.Context, interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	tick := time.Tick(interval)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-tick:
 			lm.updateCPUUsage()
 		}
 	}
 }
 
-// updateCPUUsageはCPU使用率を更新します
+// updateCPUUsage CPU使用率を更新します
 func (lm *LoadMonitor) updateCPUUsage() {
 	// 簡易CPU使用率計算（実際の実装では/proc/statやruntime/metricsを使用）
 	var memStats runtime.MemStats
@@ -266,11 +269,7 @@ func (lm *LoadMonitor) updateCPUUsage() {
 	// Goroutine数とメモリ使用量からCPU使用率を推定
 	goroutines := float64(runtime.NumGoroutine())
 	cpuCores := float64(runtime.NumCPU())
-	estimatedCPU := (goroutines / cpuCores) * 10.0 // 簡易推定
-
-	if estimatedCPU > 100.0 {
-		estimatedCPU = 100.0
-	}
+	estimatedCPU := min((goroutines/cpuCores)*10.0, 100.0) // 簡易推定
 
 	lm.mu.Lock()
 	defer lm.mu.Unlock()
@@ -285,14 +284,14 @@ func (lm *LoadMonitor) updateCPUUsage() {
 	}
 }
 
-// getCPUUsageは現在のCPU使用率を取得します
+// getCPUUsage 現在のCPU使用率を取得します
 func (lm *LoadMonitor) getCPUUsage() float64 {
 	lm.mu.RLock()
 	defer lm.mu.RUnlock()
 	return lm.cpuUsage
 }
 
-// getAverageCPUUsageは平均CPU使用率を取得します
+// getAverageCPUUsage 平均CPU使用率を取得します
 func (lm *LoadMonitor) getAverageCPUUsage() float64 {
 	lm.mu.RLock()
 	defer lm.mu.RUnlock()
@@ -308,12 +307,9 @@ func (lm *LoadMonitor) getAverageCPUUsage() float64 {
 	return sum / float64(len(lm.cpuHistory))
 }
 
-// dynamicScalerは動的スケーリングを実行します
+// dynamicScaler 動的スケーリングを実行します
 func (dwp *DynamicWorkerPool) dynamicScaler() {
-	defer dwp.wg.Done()
-
-	ticker := time.NewTicker(dwp.config.LoadCheckInterval)
-	defer ticker.Stop()
+	tick := time.Tick(dwp.config.LoadCheckInterval)
 
 	lastScaleUp := time.Time{}
 	lastScaleDown := time.Time{}
@@ -322,13 +318,13 @@ func (dwp *DynamicWorkerPool) dynamicScaler() {
 		select {
 		case <-dwp.ctx.Done():
 			return
-		case <-ticker.C:
+		case <-tick:
 			dwp.evaluateScaling(&lastScaleUp, &lastScaleDown)
 		}
 	}
 }
 
-// evaluateScalingはスケーリングの必要性を評価します
+// evaluateScaling スケーリングの必要性を評価します
 func (dwp *DynamicWorkerPool) evaluateScaling(lastScaleUp, lastScaleDown *time.Time) {
 	// 現在の状態を取得
 	queueLength := len(dwp.taskQueue)
@@ -371,29 +367,35 @@ func (dwp *DynamicWorkerPool) evaluateScaling(lastScaleUp, lastScaleDown *time.T
 		currentWorkers, cpuUsage, avgCPUUsage, queueLength, dwp.taskQueueSize, queueUtil)
 }
 
-// scaleDownはワーカーを削減します
+// scaleDown ワーカーを削減します
+// 最も長くタスクを受け取っていないワーカーを1つ止めます
 func (dwp *DynamicWorkerPool) scaleDown() {
-	dwp.mu.RLock()
-	var oldestWorker *DynamicWorker
-	oldestTime := time.Now()
+	dwp.mu.Lock()
+	defer dwp.mu.Unlock()
 
-	for _, worker := range dwp.workers {
-		if worker.lastActivity.Before(oldestTime) {
-			oldestTime = worker.lastActivity
-			oldestWorker = worker
+	if len(dwp.workers) <= dwp.minWorkers {
+		return
+	}
+	var oldest *DynamicWorker
+	for _, w := range dwp.workers {
+		if oldest == nil || w.lastActivity.Load() < oldest.lastActivity.Load() {
+			oldest = w
 		}
 	}
-	dwp.mu.RUnlock()
-
-	if oldestWorker != nil {
-		// ワーカーにシャットダウンシグナルを送る代わりに
-		// アイドルタイムアウトを短くして自然に終了させる
-		log.Printf("Marking worker %d for scale down", oldestWorker.ID)
-	}
+	// 先にマップから外すので、同じワーカーのquitを二重に閉じることはない
+	delete(dwp.workers, oldest.ID)
+	close(oldest.quit)
 }
 
-// SubmitTaskはタスクを追加します
+// SubmitTask タスクを追加します
 func (dwp *DynamicWorkerPool) SubmitTask(task DynamicTask) error {
+	// 送信が終わるまで読み取りロックを持ち、Shutdownのclose(taskQueue)と重ならないようにする
+	dwp.mu.RLock()
+	defer dwp.mu.RUnlock()
+	if dwp.closed {
+		return fmt.Errorf("pool is shutting down")
+	}
+
 	select {
 	case dwp.taskQueue <- task:
 		return nil
@@ -404,10 +406,8 @@ func (dwp *DynamicWorkerPool) SubmitTask(task DynamicTask) error {
 	}
 }
 
-// resultHandlerは結果を処理します
+// resultHandler 結果を処理します
 func (dwp *DynamicWorkerPool) resultHandler() {
-	defer dwp.wg.Done()
-
 	for {
 		select {
 		case <-dwp.ctx.Done():
@@ -421,11 +421,16 @@ func (dwp *DynamicWorkerPool) resultHandler() {
 	}
 }
 
-// Shutdownはプールを停止します
+// Shutdown プールを停止します
 func (dwp *DynamicWorkerPool) Shutdown(timeout time.Duration) error {
 	log.Println("Starting dynamic worker pool shutdown...")
 
-	close(dwp.taskQueue)
+	dwp.mu.Lock()
+	if !dwp.closed {
+		dwp.closed = true
+		close(dwp.taskQueue)
+	}
+	dwp.mu.Unlock()
 	dwp.cancel()
 
 	done := make(chan struct{})
@@ -443,7 +448,7 @@ func (dwp *DynamicWorkerPool) Shutdown(timeout time.Duration) error {
 	}
 }
 
-// GetStatsは統計を取得します
+// GetStats 統計を取得します
 func (dwp *DynamicWorkerPool) GetStats() (int, float64, float64) {
 	dwp.mu.RLock()
 	workerCount := len(dwp.workers)
@@ -467,11 +472,12 @@ func main() {
 	// 負荷パターンを変化させるタスクを送信
 	go func() {
 		// 軽い負荷から開始
-		for i := 1; i <= 10; i++ {
+		for n := range 10 {
+			i := n + 1
 			task := DynamicTask{
 				ID:   i,
 				Data: fmt.Sprintf("light-task-%d", i),
-				Execute: func(data interface{}) error {
+				Execute: func(data any) error {
 					time.Sleep(100 * time.Millisecond)
 					return nil
 				},
@@ -484,11 +490,12 @@ func main() {
 		}
 
 		// 重い負荷に切り替え
-		for i := 11; i <= 30; i++ {
+		for n := range 20 {
+			i := 11 + n
 			task := DynamicTask{
 				ID:   i,
 				Data: fmt.Sprintf("heavy-task-%d", i),
-				Execute: func(data interface{}) error {
+				Execute: func(data any) error {
 					// CPU集約的処理をシミュレート
 					end := time.Now().Add(500 * time.Millisecond)
 					for time.Now().Before(end) {
@@ -505,11 +512,12 @@ func main() {
 		}
 
 		// 軽い負荷に戻す
-		for i := 31; i <= 40; i++ {
+		for n := range 10 {
+			i := 31 + n
 			task := DynamicTask{
 				ID:   i,
 				Data: fmt.Sprintf("cool-down-task-%d", i),
-				Execute: func(data interface{}) error {
+				Execute: func(data any) error {
 					time.Sleep(50 * time.Millisecond)
 					return nil
 				},
@@ -524,8 +532,7 @@ func main() {
 
 	// 統計を定期的に出力
 	go func() {
-		for {
-			time.Sleep(10 * time.Second)
+		for range time.Tick(10 * time.Second) {
 			workers, queueUtil, cpuUsage := pool.GetStats()
 			log.Printf("Current Stats: Workers=%d, Queue=%.1f%%, CPU=%.1f%%",
 				workers, queueUtil, cpuUsage)

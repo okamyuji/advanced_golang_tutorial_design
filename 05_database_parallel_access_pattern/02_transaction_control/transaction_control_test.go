@@ -1,8 +1,8 @@
 package main
 
 import (
-	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -16,11 +16,11 @@ import (
 
 // setupTestDB テスト用のPostgreSQLコンテナを起動し、初期化されたデータベースを返す
 func setupTestDB(t *testing.T) (*sql.DB, func()) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// PostgreSQLコンテナを起動
-	pgContainer, err := postgres.RunContainer(ctx,
-		testcontainers.WithImage("postgres:15-alpine"),
+	pgContainer, err := postgres.Run(ctx,
+		"postgres:15-alpine",
 		postgres.WithDatabase("testdb"),
 		postgres.WithUsername("testuser"),
 		postgres.WithPassword("testpass"),
@@ -124,7 +124,7 @@ func createTestTables(db *sql.DB) error {
 	for _, query := range queries {
 		_, err := db.Exec(query)
 		if err != nil {
-			return fmt.Errorf("failed to create table: %v", err)
+			return fmt.Errorf("failed to create table: %w", err)
 		}
 	}
 
@@ -141,7 +141,7 @@ func insertTestData(db *sql.DB) error {
 		('Test Product 3', 3000.00)
 	`)
 	if err != nil {
-		return fmt.Errorf("failed to insert test products: %v", err)
+		return fmt.Errorf("failed to insert test products: %w", err)
 	}
 
 	// テスト用在庫
@@ -152,7 +152,7 @@ func insertTestData(db *sql.DB) error {
 		(3, 1, 200)
 	`)
 	if err != nil {
-		return fmt.Errorf("failed to insert test inventory: %v", err)
+		return fmt.Errorf("failed to insert test inventory: %w", err)
 	}
 
 	// テスト用ロックデータ
@@ -163,7 +163,7 @@ func insertTestData(db *sql.DB) error {
 		('initial data 3')
 	`)
 	if err != nil {
-		return fmt.Errorf("failed to insert test lock data: %v", err)
+		return fmt.Errorf("failed to insert test lock data: %w", err)
 	}
 
 	return nil
@@ -174,7 +174,7 @@ func TestTransactionManager_BasicTransaction(t *testing.T) {
 	defer cleanup()
 
 	tm := NewTransactionManager(db)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	config := &TxConfig{
 		IsolationLevel: sql.LevelReadCommitted,
@@ -218,7 +218,7 @@ func TestTransactionManager_WithRetry(t *testing.T) {
 	defer cleanup()
 
 	tm := NewTransactionManager(db)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	config := &TxConfig{
 		IsolationLevel: sql.LevelReadCommitted,
@@ -263,19 +263,16 @@ func TestOptimisticLockManager_ConcurrentUpdates(t *testing.T) {
 
 	tm := NewTransactionManager(db)
 	olm := NewOptimisticLockManager(tm)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	const numWorkers = 5
 	var wg sync.WaitGroup
 	var successCount, failureCount int64
 	var mu sync.Mutex
 
-	for i := 0; i < numWorkers; i++ {
-		wg.Add(1)
-		go func(workerID int) {
-			defer wg.Done()
-
-			updateFields := map[string]interface{}{
+	for workerID := range numWorkers {
+		wg.Go(func() {
+			updateFields := map[string]any{
 				"data": fmt.Sprintf("updated by worker %d at %s", workerID, time.Now().Format("15:04:05.000")),
 			}
 
@@ -290,7 +287,7 @@ func TestOptimisticLockManager_ConcurrentUpdates(t *testing.T) {
 				t.Logf("Worker %d succeeded", workerID)
 			}
 			mu.Unlock()
-		}(i)
+		})
 	}
 
 	wg.Wait()
@@ -328,7 +325,7 @@ func TestInventoryManager_ConcurrentReservations(t *testing.T) {
 
 	tm := NewTransactionManager(db)
 	im := NewInventoryManager(tm)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	const numOrders = 10
 	const productID = 1
@@ -345,24 +342,21 @@ func TestInventoryManager_ConcurrentReservations(t *testing.T) {
 	t.Logf("Initial inventory: quantity=%d, reserved=%d", initialQty, initialReserved)
 
 	var wg sync.WaitGroup
-	successCount := int64(0)
-	failureCount := int64(0)
+	var successCount, failureCount atomic.Int64
 
-	for i := 0; i < numOrders; i++ {
-		wg.Add(1)
-		go func(orderID int) {
-			defer wg.Done()
-
+	for i := range numOrders {
+		orderID := i + 1
+		wg.Go(func() {
 			quantity := 5 // 各注文で5個予約
 			err := im.ReserveInventory(ctx, productID, warehouseID, quantity)
 			if err != nil {
-				atomic.AddInt64(&failureCount, 1)
+				failureCount.Add(1)
 				t.Logf("Order %d failed: %v", orderID, err)
 			} else {
-				atomic.AddInt64(&successCount, 1)
+				successCount.Add(1)
 				t.Logf("Order %d succeeded: reserved %d units", orderID, quantity)
 			}
-		}(i + 1)
+		})
 	}
 
 	wg.Wait()
@@ -376,8 +370,8 @@ func TestInventoryManager_ConcurrentReservations(t *testing.T) {
 	}
 
 	// 予約数の増加が正しいことを確認
-	successCountValue := atomic.LoadInt64(&successCount)
-	failureCountValue := atomic.LoadInt64(&failureCount)
+	successCountValue := successCount.Load()
+	failureCountValue := failureCount.Load()
 
 	t.Logf("Final inventory: quantity=%d, reserved=%d", finalQty, finalReserved)
 	t.Logf("Order results: Success=%d, Failure=%d", successCountValue, failureCountValue)
@@ -405,7 +399,7 @@ func TestTransactionManager_RollbackOnError(t *testing.T) {
 	defer cleanup()
 
 	tm := NewTransactionManager(db)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	config := &TxConfig{
 		IsolationLevel: sql.LevelReadCommitted,
@@ -458,7 +452,7 @@ func TestTransactionManager_Timeout(t *testing.T) {
 	defer cleanup()
 
 	tm := NewTransactionManager(db)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	config := &TxConfig{
 		IsolationLevel: sql.LevelReadCommitted,
@@ -473,16 +467,11 @@ func TestTransactionManager_Timeout(t *testing.T) {
 	})
 	elapsed := time.Since(start)
 
-	if err == nil {
-		t.Error("Transaction should timeout")
+	// fnは途中で止められないので最後まで走る。期限が切れた時点でdatabase/sqlが
+	// トランザクションをロールバックするため、その後のCommitがErrTxDoneで失敗する
+	if !errors.Is(err, sql.ErrTxDone) {
+		t.Fatalf("err = %v after %v, want sql.ErrTxDone", err, elapsed)
 	}
-
-	// タイムアウト時間内で終了していることを確認
-	if elapsed > 250*time.Millisecond {
-		t.Errorf("Transaction should timeout quickly, took %v", elapsed)
-	}
-
-	t.Logf("Transaction correctly timed out after %v", elapsed)
 }
 
 func TestTransactionManager_IsolationLevels(t *testing.T) {
@@ -490,7 +479,7 @@ func TestTransactionManager_IsolationLevels(t *testing.T) {
 	defer cleanup()
 
 	tm := NewTransactionManager(db)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	isolationLevels := []sql.IsolationLevel{
 		sql.LevelDefault,
@@ -524,7 +513,7 @@ func TestTransactionManager_Statistics(t *testing.T) {
 	defer cleanup()
 
 	tm := NewTransactionManager(db)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	config := &TxConfig{
 		IsolationLevel: sql.LevelReadCommitted,
@@ -535,7 +524,7 @@ func TestTransactionManager_Statistics(t *testing.T) {
 	const numTransactions = 5
 	successfulTx := 0
 
-	for i := 0; i < numTransactions; i++ {
+	for i := range numTransactions {
 		err := tm.ExecuteTransaction(ctx, config, func(tx *sql.Tx) error {
 			if i%2 == 0 {
 				// 成功するトランザクション

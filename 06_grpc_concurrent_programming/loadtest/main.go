@@ -4,8 +4,9 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"runtime"
-	"sort"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -42,10 +43,10 @@ func main() {
 	// サーバー設定と起動
 	serverConfig := server.ServerConfig{
 		Port:                  8080,
-		MaxWorkers:            runtime.NumCPU() * 16, // 負荷テスト用に多めに設定
-		MaxConcurrentStreams:  2000,                  // 高負荷対応
-		MaxReceiveMessageSize: 4 * 1024 * 1024,       // 4MB
-		MaxSendMessageSize:    4 * 1024 * 1024,       // 4MB
+		MaxWorkers:            runtime.GOMAXPROCS(0) * 16, // 負荷テスト用に多めに設定
+		MaxConcurrentStreams:  2000,                       // 高負荷対応
+		MaxReceiveMessageSize: 4 * 1024 * 1024,            // 4MB
+		MaxSendMessageSize:    4 * 1024 * 1024,            // 4MB
 		ConnectionTimeout:     30 * time.Second,
 		KeepaliveTime:         30 * time.Second,
 		KeepaliveTimeout:      5 * time.Second,
@@ -55,15 +56,18 @@ func main() {
 		EnableTLS:             false, // 負荷テスト用にTLS無効
 	}
 
+	// Listenを先に済ませるので、Serveの開始を待たずにクライアントから接続できる
+	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", serverConfig.Port))
+	if err != nil {
+		log.Fatalf("リスナー作成エラー: %v", err)
+	}
+
 	// サーバーを別ゴルーチンで起動
 	go func() {
-		if err := server.StartHighPerformanceServer(serverConfig); err != nil {
+		if err := server.Serve(lis, serverConfig); err != nil {
 			log.Fatalf("サーバー起動エラー: %v", err)
 		}
 	}()
-
-	// サーバー起動待機
-	time.Sleep(3 * time.Second)
 
 	// 複数の負荷テストシナリオを実行
 	runLoadTestSuite()
@@ -151,14 +155,14 @@ func executeLoadTest(config LoadTestConfig) LoadTestResult {
 		DefaultTimeout:          10 * time.Second,
 		CircuitBreakerThreshold: 10, // 負荷テスト用に閾値を上げる
 		CircuitBreakerTimeout:   30 * time.Second,
-		EnableTLS:               false,    // 負荷テスト用にTLS無効
+		EnableTLS:               false,     // 負荷テスト用にTLS無効
 		AuthToken:               authToken, // JWT認証トークン
 	}
 
-	var totalRequests int64
-	var successfulRequests int64
-	var failedRequests int64
-	var totalLatency int64
+	var totalRequests atomic.Int64
+	var successfulRequests atomic.Int64
+	var failedRequests atomic.Int64
+	var totalLatency atomic.Int64
 
 	latencies := make([]time.Duration, 0, config.ConcurrentClients*config.RequestsPerClient)
 	latenciesMutex := sync.Mutex{}
@@ -169,15 +173,14 @@ func executeLoadTest(config LoadTestConfig) LoadTestResult {
 	// リアルタイム統計表示用ゴルーチン
 	stopStats := make(chan struct{})
 	go func() {
-		ticker := time.NewTicker(5 * time.Second)
-		defer ticker.Stop()
+		tick := time.Tick(5 * time.Second)
 
 		for {
 			select {
-			case <-ticker.C:
-				current := atomic.LoadInt64(&totalRequests)
-				successful := atomic.LoadInt64(&successfulRequests)
-				failed := atomic.LoadInt64(&failedRequests)
+			case <-tick:
+				current := totalRequests.Load()
+				successful := successfulRequests.Load()
+				failed := failedRequests.Load()
 				elapsed := time.Since(startTime)
 				currentRPS := float64(current) / elapsed.Seconds()
 
@@ -191,21 +194,24 @@ func executeLoadTest(config LoadTestConfig) LoadTestResult {
 	}()
 
 	// 段階的にクライアントを起動（ランプアップ）
-	clientInterval := config.RampUpDuration / time.Duration(config.ConcurrentClients)
+	var clientInterval time.Duration
+	if config.ConcurrentClients > 0 {
+		clientInterval = config.RampUpDuration / time.Duration(config.ConcurrentClients)
+	}
 
-	for i := 0; i < config.ConcurrentClients; i++ {
-		wg.Add(1)
-
-		go func(clientID int) {
-			defer wg.Done()
-
+	for clientID := range config.ConcurrentClients {
+		wg.Go(func() {
 			// クライアント作成
 			grpcClient, err := client.NewHighPerformanceGRPCClient(clientConfig)
 			if err != nil {
 				log.Printf("クライアント作成エラー (ID: %d): %v", clientID, err)
 				return
 			}
-			defer grpcClient.Close()
+			defer func() {
+				if err := grpcClient.Close(); err != nil {
+					log.Printf("クライアント終了エラー (ID: %d): %v", clientID, err)
+				}
+			}()
 
 			// テスト期間中リクエストを継続送信
 			endTime := startTime.Add(config.TestDuration)
@@ -222,17 +228,17 @@ func executeLoadTest(config LoadTestConfig) LoadTestResult {
 
 				requestDuration := time.Since(requestStart)
 
-				atomic.AddInt64(&totalRequests, 1)
+				totalRequests.Add(1)
 
 				if err != nil {
-					atomic.AddInt64(&failedRequests, 1)
+					failedRequests.Add(1)
 				} else {
-					atomic.AddInt64(&successfulRequests, 1)
+					successfulRequests.Add(1)
 				}
 
 				// レイテンシー統計更新
 				latencyNs := requestDuration.Nanoseconds()
-				atomic.AddInt64(&totalLatency, latencyNs)
+				totalLatency.Add(latencyNs)
 
 				// パーセンタイル計算用にレイテンシーを保存
 				latenciesMutex.Lock()
@@ -244,10 +250,10 @@ func executeLoadTest(config LoadTestConfig) LoadTestResult {
 				// 負荷調整（短い間隔でリクエスト）
 				time.Sleep(100 * time.Microsecond)
 			}
-		}(i)
+		})
 
 		// ランプアップ間隔
-		if i < config.ConcurrentClients-1 {
+		if clientID < config.ConcurrentClients-1 {
 			time.Sleep(clientInterval)
 		}
 	}
@@ -257,32 +263,24 @@ func executeLoadTest(config LoadTestConfig) LoadTestResult {
 	actualTestDuration := time.Since(startTime)
 
 	// 統計計算
-	totalReq := atomic.LoadInt64(&totalRequests)
-	successReq := atomic.LoadInt64(&successfulRequests)
-	failedReq := atomic.LoadInt64(&failedRequests)
-	avgLatency := time.Duration(atomic.LoadInt64(&totalLatency) / totalReq)
+	totalReq := totalRequests.Load()
+	successReq := successfulRequests.Load()
+	failedReq := failedRequests.Load()
+	var avgLatency time.Duration
+	if totalReq > 0 {
+		avgLatency = time.Duration(totalLatency.Load() / totalReq)
+	}
 
 	// パーセンタイル計算
-	sort.Slice(latencies, func(i, j int) bool {
-		return latencies[i] < latencies[j]
-	})
+	slices.Sort(latencies)
 
 	var minLatency, maxLatency, p95Latency, p99Latency time.Duration
 	if len(latencies) > 0 {
 		minLatency = latencies[0]
 		maxLatency = latencies[len(latencies)-1]
 
-		p95Index := int(float64(len(latencies)) * 0.95)
-		if p95Index >= len(latencies) {
-			p95Index = len(latencies) - 1
-		}
-		p95Latency = latencies[p95Index]
-
-		p99Index := int(float64(len(latencies)) * 0.99)
-		if p99Index >= len(latencies) {
-			p99Index = len(latencies) - 1
-		}
-		p99Latency = latencies[p99Index]
+		p95Latency = latencies[min(int(float64(len(latencies))*0.95), len(latencies)-1)]
+		p99Latency = latencies[min(int(float64(len(latencies))*0.99), len(latencies)-1)]
 	}
 
 	return LoadTestResult{
@@ -306,7 +304,10 @@ func printLoadTestResult(scenarioName string, result LoadTestResult) {
 	fmt.Printf("成功リクエスト数: %d\n", result.SuccessfulRequests)
 	fmt.Printf("失敗リクエスト数: %d\n", result.FailedRequests)
 
-	successRate := float64(result.SuccessfulRequests) / float64(result.TotalRequests) * 100
+	var successRate float64
+	if result.TotalRequests > 0 {
+		successRate = float64(result.SuccessfulRequests) / float64(result.TotalRequests) * 100
+	}
 	fmt.Printf("成功率: %.2f%%\n", successRate)
 	fmt.Printf("スループット: %.2f RPS\n", result.RequestsPerSecond)
 

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"cmp"
 	"fmt"
 	"os"
 	"strings"
@@ -295,15 +296,8 @@ func expandEnvVars(config string) string {
 	// ${VAR_NAME:default_value} 形式の環境変数を展開
 	return os.Expand(config, func(key string) string {
 		// デフォルト値の処理
-		parts := strings.SplitN(key, ":", 2)
-		envKey := parts[0]
-
-		value := os.Getenv(envKey)
-		if value == "" && len(parts) == 2 {
-			value = parts[1]
-		}
-
-		return value
+		envKey, defaultValue, _ := strings.Cut(key, ":")
+		return cmp.Or(os.Getenv(envKey), defaultValue)
 	})
 }
 
@@ -337,7 +331,7 @@ func (c *Config) Validate() error {
 	if c.Databases.Oracle.Enabled {
 		enabledDBs++
 		if err := c.Databases.Oracle.DatabaseConfig.Validate(); err != nil {
-			return fmt.Errorf("Oracle設定エラー: %w", err)
+			return fmt.Errorf("データベース設定エラー (Oracle): %w", err)
 		}
 	}
 
@@ -402,21 +396,12 @@ func (d *DatabaseConfig) GetDSN(dbType string) string {
 
 // LoadConfigFromEnv 環境変数から設定を読み込む
 func LoadConfigFromEnv() (*Config, error) {
-	configPath := os.Getenv("CONFIG_PATH")
-	if configPath == "" {
-		configPath = "configs/config.yaml"
-	}
-
-	return LoadConfig(configPath)
+	return LoadConfig(cmp.Or(os.Getenv("CONFIG_PATH"), "configs/config.yaml"))
 }
 
 // GetEnvironment 現在の環境を取得
 func GetEnvironment() string {
-	env := os.Getenv("APP_ENV")
-	if env == "" {
-		env = "development"
-	}
-	return env
+	return cmp.Or(os.Getenv("APP_ENV"), "development")
 }
 
 // IsDevelopment 開発環境かどうか

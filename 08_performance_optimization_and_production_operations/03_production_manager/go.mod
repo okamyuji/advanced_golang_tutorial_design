@@ -1,3 +1,3 @@
 module production_manager
 
-go 1.24.5
+go 1.27.0

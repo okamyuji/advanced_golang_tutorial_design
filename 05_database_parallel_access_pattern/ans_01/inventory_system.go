@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
 )
 
 // 楽観的ロック付き在庫管理システム
@@ -78,7 +78,7 @@ func NewInventoryManager(db *sql.DB) *InventoryManager {
 
 // ProcessOrder 注文を処理（楽観的ロック付き）
 func (im *InventoryManager) ProcessOrder(ctx context.Context, req *OrderRequest) error {
-	for attempt := 0; attempt < im.maxRetries; attempt++ {
+	for attempt := range im.maxRetries {
 		err := im.processOrderAttempt(ctx, req)
 
 		if err == nil {
@@ -129,7 +129,7 @@ func (im *InventoryManager) processOrderAttempt(ctx context.Context, req *OrderR
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer func() {
-		if err := tx.Rollback(); err != nil {
+		if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
 			log.Printf("Failed to rollback transaction: %v", err)
 		}
 	}()
@@ -186,7 +186,7 @@ func (im *InventoryManager) getInventoryForUpdate(ctx context.Context, tx *sql.T
 	err := tx.QueryRowContext(ctx, query, itemID).Scan(
 		&item.ID, &item.Name, &item.Quantity, &item.Version, &item.UpdatedAt)
 
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("inventory item not found: id=%d", itemID)
 	}
 	if err != nil {
@@ -241,12 +241,11 @@ func (im *InventoryManager) calculateBackoffDelay(attempt int) time.Duration {
 }
 
 // isDeadlockError デッドロックエラーかどうかを判定
+// エラー文字列は lib/pq の版で変わる（v1.12 は末尾に " (40P01)" が付く）ので、SQLSTATE で判定する
 func isDeadlockError(err error) bool {
-	if err == nil {
-		return false
-	}
+	pqErr, ok := errors.AsType[*pq.Error](err)
 	// PostgreSQLのデッドロックエラーコード: 40P01
-	return fmt.Sprintf("%v", err) == "pq: deadlock detected"
+	return ok && pqErr.Code == "40P01"
 }
 
 // GetInventoryStatus 在庫状況を取得
@@ -260,7 +259,7 @@ func (im *InventoryManager) GetInventoryStatus(ctx context.Context, itemID int64
 	err := im.db.QueryRowContext(ctx, query, itemID).Scan(
 		&item.ID, &item.Name, &item.Quantity, &item.Version, &item.UpdatedAt)
 
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("inventory item not found: id=%d", itemID)
 	}
 	if err != nil {
@@ -340,11 +339,8 @@ func main() {
 	orderCount := 10
 	itemID := int64(1)
 
-	for i := 0; i < orderCount; i++ {
-		wg.Add(1)
-		go func(orderNum int) {
-			defer wg.Done()
-
+	for orderNum := range orderCount {
+		wg.Go(func() {
 			req := &OrderRequest{
 				ItemID:   itemID,
 				Quantity: 1,
@@ -357,7 +353,7 @@ func main() {
 			} else {
 				log.Printf("Order %d succeeded", orderNum)
 			}
-		}(i)
+		})
 	}
 
 	wg.Wait()

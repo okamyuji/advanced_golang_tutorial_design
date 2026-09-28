@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-// ImageTaskは画像処理タスクを表現します
+// ImageTask 画像処理タスクを表現します
 type ImageTask struct {
 	ID         int
 	InputPath  string
@@ -24,7 +24,7 @@ type ImageTask struct {
 	Priority   int
 }
 
-// ImageOperationは画像処理操作を定義します
+// ImageOperation 画像処理操作を定義します
 type ImageOperation int
 
 const (
@@ -34,7 +34,7 @@ const (
 	OperationThumbnail
 )
 
-// ImageResultは画像処理結果を表現します
+// ImageResult 画像処理結果を表現します
 type ImageResult struct {
 	TaskID     int
 	Success    bool
@@ -45,7 +45,7 @@ type ImageResult struct {
 	WorkerID   int
 }
 
-// ImageProcessorは画像処理専用のワーカープールです
+// ImageProcessor 画像処理専用のワーカープールです
 type ImageProcessor struct {
 	// ワーカー設定
 	cpuWorkers int
@@ -69,24 +69,24 @@ type ImageProcessor struct {
 	maxFileSize int64
 }
 
-// ProcessingStatsは処理統計を管理します
+// ProcessingStats 処理統計を管理します
 type ProcessingStats struct {
 	mu                 sync.RWMutex
-	totalTasks         int64
-	completedTasks     int64
-	failedTasks        int64
-	totalInputSize     int64
-	totalOutputSize    int64
+	totalTasks         atomic.Int64
+	completedTasks     atomic.Int64
+	failedTasks        atomic.Int64
+	totalInputSize     atomic.Int64
+	totalOutputSize    atomic.Int64
 	averageProcessTime time.Duration
 	operationCounts    map[ImageOperation]int64
 }
 
-// NewImageProcessorは新しい画像処理プールを作成します
+// NewImageProcessor 新しい画像処理プールを作成します
 func NewImageProcessor(tempDir string) *ImageProcessor {
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// CPU集約的処理はCPUコア数、I/O処理は多めに設定
-	cpuWorkers := runtime.NumCPU()
+	// CPU集約的処理はGOMAXPROCS（Go 1.25以降はコンテナのCPU上限を反映）に合わせ、I/O処理は多めに設定
+	cpuWorkers := runtime.GOMAXPROCS(0)
 	ioWorkers := cpuWorkers * 2
 
 	return &ImageProcessor{
@@ -105,42 +105,36 @@ func NewImageProcessor(tempDir string) *ImageProcessor {
 	}
 }
 
-// Startは画像処理プールを開始します
+// Start 画像処理プールを開始します
 func (ip *ImageProcessor) Start() error {
 	// 一時ディレクトリを作成
 	if err := os.MkdirAll(ip.tempDir, 0755); err != nil {
-		return fmt.Errorf("failed to create temp directory: %v", err)
+		return fmt.Errorf("failed to create temp directory: %w", err)
 	}
 
 	// CPUワーカーを開始
-	for i := 0; i < ip.cpuWorkers; i++ {
-		ip.wg.Add(1)
-		go ip.cpuWorker(i)
+	for i := range ip.cpuWorkers {
+		ip.wg.Go(func() { ip.cpuWorker(i) })
 	}
 
 	// I/Oワーカーを開始
-	for i := 0; i < ip.ioWorkers; i++ {
-		ip.wg.Add(1)
-		go ip.ioWorker(i)
+	for i := range ip.ioWorkers {
+		ip.wg.Go(func() { ip.ioWorker(i) })
 	}
 
 	// 結果処理を開始
-	ip.wg.Add(1)
-	go ip.resultHandler()
+	ip.wg.Go(ip.resultHandler)
 
 	// 統計レポートを開始
-	ip.wg.Add(1)
-	go ip.statsReporter()
+	ip.wg.Go(ip.statsReporter)
 
 	log.Printf("Image processor started: %d CPU workers, %d I/O workers",
 		ip.cpuWorkers, ip.ioWorkers)
 	return nil
 }
 
-// cpuWorkerはCPU集約的な画像処理を実行します
+// cpuWorker CPU集約的な画像処理を実行します
 func (ip *ImageProcessor) cpuWorker(workerID int) {
-	defer ip.wg.Done()
-
 	for {
 		select {
 		case <-ip.ctx.Done():
@@ -161,10 +155,8 @@ func (ip *ImageProcessor) cpuWorker(workerID int) {
 	}
 }
 
-// ioWorkerはI/O集約的な画像処理を実行します
+// ioWorker I/O集約的な画像処理を実行します
 func (ip *ImageProcessor) ioWorker(workerID int) {
-	defer ip.wg.Done()
-
 	for {
 		select {
 		case <-ip.ctx.Done():
@@ -185,7 +177,7 @@ func (ip *ImageProcessor) ioWorker(workerID int) {
 	}
 }
 
-// processCPUTaskはCPU集約的タスクを処理します
+// processCPUTask CPU集約的タスクを処理します
 func (ip *ImageProcessor) processCPUTask(task ImageTask, workerID int) ImageResult {
 	start := time.Now()
 
@@ -197,7 +189,7 @@ func (ip *ImageProcessor) processCPUTask(task ImageTask, workerID int) ImageResu
 	// ファイルサイズをチェック
 	inputInfo, err := os.Stat(task.InputPath)
 	if err != nil {
-		result.Error = fmt.Errorf("failed to stat input file: %v", err)
+		result.Error = fmt.Errorf("failed to stat input file: %w", err)
 		result.Duration = time.Since(start)
 		return result
 	}
@@ -233,7 +225,7 @@ func (ip *ImageProcessor) processCPUTask(task ImageTask, workerID int) ImageResu
 	return result
 }
 
-// processIOTaskはI/O集約的タスクを処理します
+// processIOTask I/O集約的タスクを処理します
 func (ip *ImageProcessor) processIOTask(task ImageTask, workerID int) ImageResult {
 	start := time.Now()
 
@@ -245,7 +237,7 @@ func (ip *ImageProcessor) processIOTask(task ImageTask, workerID int) ImageResul
 	// ファイル読み込みをシミュレート
 	inputInfo, err := os.Stat(task.InputPath)
 	if err != nil {
-		result.Error = fmt.Errorf("failed to read input file: %v", err)
+		result.Error = fmt.Errorf("failed to read input file: %w", err)
 		result.Duration = time.Since(start)
 		return result
 	}
@@ -275,7 +267,7 @@ func (ip *ImageProcessor) processIOTask(task ImageTask, workerID int) ImageResul
 	return result
 }
 
-// simulateProcessingは処理時間をシミュレートします
+// simulateProcessing 処理時間をシミュレートします
 func (ip *ImageProcessor) simulateProcessing(operation ImageOperation, fileSize int64) time.Duration {
 	baseTime := time.Duration(float64(fileSize)/1024/1024) * 50 * time.Millisecond
 
@@ -293,7 +285,7 @@ func (ip *ImageProcessor) simulateProcessing(operation ImageOperation, fileSize 
 	}
 }
 
-// getCompressionRatioは圧縮比率を取得します
+// getCompressionRatio 圧縮比率を取得します
 func (ip *ImageProcessor) getCompressionRatio(operation ImageOperation) float64 {
 	switch operation {
 	case OperationCompress:
@@ -307,7 +299,7 @@ func (ip *ImageProcessor) getCompressionRatio(operation ImageOperation) float64 
 	}
 }
 
-// getOperationNameは操作名を取得します
+// getOperationName 操作名を取得します
 func (ip *ImageProcessor) getOperationName(operation ImageOperation) string {
 	switch operation {
 	case OperationResize:
@@ -323,10 +315,8 @@ func (ip *ImageProcessor) getOperationName(operation ImageOperation) string {
 	}
 }
 
-// resultHandlerは結果を処理します
+// resultHandler 結果を処理します
 func (ip *ImageProcessor) resultHandler() {
-	defer ip.wg.Done()
-
 	for {
 		select {
 		case <-ip.ctx.Done():
@@ -341,54 +331,51 @@ func (ip *ImageProcessor) resultHandler() {
 	}
 }
 
-// updateStatsは統計を更新します
+// updateStats 統計を更新します
 func (ip *ImageProcessor) updateStats(result ImageResult) {
 	ip.stats.mu.Lock()
 	defer ip.stats.mu.Unlock()
 
-	atomic.AddInt64(&ip.stats.totalTasks, 1)
+	ip.stats.totalTasks.Add(1)
 
 	if result.Success {
-		atomic.AddInt64(&ip.stats.completedTasks, 1)
-		atomic.AddInt64(&ip.stats.totalInputSize, result.InputSize)
-		atomic.AddInt64(&ip.stats.totalOutputSize, result.OutputSize)
+		ip.stats.completedTasks.Add(1)
+		ip.stats.totalInputSize.Add(result.InputSize)
+		ip.stats.totalOutputSize.Add(result.OutputSize)
 	} else {
-		atomic.AddInt64(&ip.stats.failedTasks, 1)
+		ip.stats.failedTasks.Add(1)
 	}
 
 	// 平均処理時間を更新
-	total := atomic.LoadInt64(&ip.stats.totalTasks)
+	total := ip.stats.totalTasks.Load()
 	ip.stats.averageProcessTime = time.Duration(
 		(int64(ip.stats.averageProcessTime)*total + int64(result.Duration)) / (total + 1))
 }
 
-// statsReporterは統計を定期的に報告します
+// statsReporter 統計を定期的に報告します
 func (ip *ImageProcessor) statsReporter() {
-	defer ip.wg.Done()
-
-	ticker := time.NewTicker(15 * time.Second)
-	defer ticker.Stop()
+	tick := time.Tick(15 * time.Second)
 
 	for {
 		select {
 		case <-ip.ctx.Done():
 			return
-		case <-ticker.C:
+		case <-tick:
 			ip.printStats()
 		}
 	}
 }
 
-// printStatsは統計を出力します
+// printStats 統計を出力します
 func (ip *ImageProcessor) printStats() {
 	ip.stats.mu.RLock()
 	defer ip.stats.mu.RUnlock()
 
-	total := atomic.LoadInt64(&ip.stats.totalTasks)
-	completed := atomic.LoadInt64(&ip.stats.completedTasks)
-	failed := atomic.LoadInt64(&ip.stats.failedTasks)
-	inputSize := atomic.LoadInt64(&ip.stats.totalInputSize)
-	outputSize := atomic.LoadInt64(&ip.stats.totalOutputSize)
+	total := ip.stats.totalTasks.Load()
+	completed := ip.stats.completedTasks.Load()
+	failed := ip.stats.failedTasks.Load()
+	inputSize := ip.stats.totalInputSize.Load()
+	outputSize := ip.stats.totalOutputSize.Load()
 
 	cpuQueueLen := len(ip.cpuQueue)
 	ioQueueLen := len(ip.ioQueue)
@@ -404,8 +391,12 @@ func (ip *ImageProcessor) printStats() {
 		compressionRatio, ip.stats.averageProcessTime)
 }
 
-// SubmitTaskはタスクを適切なキューに追加します
+// SubmitTask タスクを適切なキューに追加します
 func (ip *ImageProcessor) SubmitTask(task ImageTask) error {
+	// 停止後の投入を拒否する。キューはcloseせず、読む側はctxのキャンセルで止める
+	if ip.ctx.Err() != nil {
+		return fmt.Errorf("processor is shutting down")
+	}
 	var targetQueue chan ImageTask
 
 	// 操作種別に応じてキューを選択
@@ -431,13 +422,9 @@ func (ip *ImageProcessor) SubmitTask(task ImageTask) error {
 	}
 }
 
-// Shutdownはプロセッサーを停止します
+// Shutdown プロセッサーを停止します
 func (ip *ImageProcessor) Shutdown(timeout time.Duration) error {
 	log.Println("Starting image processor shutdown...")
-
-	// 新しいタスクの受付を停止
-	close(ip.cpuQueue)
-	close(ip.ioQueue)
 
 	// ワーカーに停止シグナルを送信
 	ip.cancel()
@@ -458,11 +445,11 @@ func (ip *ImageProcessor) Shutdown(timeout time.Duration) error {
 	}
 }
 
-// GetStatsは現在の統計を取得します
+// GetStats 現在の統計を取得します
 func (ip *ImageProcessor) GetStats() (int64, int64, int64, float64) {
-	total := atomic.LoadInt64(&ip.stats.totalTasks)
-	completed := atomic.LoadInt64(&ip.stats.completedTasks)
-	failed := atomic.LoadInt64(&ip.stats.failedTasks)
+	total := ip.stats.totalTasks.Load()
+	completed := ip.stats.completedTasks.Load()
+	failed := ip.stats.failedTasks.Load()
 
 	successRate := float64(0)
 	if total > 0 {
@@ -505,7 +492,8 @@ func main() {
 
 	// タスクを送信
 	go func() {
-		for i := 1; i <= 20; i++ {
+		for n := range 20 {
+			i := n + 1
 			file := testFiles[i%len(testFiles)]
 			task := ImageTask{
 				ID:         i,

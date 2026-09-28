@@ -4,23 +4,23 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"math/rand"
+	"math/rand/v2"
 	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-// DataItemは処理対象データです
+// DataItem 処理対象データです
 type DataItem struct {
 	ID        int64
 	Value     string
 	Timestamp time.Time
-	Metadata  map[string]interface{}
+	Metadata  map[string]any
 	Source    string
 }
 
-// ProcessedDataは処理済みデータです
+// ProcessedData 処理済みデータです
 type ProcessedData struct {
 	OriginalID     int64
 	ProcessedValue string
@@ -31,20 +31,30 @@ type ProcessedData struct {
 	Timestamp      time.Time
 }
 
-// AggregatedResultは集約結果です
+// AggregatedResult 集約結果です
 type AggregatedResult struct {
 	TotalProcessed int64
 	SuccessCount   int64
 	ErrorCount     int64
 	AverageTime    time.Duration
 	ThroughputRPS  float64
-	ProcessorStats map[int]*ProcessorStats
+	ProcessorStats map[int]*ProcessorStatsSnapshot
 	StartTime      time.Time
 	EndTime        time.Time
 }
 
-// ProcessorStatsはプロセッサー統計です
+// ProcessorStats プロセッサー統計です。ワーカーgoroutineと監視goroutineの両方から
+// 参照されるため、各カウンタは型付きatomicで保持します。
 type ProcessorStats struct {
+	ProcessorID    int
+	ProcessedCount atomic.Int64
+	SuccessCount   atomic.Int64
+	ErrorCount     atomic.Int64
+	TotalTime      atomic.Int64 // 累積処理時間（ナノ秒）
+}
+
+// ProcessorStatsSnapshot ProcessorStats の値コピー可能なスナップショットです
+type ProcessorStatsSnapshot struct {
 	ProcessorID    int
 	ProcessedCount int64
 	SuccessCount   int64
@@ -53,7 +63,27 @@ type ProcessorStats struct {
 	AverageTime    time.Duration
 }
 
-// PipelineConfigはパイプライン設定です
+// Snapshot 現在の値をコピーしたスナップショットを返します
+func (s *ProcessorStats) Snapshot() ProcessorStatsSnapshot {
+	processed := s.ProcessedCount.Load()
+	total := time.Duration(s.TotalTime.Load())
+
+	var avg time.Duration
+	if processed > 0 {
+		avg = total / time.Duration(processed)
+	}
+
+	return ProcessorStatsSnapshot{
+		ProcessorID:    s.ProcessorID,
+		ProcessedCount: processed,
+		SuccessCount:   s.SuccessCount.Load(),
+		ErrorCount:     s.ErrorCount.Load(),
+		TotalTime:      total,
+		AverageTime:    avg,
+	}
+}
+
+// PipelineConfig パイプライン設定です
 type PipelineConfig struct {
 	WorkerCount     int
 	BufferSize      int
@@ -65,7 +95,7 @@ type PipelineConfig struct {
 	LogLevel        string
 }
 
-// FanOutFanInPipelineはFan-out/Fan-inパイプライン処理システムです
+// FanOutFanInPipeline Fan-out/Fan-inパイプライン処理システムです
 type FanOutFanInPipeline struct {
 	config *PipelineConfig
 
@@ -88,11 +118,11 @@ type FanOutFanInPipeline struct {
 	workers []*PipelineWorker
 
 	// 状態管理
-	isRunning int32
+	isRunning atomic.Bool
 	startTime time.Time
 }
 
-// PipelineWorkerはパイプライン処理ワーカーです
+// PipelineWorker パイプライン処理ワーカーです
 type PipelineWorker struct {
 	ID        int
 	pipeline  *FanOutFanInPipeline
@@ -100,28 +130,28 @@ type PipelineWorker struct {
 	processor *DataProcessor
 }
 
-// DataProcessorはデータ処理エンジンです
+// DataProcessor データ処理エンジンです
 type DataProcessor struct {
 	ID             int
 	config         *PipelineConfig
-	processedCount int64
-	errorCount     int64
+	processedCount atomic.Int64
+	errorCount     atomic.Int64
 }
 
-// PipelineMetricsはパイプライン監視メトリクスです
+// PipelineMetrics パイプライン監視メトリクスです
 type PipelineMetrics struct {
 	mu               sync.RWMutex
-	totalInputItems  int64
-	totalOutputItems int64
-	errorCount       int64
+	totalInputItems  atomic.Int64
+	totalOutputItems atomic.Int64
+	errorCount       atomic.Int64
 	startTime        time.Time
 	processorMetrics map[int]*ProcessorStats
 }
 
-// NewPipelineConfigはデフォルト設定を作成します
+// NewPipelineConfig デフォルト設定を作成します
 func NewPipelineConfig() *PipelineConfig {
 	return &PipelineConfig{
-		WorkerCount:     runtime.NumCPU(),
+		WorkerCount:     runtime.GOMAXPROCS(0),
 		BufferSize:      1000,
 		ProcessingDelay: 10 * time.Millisecond,
 		ErrorRate:       0.05, // 5%のエラー率
@@ -132,7 +162,7 @@ func NewPipelineConfig() *PipelineConfig {
 	}
 }
 
-// NewFanOutFanInPipelineは新しいパイプラインを作成します
+// NewFanOutFanInPipeline 新しいパイプラインを作成します
 func NewFanOutFanInPipeline(config *PipelineConfig) *FanOutFanInPipeline {
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -150,7 +180,7 @@ func NewFanOutFanInPipeline(config *PipelineConfig) *FanOutFanInPipeline {
 	}
 
 	// ワーカーを初期化
-	for i := 0; i < config.WorkerCount; i++ {
+	for i := range config.WorkerCount {
 		worker := &PipelineWorker{
 			ID:       i,
 			pipeline: pipeline,
@@ -169,9 +199,9 @@ func NewFanOutFanInPipeline(config *PipelineConfig) *FanOutFanInPipeline {
 	return pipeline
 }
 
-// Startはパイプライン処理を開始します
+// Start パイプライン処理を開始します
 func (p *FanOutFanInPipeline) Start() error {
-	if !atomic.CompareAndSwapInt32(&p.isRunning, 0, 1) {
+	if !p.isRunning.CompareAndSwap(false, true) {
 		return fmt.Errorf("pipeline is already running")
 	}
 
@@ -182,28 +212,23 @@ func (p *FanOutFanInPipeline) Start() error {
 
 	// Fan-out: ワーカーを開始（複数のgoroutineでデータを並列処理）
 	for _, worker := range p.workers {
-		p.wg.Add(1)
-		go worker.run()
+		p.wg.Go(worker.run)
 	}
 
 	// Fan-in: 結果集約を開始（複数のワーカーからの結果を集約）
-	p.wg.Add(1)
-	go p.aggregateResults()
+	p.wg.Go(p.aggregateResults)
 
 	// メトリクス監視を開始
 	if p.config.EnableMetrics {
-		p.wg.Add(1)
-		go p.monitorMetrics()
+		p.wg.Go(p.monitorMetrics)
 	}
 
 	log.Printf("Pipeline started successfully with %d workers", len(p.workers))
 	return nil
 }
 
-// runはワーカーのメインループです
+// run ワーカーのメインループです
 func (w *PipelineWorker) run() {
-	defer w.pipeline.wg.Done()
-
 	log.Printf("Worker %d started", w.ID)
 
 	for {
@@ -211,12 +236,7 @@ func (w *PipelineWorker) run() {
 		case <-w.pipeline.ctx.Done():
 			log.Printf("Worker %d stopping due to context cancellation", w.ID)
 			return
-		case item, ok := <-w.pipeline.inputChannel:
-			if !ok {
-				log.Printf("Worker %d stopping due to input channel closure", w.ID)
-				return
-			}
-
+		case item := <-w.pipeline.inputChannel:
 			// データ処理実行
 			result := w.processData(item)
 
@@ -232,7 +252,7 @@ func (w *PipelineWorker) run() {
 	}
 }
 
-// processDataはデータ処理を実行します
+// processData データ処理を実行します
 func (w *PipelineWorker) processData(item DataItem) ProcessedData {
 	start := time.Now()
 
@@ -251,34 +271,28 @@ func (w *PipelineWorker) processData(item DataItem) ProcessedData {
 	if rand.Float64() < w.pipeline.config.ErrorRate {
 		result.Success = false
 		result.Error = fmt.Errorf("processing error in worker %d for item %d", w.ID, item.ID)
-		atomic.AddInt64(&w.processor.errorCount, 1)
-		atomic.AddInt64(&w.stats.ErrorCount, 1)
+		w.processor.errorCount.Add(1)
+		w.stats.ErrorCount.Add(1)
 	} else {
 		// 正常処理
 		result.Success = true
 		result.ProcessedValue = fmt.Sprintf("processed_%s_by_worker_%d", item.Value, w.ID)
-		atomic.AddInt64(&w.stats.SuccessCount, 1)
+		w.stats.SuccessCount.Add(1)
 	}
 
 	processingTime := time.Since(start)
 	result.ProcessingTime = processingTime
 
 	// 統計更新
-	atomic.AddInt64(&w.processor.processedCount, 1)
-	atomic.AddInt64(&w.stats.ProcessedCount, 1)
-	w.stats.TotalTime += processingTime
-
-	if w.stats.ProcessedCount > 0 {
-		w.stats.AverageTime = w.stats.TotalTime / time.Duration(w.stats.ProcessedCount)
-	}
+	w.processor.processedCount.Add(1)
+	w.stats.ProcessedCount.Add(1)
+	w.stats.TotalTime.Add(int64(processingTime))
 
 	return result
 }
 
-// aggregateResultsは結果を集約します（Fan-in）
+// aggregateResults 結果を集約します（Fan-in）
 func (p *FanOutFanInPipeline) aggregateResults() {
-	defer p.wg.Done()
-
 	log.Println("Result aggregator started")
 
 	var (
@@ -289,9 +303,8 @@ func (p *FanOutFanInPipeline) aggregateResults() {
 		itemCount      int64
 	)
 
-	// 定期的に統計を集計・報告
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
+	// 定期的に統計を集計・報告。Stop/Resetは使わず参照もしないので、GCが回収できるtime.Tickでよい。
+	tick := time.Tick(5 * time.Second)
 
 	for {
 		select {
@@ -324,12 +337,12 @@ func (p *FanOutFanInPipeline) aggregateResults() {
 			}
 
 			// メトリクス更新
-			atomic.AddInt64(&p.metrics.totalOutputItems, 1)
+			p.metrics.totalOutputItems.Add(1)
 			if result.Error != nil {
-				atomic.AddInt64(&p.metrics.errorCount, 1)
+				p.metrics.errorCount.Add(1)
 			}
 
-		case <-ticker.C:
+		case <-tick:
 			// 定期的な統計報告
 			if totalProcessed > 0 {
 				avgTime := totalTime / time.Duration(totalProcessed)
@@ -342,7 +355,7 @@ func (p *FanOutFanInPipeline) aggregateResults() {
 	}
 }
 
-// sendFinalAggregatedResultは最終集約結果を送信します
+// sendFinalAggregatedResult 最終集約結果を送信します
 func (p *FanOutFanInPipeline) sendFinalAggregatedResult(totalProcessed, successCount, errorCount int64, totalTime time.Duration, itemCount int64) {
 	endTime := time.Now()
 	duration := endTime.Sub(p.startTime)
@@ -361,15 +374,15 @@ func (p *FanOutFanInPipeline) sendFinalAggregatedResult(totalProcessed, successC
 		ErrorCount:     errorCount,
 		AverageTime:    avgTime,
 		ThroughputRPS:  throughput,
-		ProcessorStats: make(map[int]*ProcessorStats),
+		ProcessorStats: make(map[int]*ProcessorStatsSnapshot),
 		StartTime:      p.startTime,
 		EndTime:        endTime,
 	}
 
-	// プロセッサー統計をコピー
+	// プロセッサー統計のスナップショットをコピー
 	for id, stats := range p.metrics.processorMetrics {
-		statsCopy := *stats
-		result.ProcessorStats[id] = &statsCopy
+		snap := stats.Snapshot()
+		result.ProcessorStats[id] = &snap
 	}
 
 	select {
@@ -381,15 +394,20 @@ func (p *FanOutFanInPipeline) sendFinalAggregatedResult(totalProcessed, successC
 	}
 }
 
-// SubmitDataはデータを処理キューに追加します
+// SubmitData データを処理キューに追加します
 func (p *FanOutFanInPipeline) SubmitData(item DataItem) error {
-	if atomic.LoadInt32(&p.isRunning) == 0 {
+	if !p.isRunning.Load() {
 		return fmt.Errorf("pipeline is not running")
+	}
+	// inputChannel closeしないので送信自体はpanicしないが、停止後の投入は
+	// 処理されずに残ってしまうため、ctx側でも早期に拒否する。
+	if p.ctx.Err() != nil {
+		return fmt.Errorf("pipeline is shutting down")
 	}
 
 	select {
 	case p.inputChannel <- item:
-		atomic.AddInt64(&p.metrics.totalInputItems, 1)
+		p.metrics.totalInputItems.Add(1)
 		return nil
 	case <-p.ctx.Done():
 		return fmt.Errorf("pipeline is shutting down")
@@ -398,17 +416,14 @@ func (p *FanOutFanInPipeline) SubmitData(item DataItem) error {
 	}
 }
 
-// GetResultChannelは結果チャネルを取得します
+// GetResultChannel 結果チャネルを取得します
 func (p *FanOutFanInPipeline) GetResultChannel() <-chan AggregatedResult {
 	return p.resultChannel
 }
 
-// monitorMetricsはメトリクスを監視します
+// monitorMetrics メトリクスを監視します
 func (p *FanOutFanInPipeline) monitorMetrics() {
-	defer p.wg.Done()
-
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
+	tick := time.Tick(10 * time.Second)
 
 	log.Println("Metrics monitor started")
 
@@ -417,20 +432,20 @@ func (p *FanOutFanInPipeline) monitorMetrics() {
 		case <-p.ctx.Done():
 			log.Println("Metrics monitor stopping")
 			return
-		case <-ticker.C:
+		case <-tick:
 			p.reportMetrics()
 		}
 	}
 }
 
-// reportMetricsはメトリクスを報告します
+// reportMetrics メトリクスを報告します
 func (p *FanOutFanInPipeline) reportMetrics() {
 	p.metrics.mu.RLock()
 	defer p.metrics.mu.RUnlock()
 
-	totalInput := atomic.LoadInt64(&p.metrics.totalInputItems)
-	totalOutput := atomic.LoadInt64(&p.metrics.totalOutputItems)
-	errorCount := atomic.LoadInt64(&p.metrics.errorCount)
+	totalInput := p.metrics.totalInputItems.Load()
+	totalOutput := p.metrics.totalOutputItems.Load()
+	errorCount := p.metrics.errorCount.Load()
 
 	duration := time.Since(p.metrics.startTime)
 	var throughput float64
@@ -443,30 +458,29 @@ func (p *FanOutFanInPipeline) reportMetrics() {
 
 	// ワーカー別統計
 	for _, worker := range p.workers {
-		processed := atomic.LoadInt64(&worker.stats.ProcessedCount)
-		success := atomic.LoadInt64(&worker.stats.SuccessCount)
-		errors := atomic.LoadInt64(&worker.stats.ErrorCount)
+		snap := worker.stats.Snapshot()
 
-		if processed > 0 {
-			successRate := float64(success) / float64(processed) * 100
+		if snap.ProcessedCount > 0 {
+			successRate := float64(snap.SuccessCount) / float64(snap.ProcessedCount) * 100
 			log.Printf("Worker %d: Processed=%d, Success=%.1f%%, Errors=%d, AvgTime=%v",
-				worker.ID, processed, successRate, errors, worker.stats.AverageTime)
+				worker.ID, snap.ProcessedCount, successRate, snap.ErrorCount, snap.AverageTime)
 		}
 	}
 }
 
-// Shutdownはパイプラインを停止します
+// Shutdown パイプラインを停止します
 func (p *FanOutFanInPipeline) Shutdown(timeout time.Duration) error {
-	if !atomic.CompareAndSwapInt32(&p.isRunning, 1, 0) {
+	if !p.isRunning.CompareAndSwap(true, false) {
 		return fmt.Errorf("pipeline is not running")
 	}
 
 	log.Println("Shutting down pipeline...")
 
-	// 1. 入力チャネルを閉じて新しいデータの受付を停止
-	close(p.inputChannel)
+	// ワーカーに停止を指示する。inputChannelはcloseしない
+	// （SubmitDataとの競合でpanic: send on closed channelになるため）。
+	p.cancel()
 
-	// 2. ワーカーの終了を待機（タイムアウト付き）
+	// ワーカーの終了を待機（タイムアウト付き）
 	done := make(chan struct{})
 	go func() {
 		p.wg.Wait()
@@ -477,36 +491,26 @@ func (p *FanOutFanInPipeline) Shutdown(timeout time.Duration) error {
 	case <-done:
 		log.Println("All workers stopped gracefully")
 	case <-time.After(timeout):
-		log.Println("Timeout reached, forcing shutdown...")
-		p.cancel()
-
-		// 追加の待機時間
-		select {
-		case <-done:
-			log.Println("Workers stopped after cancellation")
-		case <-time.After(2 * time.Second):
-			log.Println("Some workers may not have stopped properly")
-		}
+		// 送信側のgoroutineが残っている可能性があるので、チャネルは閉じずにエラーを返す
+		return fmt.Errorf("shutdown timeout: some workers may not have stopped")
 	}
 
-	// 3. 出力チャネルを閉じる
+	// 出力チャネル・結果チャネルへの送信元はwg.Waitの完了で全て止まっているのでcloseしてよい
 	close(p.outputChannel)
-
-	// 4. 結果チャネルを閉じる
 	close(p.resultChannel)
 
 	log.Println("Pipeline shutdown completed")
 	return nil
 }
 
-// GetMetricsは現在のメトリクスを取得します
-func (p *FanOutFanInPipeline) GetMetrics() map[string]interface{} {
+// GetMetrics 現在のメトリクスを取得します
+func (p *FanOutFanInPipeline) GetMetrics() map[string]any {
 	p.metrics.mu.RLock()
 	defer p.metrics.mu.RUnlock()
 
-	totalInput := atomic.LoadInt64(&p.metrics.totalInputItems)
-	totalOutput := atomic.LoadInt64(&p.metrics.totalOutputItems)
-	errorCount := atomic.LoadInt64(&p.metrics.errorCount)
+	totalInput := p.metrics.totalInputItems.Load()
+	totalOutput := p.metrics.totalOutputItems.Load()
+	errorCount := p.metrics.errorCount.Load()
 
 	duration := time.Since(p.metrics.startTime)
 	var throughput float64
@@ -514,17 +518,18 @@ func (p *FanOutFanInPipeline) GetMetrics() map[string]interface{} {
 		throughput = float64(totalOutput) / duration.Seconds()
 	}
 
-	workerStats := make(map[string]interface{})
+	workerStats := make(map[string]any)
 	for id, stats := range p.metrics.processorMetrics {
-		workerStats[fmt.Sprintf("worker_%d", id)] = map[string]interface{}{
-			"processed_count": atomic.LoadInt64(&stats.ProcessedCount),
-			"success_count":   atomic.LoadInt64(&stats.SuccessCount),
-			"error_count":     atomic.LoadInt64(&stats.ErrorCount),
-			"average_time":    stats.AverageTime,
+		snap := stats.Snapshot()
+		workerStats[fmt.Sprintf("worker_%d", id)] = map[string]any{
+			"processed_count": snap.ProcessedCount,
+			"success_count":   snap.SuccessCount,
+			"error_count":     snap.ErrorCount,
+			"average_time":    snap.AverageTime,
 		}
 	}
 
-	return map[string]interface{}{
+	return map[string]any{
 		"total_input":    totalInput,
 		"total_output":   totalOutput,
 		"error_count":    errorCount,
@@ -565,14 +570,14 @@ func main() {
 
 	// テストデータを並行で送信
 	go func() {
-		for i := 0; i < 1000; i++ {
+		for i := range 1000 {
 			item := DataItem{
 				ID:        int64(i),
 				Value:     fmt.Sprintf("data_%d", i),
 				Timestamp: time.Now(),
-				Metadata: map[string]interface{}{
+				Metadata: map[string]any{
 					"batch_id": i / 100,
-					"priority": rand.Intn(5),
+					"priority": rand.IntN(5),
 				},
 				Source: "test_generator",
 			}

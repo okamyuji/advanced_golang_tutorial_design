@@ -3,15 +3,23 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
+	"maps"
+	"math"
 	"runtime"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
 )
+
+// maxBindParams PostgreSQL の拡張問い合わせプロトコルで1文に渡せるバインド変数の上限
+const maxBindParams = 65535
 
 // 大容量データ移行システム
 // 1000万件以上のレコードを効率的に別テーブルに移行
@@ -79,8 +87,7 @@ type CheckpointManager struct {
 // ResourceMonitor リソース監視
 type ResourceMonitor struct {
 	thresholds      ResourceThresholds
-	cpuUsage        atomic.Value // float64
-	memoryUsage     atomic.Value // float64
+	memoryUsage     atomic.Uint64 // math.Float64bits で格納した使用率（%）
 	connectionCount atomic.Int64
 }
 
@@ -135,8 +142,6 @@ func NewMigrationManager(db *sql.DB, config *MigrationConfig) *MigrationManager 
 	mm.resourceMonitor = &ResourceMonitor{
 		thresholds: config.ResourceThresholds,
 	}
-	mm.resourceMonitor.cpuUsage.Store(0.0)
-	mm.resourceMonitor.memoryUsage.Store(0.0)
 
 	// チェックポイント管理初期化
 	mm.checkpointManager = &CheckpointManager{
@@ -177,6 +182,11 @@ func (mm *MigrationManager) StartMigration(ctx context.Context) error {
 
 // prepareMigration 移行の準備
 func (mm *MigrationManager) prepareMigration(ctx context.Context) error {
+	// チェックポイント・チャンク管理テーブルの初期化（計画の保存より先に必要）
+	if err := mm.initializeCheckpointTable(ctx); err != nil {
+		return err
+	}
+
 	// 移行対象レコード数の取得
 	totalRecords, err := mm.getTotalRecordCount(ctx)
 	if err != nil {
@@ -197,8 +207,25 @@ func (mm *MigrationManager) prepareMigration(ctx context.Context) error {
 
 	log.Printf("Migration plan created: %d chunks", len(chunks))
 
-	// チェックポイントテーブルの初期化
-	return mm.initializeCheckpointTable(ctx)
+	// 計画を保存する。既存のチャンクは状態を残すので、再実行すると未完了分だけが処理される
+	return mm.saveChunkPlan(ctx, chunks)
+}
+
+// saveChunkPlan チャンク計画を migration_chunks に保存する（既存の行は変更しない）
+func (mm *MigrationManager) saveChunkPlan(ctx context.Context, chunks []*ChunkInfo) error {
+	query := `
+		INSERT INTO migration_chunks (migration_id, chunk_id, start_id, end_id, status)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (migration_id, chunk_id) DO NOTHING`
+
+	migrationID := fmt.Sprintf("%s_to_%s", mm.sourceTable, mm.targetTable)
+	for _, chunk := range chunks {
+		if _, err := mm.db.ExecContext(ctx, query,
+			migrationID, chunk.ID, chunk.StartID, chunk.EndID, string(chunk.Status)); err != nil {
+			return fmt.Errorf("failed to save chunk plan: %w", err)
+		}
+	}
+	return nil
 }
 
 // getTotalRecordCount 対象レコード数を取得
@@ -213,6 +240,11 @@ func (mm *MigrationManager) getTotalRecordCount(ctx context.Context) (int64, err
 // createChunkPlan チャンク分割計画を作成
 func (mm *MigrationManager) createChunkPlan(ctx context.Context, totalRecords int64) ([]*ChunkInfo, error) {
 	chunks := make([]*ChunkInfo, 0)
+
+	// 空のテーブルでは MIN/MAX が NULL になり int64 に読めないので、先に返す
+	if totalRecords == 0 {
+		return chunks, nil
+	}
 
 	// 最小・最大IDを取得
 	minID, maxID, err := mm.getIDRange(ctx)
@@ -233,10 +265,7 @@ func (mm *MigrationManager) createChunkPlan(ctx context.Context, totalRecords in
 
 	chunkID := int64(0)
 	for startID := minID; startID <= maxID; startID += optimizedChunkSize {
-		endID := startID + optimizedChunkSize - 1
-		if endID > maxID {
-			endID = maxID
-		}
+		endID := min(startID+optimizedChunkSize-1, maxID)
 
 		chunk := &ChunkInfo{
 			ID:      chunkID,
@@ -272,21 +301,13 @@ func (mm *MigrationManager) executeMigration(ctx context.Context) error {
 	pendingChunks := mm.filterPendingChunks(chunks)
 	log.Printf("Found %d pending chunks to process", len(pendingChunks))
 
-	// 並列処理用チャネル
-	chunkChan := make(chan *ChunkInfo, len(pendingChunks))
 	semaphore := make(chan struct{}, mm.maxConcurrency)
-
-	// チャンクをチャネルに送信
-	for _, chunk := range pendingChunks {
-		chunkChan <- chunk
-	}
-	close(chunkChan)
 
 	// Worker群の起動
 	var wg sync.WaitGroup
 	errorChan := make(chan error, len(pendingChunks))
 
-	for chunk := range chunkChan {
+	for _, chunk := range pendingChunks {
 		// リソース制限チェック
 		if mm.shouldPauseForResources() {
 			log.Printf("Pausing due to resource constraints")
@@ -294,10 +315,7 @@ func (mm *MigrationManager) executeMigration(ctx context.Context) error {
 			mm.waitForResourceRecovery(ctx)
 		}
 
-		wg.Add(1)
-		go func(chunk *ChunkInfo) {
-			defer wg.Done()
-
+		wg.Go(func() {
 			// 並列数制御
 			semaphore <- struct{}{}
 			defer func() { <-semaphore }()
@@ -305,20 +323,20 @@ func (mm *MigrationManager) executeMigration(ctx context.Context) error {
 			if err := mm.processChunk(ctx, chunk); err != nil {
 				errorChan <- fmt.Errorf("chunk %d failed: %w", chunk.ID, err)
 			}
-		}(chunk)
+		})
 	}
 
 	wg.Wait()
 	close(errorChan)
 
 	// エラーの集約
-	var errors []error
+	var errs []error
 	for err := range errorChan {
-		errors = append(errors, err)
+		errs = append(errs, err)
 	}
 
-	if len(errors) > 0 {
-		return fmt.Errorf("migration completed with %d errors: %v", len(errors), errors[0])
+	if len(errs) > 0 {
+		return fmt.Errorf("migration completed with %d errors: %w", len(errs), errors.Join(errs...))
 	}
 
 	log.Printf("Migration completed successfully")
@@ -383,7 +401,7 @@ func (mm *MigrationManager) processChunk(ctx context.Context, chunk *ChunkInfo) 
 }
 
 // getChunkData チャンクのデータを取得
-func (mm *MigrationManager) getChunkData(ctx context.Context, startID, endID int64) ([]map[string]interface{}, error) {
+func (mm *MigrationManager) getChunkData(ctx context.Context, startID, endID int64) ([]map[string]any, error) {
 	query := fmt.Sprintf(`
 		SELECT * FROM %s 
 		WHERE id >= $1 AND id <= $2 
@@ -405,12 +423,12 @@ func (mm *MigrationManager) getChunkData(ctx context.Context, startID, endID int
 		return nil, err
 	}
 
-	var records []map[string]interface{}
+	var records []map[string]any
 
 	for rows.Next() {
 		// 動的にレコードを読み取り
-		values := make([]interface{}, len(columns))
-		valuePtrs := make([]interface{}, len(columns))
+		values := make([]any, len(columns))
+		valuePtrs := make([]any, len(columns))
 		for i := range columns {
 			valuePtrs[i] = &values[i]
 		}
@@ -419,13 +437,10 @@ func (mm *MigrationManager) getChunkData(ctx context.Context, startID, endID int
 			return nil, err
 		}
 
-		// マップに変換
-		record := make(map[string]interface{})
+		// マップに変換。NULL の列も残す（行ごとに列の集合が変わると INSERT の引数がずれる）
+		record := make(map[string]any, len(columns))
 		for i, col := range columns {
-			val := values[i]
-			if val != nil {
-				record[col] = val
-			}
+			record[col] = values[i]
 		}
 
 		records = append(records, record)
@@ -435,7 +450,7 @@ func (mm *MigrationManager) getChunkData(ctx context.Context, startID, endID int
 }
 
 // migrateChunkData チャンクデータを移行
-func (mm *MigrationManager) migrateChunkData(ctx context.Context, records []map[string]interface{}) error {
+func (mm *MigrationManager) migrateChunkData(ctx context.Context, records []map[string]any) error {
 	if len(records) == 0 {
 		return nil
 	}
@@ -446,47 +461,68 @@ func (mm *MigrationManager) migrateChunkData(ctx context.Context, records []map[
 		return err
 	}
 	defer func() {
-		if err := tx.Rollback(); err != nil {
+		if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
 			log.Printf("Failed to rollback transaction: %v", err)
 		}
 	}()
 
-	// バルクインサート用のSQL構築
-	columns := mm.extractColumns(records[0])
-	placeholders := mm.buildPlaceholders(len(columns), len(records))
+	// マップの反復順は毎回変わるので、列順を固定してから SQL と引数を組み立てる
+	columns := slices.Sorted(maps.Keys(records[0]))
 
-	query := fmt.Sprintf(`
-		INSERT INTO %s (%s) VALUES %s 
-		ON CONFLICT (id) DO UPDATE SET 
-		%s`,
-		mm.targetTable,
-		columns,
-		placeholders,
-		mm.buildUpdateClause(records[0]))
-
-	// パラメータ配列の構築
-	args := mm.buildInsertArgs(records)
-
-	// 実行
-	_, err = tx.ExecContext(ctx, query, args...)
-	if err != nil {
-		return fmt.Errorf("failed to insert chunk data: %w", err)
+	// バインド変数の上限を超えないよう、同じトランザクション内で分割して実行
+	for batch := range slices.Chunk(records, maxBindParams/len(columns)) {
+		query, args := mm.buildUpsert(columns, batch)
+		if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+			return fmt.Errorf("failed to insert chunk data: %w", err)
+		}
 	}
 
 	// コミット
 	return tx.Commit()
 }
 
+// buildUpsert 複数行の INSERT ... ON CONFLICT (id) 文と、その引数を列順どおりに組み立てる
+func (mm *MigrationManager) buildUpsert(columns []string, records []map[string]any) (string, []any) {
+	quoted := make([]string, len(columns))
+	var updates []string
+	for i, col := range columns {
+		quoted[i] = pq.QuoteIdentifier(col)
+		if col != "id" {
+			updates = append(updates, fmt.Sprintf("%s = EXCLUDED.%s", quoted[i], quoted[i]))
+		}
+	}
+
+	rows := make([]string, len(records))
+	args := make([]any, 0, len(records)*len(columns))
+	for r, record := range records {
+		placeholders := make([]string, len(columns))
+		for c, col := range columns {
+			args = append(args, record[col])
+			placeholders[c] = fmt.Sprintf("$%d", len(args))
+		}
+		rows[r] = "(" + strings.Join(placeholders, ", ") + ")"
+	}
+
+	// 更新する列がないときに DO UPDATE SET を空で書くと構文エラーになる
+	onConflict := "DO NOTHING"
+	if len(updates) > 0 {
+		onConflict = "DO UPDATE SET " + strings.Join(updates, ", ")
+	}
+
+	query := fmt.Sprintf("INSERT INTO %s (%s) VALUES %s ON CONFLICT (id) %s",
+		mm.targetTable, strings.Join(quoted, ", "), strings.Join(rows, ", "), onConflict)
+	return query, args
+}
+
 // startResourceMonitoring リソース監視を開始
 func (mm *MigrationManager) startResourceMonitoring(ctx context.Context) {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
+	tick := time.Tick(5 * time.Second)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-tick:
 			mm.updateResourceMetrics()
 		}
 	}
@@ -500,7 +536,7 @@ func (mm *MigrationManager) updateResourceMetrics() {
 
 	// メモリ使用率の計算
 	memoryUsagePercent := float64(memStats.Alloc) / float64(memStats.Sys) * 100
-	mm.resourceMonitor.memoryUsage.Store(memoryUsagePercent)
+	mm.resourceMonitor.memoryUsage.Store(math.Float64bits(memoryUsagePercent))
 
 	// 接続数の更新（データベース接続数）
 	stats := mm.db.Stats()
@@ -509,7 +545,7 @@ func (mm *MigrationManager) updateResourceMetrics() {
 
 // shouldPauseForResources リソース制限により一時停止すべきかを判定
 func (mm *MigrationManager) shouldPauseForResources() bool {
-	memUsage := mm.resourceMonitor.memoryUsage.Load().(float64)
+	memUsage := math.Float64frombits(mm.resourceMonitor.memoryUsage.Load())
 	connCount := mm.resourceMonitor.connectionCount.Load()
 
 	return memUsage > mm.resourceMonitor.thresholds.MaxMemoryPercent ||
@@ -518,14 +554,13 @@ func (mm *MigrationManager) shouldPauseForResources() bool {
 
 // waitForResourceRecovery リソース回復を待機
 func (mm *MigrationManager) waitForResourceRecovery(ctx context.Context) {
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
+	tick := time.Tick(10 * time.Second)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-tick:
 			if !mm.shouldPauseForResources() {
 				log.Printf("Resource constraints resolved, resuming migration")
 				return
@@ -537,14 +572,13 @@ func (mm *MigrationManager) waitForResourceRecovery(ctx context.Context) {
 
 // startCheckpointManager チェックポイント管理を開始
 func (mm *MigrationManager) startCheckpointManager(ctx context.Context) {
-	ticker := time.NewTicker(mm.checkpointManager.interval)
-	defer ticker.Stop()
+	tick := time.Tick(mm.checkpointManager.interval)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-tick:
 			if err := mm.saveCheckpoint(ctx); err != nil {
 				log.Printf("Failed to save checkpoint: %v", err)
 			} else {
@@ -556,72 +590,17 @@ func (mm *MigrationManager) startCheckpointManager(ctx context.Context) {
 
 // startProgressMonitoring 進捗監視を開始
 func (mm *MigrationManager) startProgressMonitoring(ctx context.Context) {
-	ticker := time.NewTicker(mm.progressInterval)
-	defer ticker.Stop()
+	tick := time.Tick(mm.progressInterval)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-tick:
 			progress := mm.getProgress(ctx)
 			mm.logProgress(progress)
 		}
 	}
-}
-
-// ヘルパーメソッド群
-func (mm *MigrationManager) extractColumns(record map[string]interface{}) string {
-	var columns []string
-	for col := range record {
-		columns = append(columns, col)
-	}
-	return fmt.Sprintf("\"%s\"", columns[0]) // 簡易実装
-}
-
-func (mm *MigrationManager) buildPlaceholders(colCount, recordCount int) string {
-	// 動的にプレースホルダーを生成
-	var placeholders []string
-	paramIndex := 1
-
-	for r := 0; r < recordCount; r++ {
-		var rowPlaceholders []string
-		for c := 0; c < colCount; c++ {
-			rowPlaceholders = append(rowPlaceholders, fmt.Sprintf("$%d", paramIndex))
-			paramIndex++
-		}
-		placeholders = append(placeholders, fmt.Sprintf("(%s)",
-			rowPlaceholders[0])) // 簡易実装の例
-	}
-
-	return placeholders[0] // 最初のプレースホルダーを返す
-}
-
-func (mm *MigrationManager) buildUpdateClause(record map[string]interface{}) string {
-	// レコードの内容に基づいて更新クローズを動的生成
-	var updateClauses []string
-
-	// 基本的な更新時刻
-	updateClauses = append(updateClauses, "updated_at = CURRENT_TIMESTAMP")
-
-	// レコードの内容に基づいて追加のカラムを更新
-	for column := range record {
-		if column != "id" && column != "created_at" && column != "updated_at" {
-			updateClauses = append(updateClauses, fmt.Sprintf("%s = EXCLUDED.%s", column, column))
-		}
-	}
-
-	return updateClauses[0] // 簡易実装で最初のクローズのみ返す
-}
-
-func (mm *MigrationManager) buildInsertArgs(records []map[string]interface{}) []interface{} {
-	var args []interface{}
-	for _, record := range records {
-		for _, value := range record {
-			args = append(args, value)
-		}
-	}
-	return args
 }
 
 // メトリクス更新メソッド群
@@ -653,12 +632,11 @@ func (m *MigrationMetrics) updateChunkTiming(duration time.Duration) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if m.maxChunkTime == 0 || duration > m.maxChunkTime {
-		m.maxChunkTime = duration
-	}
-	if m.minChunkTime == 0 || duration < m.minChunkTime {
+	m.maxChunkTime = max(m.maxChunkTime, duration)
+	if m.minChunkTime == 0 {
 		m.minChunkTime = duration
 	}
+	m.minChunkTime = min(m.minChunkTime, duration)
 
 	// 平均時間の計算（簡易実装）
 	m.avgChunkTime = (m.avgChunkTime + duration) / 2
@@ -683,6 +661,25 @@ func (mm *MigrationManager) initializeCheckpointTable(ctx context.Context) error
 		return fmt.Errorf("failed to create checkpoint table: %w", err)
 	}
 
+	// チャンク単位の進捗テーブル。再実行時はここの状態から未完了チャンクを選ぶ
+	chunksQuery := `
+		CREATE TABLE IF NOT EXISTS migration_chunks (
+			migration_id VARCHAR(255) NOT NULL,
+			chunk_id BIGINT NOT NULL,
+			start_id BIGINT NOT NULL,
+			end_id BIGINT NOT NULL,
+			record_count BIGINT NOT NULL DEFAULT 0,
+			status VARCHAR(20) NOT NULL,
+			error_msg TEXT NOT NULL DEFAULT '',
+			start_time TIMESTAMP,
+			end_time TIMESTAMP,
+			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			PRIMARY KEY (migration_id, chunk_id)
+		)`
+	if _, err := mm.db.ExecContext(ctx, chunksQuery); err != nil {
+		return fmt.Errorf("failed to create chunk table: %w", err)
+	}
+
 	log.Printf("Checkpoint table initialized")
 	return nil
 }
@@ -698,10 +695,6 @@ func (mm *MigrationManager) loadChunkPlan(ctx context.Context) ([]*ChunkInfo, er
 	migrationID := fmt.Sprintf("%s_to_%s", mm.sourceTable, mm.targetTable)
 	rows, err := mm.db.QueryContext(ctx, query, migrationID)
 	if err != nil {
-		// テーブルが存在しない場合は空のプランを返す
-		if err.Error() == "relation \"migration_chunks\" does not exist" {
-			return []*ChunkInfo{}, nil
-		}
 		return nil, fmt.Errorf("failed to load chunk plan: %w", err)
 	}
 	defer func() {
@@ -726,8 +719,8 @@ func (mm *MigrationManager) loadChunkPlan(ctx context.Context) ([]*ChunkInfo, er
 }
 
 func (mm *MigrationManager) filterPendingChunks(chunks []*ChunkInfo) []*ChunkInfo {
-	// 未完了チャンクのフィルタリング
-	return chunks
+	// 完了済みチャンクを除く
+	return slices.DeleteFunc(chunks, func(c *ChunkInfo) bool { return c.Status == ChunkCompleted })
 }
 
 func (mm *MigrationManager) updateChunkStatus(ctx context.Context, chunk *ChunkInfo) error {
@@ -741,6 +734,7 @@ func (mm *MigrationManager) updateChunkStatus(ctx context.Context, chunk *ChunkI
 			record_count = EXCLUDED.record_count,
 			status = EXCLUDED.status,
 			error_msg = EXCLUDED.error_msg,
+			start_time = EXCLUDED.start_time,
 			end_time = EXCLUDED.end_time,
 			updated_at = CURRENT_TIMESTAMP`
 
@@ -813,7 +807,8 @@ func (mm *MigrationManager) getProgress(ctx context.Context) *MigrationProgress 
 	err := mm.db.QueryRowContext(ctx, query, migrationID).Scan(
 		&totalChunks, &completedChunks, &failedChunks, &processedRecords)
 
-	if err != nil && err != sql.ErrNoRows {
+	// 集約クエリは必ず1行を返すので ErrNoRows は起きない
+	if err != nil {
 		log.Printf("Failed to get progress from database: %v", err)
 		// フォールバック：メトリクスから情報を取得
 		mm.metrics.mu.RLock()

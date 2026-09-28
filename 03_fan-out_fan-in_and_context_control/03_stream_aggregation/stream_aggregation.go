@@ -1,18 +1,20 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"log"
+	"maps"
 	"math"
-	"math/rand"
-	"sort"
+	"math/rand/v2"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-// StreamEventはストリームイベントです
+// StreamEvent ストリームイベントです
 type StreamEvent struct {
 	ID        int64
 	EventType string
@@ -20,11 +22,11 @@ type StreamEvent struct {
 	UserID    string
 	SessionID string
 	Value     float64
-	Data      map[string]interface{}
+	Data      map[string]any
 	Source    string
 }
 
-// AggregationWindowは集約ウィンドウです
+// AggregationWindow 集約ウィンドウです
 type AggregationWindow struct {
 	WindowID    string
 	StartTime   time.Time
@@ -41,7 +43,7 @@ type AggregationWindow struct {
 	TypeCounts  map[string]int64
 }
 
-// StreamAggregatorはストリーム集約システムです
+// StreamAggregator ストリーム集約システムです
 type StreamAggregator struct {
 	// 基本設定
 	windowSize    time.Duration
@@ -70,14 +72,14 @@ type StreamAggregator struct {
 
 	// 統計・監視
 	stats     *AggregatorStats
-	isRunning int32
+	isRunning atomic.Bool
 	startTime time.Time
 
-	// ウィンドウ清理
+	// 古いウィンドウの後片付け
 	cleanupTicker *time.Ticker
 }
 
-// AggregationWorkerは集約処理ワーカーです
+// AggregationWorker 集約処理ワーカーです
 type AggregationWorker struct {
 	ID         int
 	aggregator *StreamAggregator
@@ -85,14 +87,14 @@ type AggregationWorker struct {
 	stats      *WorkerStats
 }
 
-// EventProcessorはイベント処理エンジンです
+// EventProcessor イベント処理エンジンです
 type EventProcessor struct {
 	ID               int
-	processedEvents  int64
-	processedWindows int64
+	processedEvents  atomic.Int64
+	processedWindows atomic.Int64
 }
 
-// AggregationResultは集約結果です
+// AggregationResult 集約結果です
 type AggregationResult struct {
 	WindowID       string
 	StartTime      time.Time
@@ -111,35 +113,44 @@ type AggregationResult struct {
 	CompletedAt    time.Time
 }
 
-// EventTypeCountはイベントタイプ別カウントです
+// EventTypeCount イベントタイプ別カウントです
 type EventTypeCount struct {
 	EventType  string
 	Count      int64
 	Percentage float64
 }
 
-// AggregatorStatsは集約システム統計です
+// AggregatorStats 集約システム統計です
 type AggregatorStats struct {
 	mu                     sync.RWMutex
-	totalEvents            int64
-	totalWindows           int64
-	totalResultsGenerated  int64
+	totalEvents            atomic.Int64
+	totalWindows           atomic.Int64
+	totalResultsGenerated  atomic.Int64
 	averageEventsPerWindow float64
 	averageProcessingTime  time.Duration
 	startTime              time.Time
 	workerStats            map[int]*WorkerStats
 }
 
-// WorkerStatsはワーカー統計です
+// WorkerStats ワーカー統計です。ワーカーgoroutine（書き込み）と監視・API側
+// （読み取り）の両方から参照されるため、型付きatomicで保持します。
 type WorkerStats struct {
-	WorkerID              int
-	ProcessedEvents       int64
-	ProcessedWindows      int64
-	TotalProcessingTime   time.Duration
-	AverageProcessingTime time.Duration
+	WorkerID            int
+	ProcessedEvents     atomic.Int64
+	ProcessedWindows    atomic.Int64
+	TotalProcessingTime atomic.Int64 // 累積処理時間（ナノ秒）
 }
 
-// AggregationConfigは集約設定です
+// AverageProcessingTime 現時点の平均処理時間を計算します
+func (s *WorkerStats) AverageProcessingTime() time.Duration {
+	windows := s.ProcessedWindows.Load()
+	if windows == 0 {
+		return 0
+	}
+	return time.Duration(s.TotalProcessingTime.Load()) / time.Duration(windows)
+}
+
+// AggregationConfig 集約設定です
 type AggregationConfig struct {
 	WindowSize      time.Duration
 	SlideInterval   time.Duration
@@ -151,7 +162,7 @@ type AggregationConfig struct {
 	MetricsInterval time.Duration
 }
 
-// NewAggregationConfigはデフォルト集約設定を作成します
+// NewAggregationConfig デフォルト集約設定を作成します
 func NewAggregationConfig() *AggregationConfig {
 	return &AggregationConfig{
 		WindowSize:      30 * time.Second,
@@ -165,7 +176,7 @@ func NewAggregationConfig() *AggregationConfig {
 	}
 }
 
-// NewStreamAggregatorは新しいストリーム集約システムを作成します
+// NewStreamAggregator 新しいストリーム集約システムを作成します
 func NewStreamAggregator(config *AggregationConfig) *StreamAggregator {
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -189,7 +200,7 @@ func NewStreamAggregator(config *AggregationConfig) *StreamAggregator {
 	}
 
 	// ワーカーを初期化
-	for i := 0; i < config.WorkerCount; i++ {
+	for i := range config.WorkerCount {
 		worker := &AggregationWorker{
 			ID:         i,
 			aggregator: aggregator,
@@ -207,9 +218,9 @@ func NewStreamAggregator(config *AggregationConfig) *StreamAggregator {
 	return aggregator
 }
 
-// Startは集約システムを開始します
+// Start 集約システムを開始します
 func (sa *StreamAggregator) Start() error {
-	if !atomic.CompareAndSwapInt32(&sa.isRunning, 0, 1) {
+	if !sa.isRunning.CompareAndSwap(false, true) {
 		return fmt.Errorf("aggregator is already running")
 	}
 
@@ -219,39 +230,31 @@ func (sa *StreamAggregator) Start() error {
 	log.Printf("Starting stream aggregator with %d workers", sa.workerCount)
 
 	// イベント分散器を開始
-	sa.wg.Add(1)
-	go sa.distributeEvents()
+	sa.wg.Go(sa.distributeEvents)
 
 	// ウィンドウ管理を開始
-	sa.wg.Add(1)
-	go sa.manageWindows()
+	sa.wg.Go(sa.manageWindows)
 
 	// 集約ワーカーを開始
 	for _, worker := range sa.workers {
-		sa.wg.Add(1)
-		go worker.run()
+		sa.wg.Go(worker.run)
 	}
 
 	// 結果処理を開始
-	sa.wg.Add(1)
-	go sa.handleResults()
+	sa.wg.Go(sa.handleResults)
 
-	// ウィンドウ清理を開始
-	sa.wg.Add(1)
-	go sa.cleanupWindows()
+	// 古いウィンドウの後片付けを開始
+	sa.wg.Go(sa.cleanupWindows)
 
 	// メトリクス監視を開始
-	sa.wg.Add(1)
-	go sa.monitorMetrics()
+	sa.wg.Go(sa.monitorMetrics)
 
 	log.Printf("Stream aggregator started successfully")
 	return nil
 }
 
-// distributeEventsはイベントを分散します
+// distributeEvents イベントを分散します
 func (sa *StreamAggregator) distributeEvents() {
-	defer sa.wg.Done()
-
 	log.Println("Event distributor started")
 
 	for {
@@ -259,22 +262,17 @@ func (sa *StreamAggregator) distributeEvents() {
 		case <-sa.ctx.Done():
 			log.Println("Event distributor stopping due to context cancellation")
 			return
-		case event, ok := <-sa.eventChannel:
-			if !ok {
-				log.Println("Event distributor stopping due to event channel closure")
-				return
-			}
-
+		case event := <-sa.eventChannel:
 			// イベントを適切なウィンドウに分配
 			sa.assignEventToWindows(event)
 
 			// 統計更新
-			atomic.AddInt64(&sa.stats.totalEvents, 1)
+			sa.stats.totalEvents.Add(1)
 		}
 	}
 }
 
-// assignEventToWindowsはイベントをウィンドウに割り当てます
+// assignEventToWindows イベントをウィンドウに割り当てます
 func (sa *StreamAggregator) assignEventToWindows(event StreamEvent) {
 	sa.windowMutex.Lock()
 	defer sa.windowMutex.Unlock()
@@ -284,7 +282,7 @@ func (sa *StreamAggregator) assignEventToWindows(event StreamEvent) {
 	windowStart := now.Truncate(sa.slideInterval)
 
 	// スライディングウィンドウの複数のウィンドウに割り当て
-	for i := 0; i < int(sa.windowSize/sa.slideInterval); i++ {
+	for i := range int(sa.windowSize / sa.slideInterval) {
 		start := windowStart.Add(-time.Duration(i) * sa.slideInterval)
 		end := start.Add(sa.windowSize)
 
@@ -315,12 +313,8 @@ func (sa *StreamAggregator) assignEventToWindows(event StreamEvent) {
 			window.TotalValue += event.Value
 
 			// 最小・最大値を更新
-			if event.Value < window.MinValue {
-				window.MinValue = event.Value
-			}
-			if event.Value > window.MaxValue {
-				window.MaxValue = event.Value
-			}
+			window.MinValue = min(window.MinValue, event.Value)
+			window.MaxValue = max(window.MaxValue, event.Value)
 
 			// ユーザー別・タイプ別カウントを更新
 			window.UserCounts[event.UserID]++
@@ -348,9 +342,9 @@ func (sa *StreamAggregator) assignEventToWindows(event StreamEvent) {
 	}
 }
 
-// copyWindowはウィンドウのコピーを作成します
+// copyWindow ウィンドウのコピーを作成します
 func (sa *StreamAggregator) copyWindow(window *AggregationWindow) *AggregationWindow {
-	copy := &AggregationWindow{
+	windowCopy := &AggregationWindow{
 		WindowID:   window.WindowID,
 		StartTime:  window.StartTime,
 		EndTime:    window.EndTime,
@@ -359,29 +353,16 @@ func (sa *StreamAggregator) copyWindow(window *AggregationWindow) *AggregationWi
 		TotalValue: window.TotalValue,
 		MinValue:   window.MinValue,
 		MaxValue:   window.MaxValue,
-		Events:     make([]StreamEvent, len(window.Events)),
-		UserCounts: make(map[string]int64),
-		TypeCounts: make(map[string]int64),
+		Events:     slices.Clone(window.Events),
+		UserCounts: maps.Clone(window.UserCounts),
+		TypeCounts: maps.Clone(window.TypeCounts),
 	}
 
-	// イベントをコピー
-	copy.Events = append(copy.Events, window.Events...)
-
-	// カウントをコピー
-	for k, v := range window.UserCounts {
-		copy.UserCounts[k] = v
-	}
-	for k, v := range window.TypeCounts {
-		copy.TypeCounts[k] = v
-	}
-
-	return copy
+	return windowCopy
 }
 
-// runはワーカーのメインループです
+// run ワーカーのメインループです
 func (aw *AggregationWorker) run() {
-	defer aw.aggregator.wg.Done()
-
 	log.Printf("Aggregation worker %d started", aw.ID)
 
 	for {
@@ -391,7 +372,6 @@ func (aw *AggregationWorker) run() {
 			return
 		case window, ok := <-aw.aggregator.windowChannel:
 			if !ok {
-				log.Printf("Worker %d stopping due to window channel closure", aw.ID)
 				return
 			}
 
@@ -410,7 +390,7 @@ func (aw *AggregationWorker) run() {
 	}
 }
 
-// processWindowはウィンドウを処理します
+// processWindow ウィンドウを処理します
 func (aw *AggregationWorker) processWindow(window *AggregationWindow) *AggregationResult {
 	start := time.Now()
 
@@ -437,7 +417,7 @@ func (aw *AggregationWorker) processWindow(window *AggregationWindow) *Aggregati
 		for i, event := range window.Events {
 			values[i] = event.Value
 		}
-		sort.Float64s(values)
+		slices.Sort(values)
 
 		n := len(values)
 		if n%2 == 0 {
@@ -460,21 +440,17 @@ func (aw *AggregationWorker) processWindow(window *AggregationWindow) *Aggregati
 	result.ProcessingTime = processingTime
 
 	// 統計更新
-	atomic.AddInt64(&aw.stats.ProcessedEvents, window.EventCount)
-	atomic.AddInt64(&aw.stats.ProcessedWindows, 1)
-	aw.stats.TotalProcessingTime += processingTime
+	aw.stats.ProcessedEvents.Add(window.EventCount)
+	aw.stats.ProcessedWindows.Add(1)
+	aw.stats.TotalProcessingTime.Add(int64(processingTime))
 
-	if aw.stats.ProcessedWindows > 0 {
-		aw.stats.AverageProcessingTime = aw.stats.TotalProcessingTime / time.Duration(aw.stats.ProcessedWindows)
-	}
-
-	atomic.AddInt64(&aw.processor.processedEvents, window.EventCount)
-	atomic.AddInt64(&aw.processor.processedWindows, 1)
+	aw.processor.processedEvents.Add(window.EventCount)
+	aw.processor.processedWindows.Add(1)
 
 	return result
 }
 
-// calculateStandardDeviationは標準偏差を計算します
+// calculateStandardDeviation 標準偏差を計算します
 func (aw *AggregationWorker) calculateStandardDeviation(values []float64, mean float64) float64 {
 	if len(values) <= 1 {
 		return 0
@@ -490,7 +466,7 @@ func (aw *AggregationWorker) calculateStandardDeviation(values []float64, mean f
 	return math.Sqrt(variance)
 }
 
-// calculateTopEventTypesはトップイベントタイプを計算します
+// calculateTopEventTypes トップイベントタイプを計算します
 func (aw *AggregationWorker) calculateTopEventTypes(typeCounts map[string]int64, totalCount int64) []EventTypeCount {
 	type typeCount struct {
 		eventType string
@@ -502,19 +478,16 @@ func (aw *AggregationWorker) calculateTopEventTypes(typeCounts map[string]int64,
 		types = append(types, typeCount{eventType: eventType, count: count})
 	}
 
-	// カウント順でソート
-	sort.Slice(types, func(i, j int) bool {
-		return types[i].count > types[j].count
+	// カウント順（降順）でソート
+	slices.SortFunc(types, func(a, b typeCount) int {
+		return cmp.Compare(b.count, a.count)
 	})
 
 	// 上位5つを取得
-	maxTypes := 5
-	if len(types) < maxTypes {
-		maxTypes = len(types)
-	}
+	maxTypes := min(len(types), 5)
 
 	result := make([]EventTypeCount, maxTypes)
-	for i := 0; i < maxTypes; i++ {
+	for i := range maxTypes {
 		percentage := float64(types[i].count) / float64(totalCount) * 100
 		result[i] = EventTypeCount{
 			EventType:  types[i].eventType,
@@ -526,12 +499,9 @@ func (aw *AggregationWorker) calculateTopEventTypes(typeCounts map[string]int64,
 	return result
 }
 
-// manageWindowsはウィンドウを管理します
+// manageWindows ウィンドウを管理します
 func (sa *StreamAggregator) manageWindows() {
-	defer sa.wg.Done()
-
-	ticker := time.NewTicker(sa.slideInterval)
-	defer ticker.Stop()
+	tick := time.Tick(sa.slideInterval)
 
 	log.Println("Window manager started")
 
@@ -540,13 +510,13 @@ func (sa *StreamAggregator) manageWindows() {
 		case <-sa.ctx.Done():
 			log.Println("Window manager stopping due to context cancellation")
 			return
-		case <-ticker.C:
+		case <-tick:
 			sa.checkAndFlushWindows()
 		}
 	}
 }
 
-// checkAndFlushWindowsは期限切れウィンドウをフラッシュします
+// checkAndFlushWindows 期限切れウィンドウをフラッシュします
 func (sa *StreamAggregator) checkAndFlushWindows() {
 	sa.windowMutex.Lock()
 	defer sa.windowMutex.Unlock()
@@ -581,10 +551,15 @@ func (sa *StreamAggregator) checkAndFlushWindows() {
 	}
 }
 
-// SubmitEventはイベントをキューに追加します
+// SubmitEvent イベントをキューに追加します
 func (sa *StreamAggregator) SubmitEvent(event StreamEvent) error {
-	if atomic.LoadInt32(&sa.isRunning) == 0 {
+	if !sa.isRunning.Load() {
 		return fmt.Errorf("aggregator is not running")
+	}
+	// eventChannel closeしないので送信自体はpanicしないが、停止後の投入は
+	// 処理されずに残ってしまうため、ctx側でも早期に拒否する。
+	if sa.ctx.Err() != nil {
+		return fmt.Errorf("aggregator is shutting down")
 	}
 
 	// タイムスタンプが設定されていない場合は現在時刻を使用
@@ -602,15 +577,13 @@ func (sa *StreamAggregator) SubmitEvent(event StreamEvent) error {
 	}
 }
 
-// GetResultChannelは結果チャネルを取得します
+// GetResultChannel 結果チャネルを取得します
 func (sa *StreamAggregator) GetResultChannel() <-chan *AggregationResult {
 	return sa.resultChannel
 }
 
-// handleResultsは結果を処理します
+// handleResults 結果を処理します
 func (sa *StreamAggregator) handleResults() {
-	defer sa.wg.Done()
-
 	log.Println("Result handler started")
 
 	for {
@@ -625,12 +598,12 @@ func (sa *StreamAggregator) handleResults() {
 			}
 
 			// 統計更新
-			atomic.AddInt64(&sa.stats.totalWindows, 1)
-			atomic.AddInt64(&sa.stats.totalResultsGenerated, 1)
+			sa.stats.totalWindows.Add(1)
+			sa.stats.totalResultsGenerated.Add(1)
 
 			// 平均イベント数を更新
-			totalWindows := atomic.LoadInt64(&sa.stats.totalWindows)
-			totalEvents := atomic.LoadInt64(&sa.stats.totalEvents)
+			totalWindows := sa.stats.totalWindows.Load()
+			totalEvents := sa.stats.totalEvents.Load()
 			if totalWindows > 0 {
 				sa.stats.mu.Lock()
 				sa.stats.averageEventsPerWindow = float64(totalEvents) / float64(totalWindows)
@@ -663,10 +636,8 @@ func (sa *StreamAggregator) handleResults() {
 	}
 }
 
-// cleanupWindowsは古いウィンドウを清理します
+// cleanupWindows 古いウィンドウを後片付けします
 func (sa *StreamAggregator) cleanupWindows() {
-	defer sa.wg.Done()
-
 	log.Println("Window cleanup started")
 
 	for {
@@ -680,7 +651,7 @@ func (sa *StreamAggregator) cleanupWindows() {
 	}
 }
 
-// performCleanupは清理を実行します
+// performCleanup 後片付けを実行します
 func (sa *StreamAggregator) performCleanup() {
 	sa.windowMutex.Lock()
 	defer sa.windowMutex.Unlock()
@@ -706,12 +677,9 @@ func (sa *StreamAggregator) performCleanup() {
 	log.Printf("Active windows: %d", len(sa.windows))
 }
 
-// monitorMetricsはメトリクスを監視します
+// monitorMetrics メトリクスを監視します
 func (sa *StreamAggregator) monitorMetrics() {
-	defer sa.wg.Done()
-
-	ticker := time.NewTicker(15 * time.Second)
-	defer ticker.Stop()
+	tick := time.Tick(15 * time.Second)
 
 	log.Println("Metrics monitor started")
 
@@ -720,20 +688,20 @@ func (sa *StreamAggregator) monitorMetrics() {
 		case <-sa.ctx.Done():
 			log.Println("Metrics monitor stopping")
 			return
-		case <-ticker.C:
+		case <-tick:
 			sa.reportMetrics()
 		}
 	}
 }
 
-// reportMetricsはメトリクスを報告します
+// reportMetrics メトリクスを報告します
 func (sa *StreamAggregator) reportMetrics() {
 	sa.stats.mu.RLock()
 	defer sa.stats.mu.RUnlock()
 
-	totalEvents := atomic.LoadInt64(&sa.stats.totalEvents)
-	totalWindows := atomic.LoadInt64(&sa.stats.totalWindows)
-	totalResults := atomic.LoadInt64(&sa.stats.totalResultsGenerated)
+	totalEvents := sa.stats.totalEvents.Load()
+	totalWindows := sa.stats.totalWindows.Load()
+	totalResults := sa.stats.totalResultsGenerated.Load()
 
 	uptime := time.Since(sa.stats.startTime)
 	var eventThroughput float64
@@ -752,30 +720,32 @@ func (sa *StreamAggregator) reportMetrics() {
 
 	// ワーカー別統計
 	for _, worker := range sa.workers {
-		processedEvents := atomic.LoadInt64(&worker.stats.ProcessedEvents)
-		processedWindows := atomic.LoadInt64(&worker.stats.ProcessedWindows)
+		processedEvents := worker.stats.ProcessedEvents.Load()
+		processedWindows := worker.stats.ProcessedWindows.Load()
 
 		if processedWindows > 0 {
 			avgEventsPerWindow := float64(processedEvents) / float64(processedWindows)
 			log.Printf("Worker %d: Events=%d, Windows=%d, AvgEvts/Win=%.1f, AvgTime=%v",
-				worker.ID, processedEvents, processedWindows, avgEventsPerWindow, worker.stats.AverageProcessingTime)
+				worker.ID, processedEvents, processedWindows, avgEventsPerWindow, worker.stats.AverageProcessingTime())
 		}
 	}
 }
 
-// Shutdownは集約システムを停止します
+// Shutdown 集約システムを停止します
 func (sa *StreamAggregator) Shutdown(timeout time.Duration) error {
-	if !atomic.CompareAndSwapInt32(&sa.isRunning, 1, 0) {
+	if !sa.isRunning.CompareAndSwap(true, false) {
 		return fmt.Errorf("aggregator is not running")
 	}
 
 	log.Println("Shutting down stream aggregator...")
 
-	// 1. 新しいイベントの受付を停止
-	close(sa.eventChannel)
-
-	// 2. 残っているウィンドウをフラッシュ
+	// 1. 残っているウィンドウを、ワーカーがまだ動いているうちにフラッシュする
+	//    （eventChannelはcloseしない。SubmitEventとの競合でpanicするため）
 	sa.flushRemainingWindows()
+
+	// 2. ワーカーに停止を指示し、クリーンアップ用のtickerも止める
+	sa.cancel()
+	sa.cleanupTicker.Stop()
 
 	// 3. ワーカーの終了を待機
 	done := make(chan struct{})
@@ -788,30 +758,19 @@ func (sa *StreamAggregator) Shutdown(timeout time.Duration) error {
 	case <-done:
 		log.Println("All workers stopped gracefully")
 	case <-time.After(timeout):
-		log.Println("Timeout reached, forcing shutdown...")
-		sa.cancel()
-
-		// 追加の待機時間
-		select {
-		case <-done:
-			log.Println("Workers stopped after cancellation")
-		case <-time.After(2 * time.Second):
-			log.Println("Some workers may not have stopped properly")
-		}
+		// 送信側のgoroutineが残っている可能性があるので、チャネルは閉じずにエラーを返す
+		return fmt.Errorf("shutdown timeout: some workers may not have stopped")
 	}
 
-	// 4. チャネルを閉じる
+	// 4. チャネルを閉じる（送信元はwg.Waitの完了で全て止まっている）
 	close(sa.windowChannel)
 	close(sa.resultChannel)
-
-	// 5. タイマーを停止
-	sa.cleanupTicker.Stop()
 
 	log.Println("Stream aggregator shutdown completed")
 	return nil
 }
 
-// flushRemainingWindowsは残りのウィンドウをフラッシュします
+// flushRemainingWindows 残りのウィンドウをフラッシュします
 func (sa *StreamAggregator) flushRemainingWindows() {
 	sa.windowMutex.Lock()
 	defer sa.windowMutex.Unlock()
@@ -833,14 +792,14 @@ func (sa *StreamAggregator) flushRemainingWindows() {
 	sa.windows = make(map[string]*AggregationWindow)
 }
 
-// GetStatsは統計情報を取得します
-func (sa *StreamAggregator) GetStats() map[string]interface{} {
+// GetStats 統計情報を取得します
+func (sa *StreamAggregator) GetStats() map[string]any {
 	sa.stats.mu.RLock()
 	defer sa.stats.mu.RUnlock()
 
-	totalEvents := atomic.LoadInt64(&sa.stats.totalEvents)
-	totalWindows := atomic.LoadInt64(&sa.stats.totalWindows)
-	totalResults := atomic.LoadInt64(&sa.stats.totalResultsGenerated)
+	totalEvents := sa.stats.totalEvents.Load()
+	totalWindows := sa.stats.totalWindows.Load()
+	totalResults := sa.stats.totalResultsGenerated.Load()
 
 	uptime := time.Since(sa.stats.startTime)
 	var eventThroughput float64
@@ -852,16 +811,16 @@ func (sa *StreamAggregator) GetStats() map[string]interface{} {
 	activeWindows := len(sa.windows)
 	sa.windowMutex.RUnlock()
 
-	workerStats := make(map[string]interface{})
+	workerStats := make(map[string]any)
 	for id, stats := range sa.stats.workerStats {
-		workerStats[fmt.Sprintf("worker_%d", id)] = map[string]interface{}{
-			"processed_events":        atomic.LoadInt64(&stats.ProcessedEvents),
-			"processed_windows":       atomic.LoadInt64(&stats.ProcessedWindows),
-			"average_processing_time": stats.AverageProcessingTime,
+		workerStats[fmt.Sprintf("worker_%d", id)] = map[string]any{
+			"processed_events":        stats.ProcessedEvents.Load(),
+			"processed_windows":       stats.ProcessedWindows.Load(),
+			"average_processing_time": stats.AverageProcessingTime(),
 		}
 	}
 
-	return map[string]interface{}{
+	return map[string]any{
 		"total_events":              totalEvents,
 		"total_windows":             totalWindows,
 		"total_results":             totalResults,
@@ -917,18 +876,18 @@ func main() {
 		eventTypes := []string{"click", "view", "purchase", "login", "logout", "search", "comment"}
 		userIDs := []string{"user1", "user2", "user3", "user4", "user5", "user6", "user7", "user8", "user9", "user10"}
 
-		for i := 0; i < 5000; i++ {
+		for i := range 5000 {
 			event := StreamEvent{
 				ID:        int64(i),
-				EventType: eventTypes[rand.Intn(len(eventTypes))],
+				EventType: eventTypes[rand.IntN(len(eventTypes))],
 				Timestamp: time.Now(),
-				UserID:    userIDs[rand.Intn(len(userIDs))],
-				SessionID: fmt.Sprintf("session_%d", rand.Intn(20)),
+				UserID:    userIDs[rand.IntN(len(userIDs))],
+				SessionID: fmt.Sprintf("session_%d", rand.IntN(20)),
 				Value:     rand.Float64()*100 + 1, // 1-101の値
-				Data: map[string]interface{}{
-					"page":     fmt.Sprintf("/page%d", rand.Intn(10)),
-					"referrer": fmt.Sprintf("ref%d", rand.Intn(5)),
-					"device":   []string{"mobile", "desktop", "tablet"}[rand.Intn(3)],
+				Data: map[string]any{
+					"page":     fmt.Sprintf("/page%d", rand.IntN(10)),
+					"referrer": fmt.Sprintf("ref%d", rand.IntN(5)),
+					"device":   []string{"mobile", "desktop", "tablet"}[rand.IntN(3)],
 				},
 				Source: "test_generator",
 			}
@@ -939,7 +898,7 @@ func main() {
 			}
 
 			// 送信頻度を制御（リアルタイムストリームをシミュレート）
-			time.Sleep(time.Duration(rand.Intn(50)+10) * time.Millisecond)
+			time.Sleep(time.Duration(rand.IntN(50)+10) * time.Millisecond)
 		}
 
 		log.Println("All test events submitted")

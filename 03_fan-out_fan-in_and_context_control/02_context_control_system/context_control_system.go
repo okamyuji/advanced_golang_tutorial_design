@@ -1,16 +1,18 @@
 package main
 
 import (
+	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"log"
-	"math/rand"
+	"math/rand/v2"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-// ContextTypeはコンテキストタイプです
+// ContextType コンテキストタイプです
 type ContextType string
 
 const (
@@ -20,7 +22,7 @@ const (
 	ContextTypeValue    ContextType = "value"
 )
 
-// Taskはタスクデータです
+// Task タスクデータです
 type Task struct {
 	ID         int64
 	Name       string
@@ -30,14 +32,14 @@ type Task struct {
 	Retries    int
 	MaxRetries int
 	CreatedAt  time.Time
-	Metadata   map[string]interface{}
+	Metadata   map[string]any
 }
 
-// TaskResultはタスク実行結果です
+// TaskResult タスク実行結果です
 type TaskResult struct {
 	TaskID      int64
 	Success     bool
-	Result      interface{}
+	Result      any
 	Error       error
 	Duration    time.Duration
 	WorkerID    int
@@ -46,7 +48,7 @@ type TaskResult struct {
 	CompletedAt time.Time
 }
 
-// ContextControllerはコンテキスト制御管理者です
+// ContextControlController コンテキスト制御管理者です
 type ContextControlController struct {
 	// 基本設定
 	workerCount  int
@@ -66,7 +68,7 @@ type ContextControlController struct {
 
 	// 統計・監視
 	stats     *ControllerStats
-	isRunning int32
+	isRunning atomic.Bool
 	startTime time.Time
 
 	// タイムアウト制御
@@ -74,7 +76,7 @@ type ContextControlController struct {
 	timeoutManager *TimeoutManager
 }
 
-// ContextWorkerはコンテキスト制御ワーカーです
+// ContextWorker コンテキスト制御ワーカーです
 type ContextWorker struct {
 	ID          int
 	controller  *ContextControlController
@@ -84,42 +86,51 @@ type ContextWorker struct {
 	processor   *TaskProcessor
 }
 
-// TaskProcessorはタスク処理エンジンです
+// TaskProcessor タスク処理エンジンです
 type TaskProcessor struct {
 	ID             int
-	processedCount int64
-	errorCount     int64
-	timeoutCount   int64
-	cancelledCount int64
+	processedCount atomic.Int64
+	errorCount     atomic.Int64
+	timeoutCount   atomic.Int64
+	cancelledCount atomic.Int64
 }
 
-// ControllerStatsはコントローラー統計です
+// ControllerStats コントローラー統計です
 type ControllerStats struct {
 	mu                 sync.RWMutex
-	totalSubmitted     int64
-	totalCompleted     int64
-	totalSuccess       int64
-	totalErrors        int64
-	totalTimeouts      int64
-	totalCancellations int64
+	totalSubmitted     atomic.Int64
+	totalCompleted     atomic.Int64
+	totalSuccess       atomic.Int64
+	totalErrors        atomic.Int64
+	totalTimeouts      atomic.Int64
+	totalCancellations atomic.Int64
 	averageProcessTime time.Duration
 	startTime          time.Time
 	workerStats        map[int]*WorkerStats
 }
 
-// WorkerStatsはワーカー統計です
+// WorkerStats ワーカー統計です。ワーカーgoroutine（書き込み）と監視・API側
+// （読み取り）の両方から参照されるため、型付きatomicで保持します。
 type WorkerStats struct {
-	WorkerID           int
-	TasksProcessed     int64
-	TasksSuccess       int64
-	TasksError         int64
-	TasksTimeout       int64
-	TasksCancelled     int64
-	TotalProcessTime   time.Duration
-	AverageProcessTime time.Duration
+	WorkerID         int
+	TasksProcessed   atomic.Int64
+	TasksSuccess     atomic.Int64
+	TasksError       atomic.Int64
+	TasksTimeout     atomic.Int64
+	TasksCancelled   atomic.Int64
+	TotalProcessTime atomic.Int64 // 累積処理時間（ナノ秒）
 }
 
-// TimeoutManagerはタイムアウト管理です
+// AverageProcessTime 現時点の平均処理時間を計算します
+func (s *WorkerStats) AverageProcessTime() time.Duration {
+	processed := s.TasksProcessed.Load()
+	if processed == 0 {
+		return 0
+	}
+	return time.Duration(s.TotalProcessTime.Load()) / time.Duration(processed)
+}
+
+// TimeoutManager タイムアウト管理です
 type TimeoutManager struct {
 	mu             sync.RWMutex
 	activeTimeouts map[int64]context.CancelFunc
@@ -139,7 +150,7 @@ type TaskConfig struct {
 	MaxRetries      int
 }
 
-// NewTaskConfigはデフォルトタスク設定を作成します
+// NewTaskConfig デフォルトタスク設定を作成します
 func NewTaskConfig() *TaskConfig {
 	return &TaskConfig{
 		DefaultTimeout:  30 * time.Second,
@@ -153,7 +164,7 @@ func NewTaskConfig() *TaskConfig {
 	}
 }
 
-// NewTimeoutManagerは新しいタイムアウトマネージャーを作成します
+// NewTimeoutManager 新しいタイムアウトマネージャーを作成します
 func NewTimeoutManager(defaultTimeout, maxTimeout time.Duration) *TimeoutManager {
 	return &TimeoutManager{
 		activeTimeouts: make(map[int64]context.CancelFunc),
@@ -162,7 +173,7 @@ func NewTimeoutManager(defaultTimeout, maxTimeout time.Duration) *TimeoutManager
 	}
 }
 
-// NewContextControlControllerは新しいコンテキスト制御コントローラーを作成します
+// NewContextControlController 新しいコンテキスト制御コントローラーを作成します
 func NewContextControlController(config *TaskConfig) *ContextControlController {
 	rootCtx, cancel := context.WithCancel(context.Background())
 
@@ -183,7 +194,7 @@ func NewContextControlController(config *TaskConfig) *ContextControlController {
 	}
 
 	// ワーカーを初期化
-	for i := 0; i < config.WorkerCount; i++ {
+	for i := range config.WorkerCount {
 		worker := &ContextWorker{
 			ID:         i,
 			controller: controller,
@@ -201,9 +212,9 @@ func NewContextControlController(config *TaskConfig) *ContextControlController {
 	return controller
 }
 
-// Startはコントローラーを開始します
+// Start コントローラーを開始します
 func (c *ContextControlController) Start() error {
-	if !atomic.CompareAndSwapInt32(&c.isRunning, 0, 1) {
+	if !c.isRunning.CompareAndSwap(false, true) {
 		return fmt.Errorf("controller is already running")
 	}
 
@@ -214,30 +225,26 @@ func (c *ContextControlController) Start() error {
 
 	// ワーカーを開始
 	for _, worker := range c.workers {
-		c.wg.Add(1)
-		go worker.run()
+		c.wg.Go(worker.run)
 	}
 
 	// 結果ハンドラーを開始
-	c.wg.Add(1)
-	go c.handleResults()
+	c.wg.Go(c.handleResults)
 
 	// メトリクス監視を開始
-	c.wg.Add(1)
-	go c.monitorMetrics()
+	c.wg.Go(c.monitorMetrics)
 
-	// タイムアウト清理を開始
-	c.wg.Add(1)
-	go c.timeoutManager.cleanup()
+	// タイムアウト後片付けを開始（rootCtxのキャンセルで終了させる）
+	c.wg.Go(func() {
+		c.timeoutManager.cleanup(c.rootCtx)
+	})
 
 	log.Printf("Context control controller started successfully")
 	return nil
 }
 
-// runはワーカーのメインループです
+// run ワーカーのメインループです
 func (w *ContextWorker) run() {
-	defer w.controller.wg.Done()
-
 	log.Printf("Context worker %d started", w.ID)
 
 	for {
@@ -245,12 +252,7 @@ func (w *ContextWorker) run() {
 		case <-w.controller.rootCtx.Done():
 			log.Printf("Worker %d stopping due to root context cancellation", w.ID)
 			return
-		case task, ok := <-w.controller.taskQueue:
-			if !ok {
-				log.Printf("Worker %d stopping due to task queue closure", w.ID)
-				return
-			}
-
+		case task := <-w.controller.taskQueue:
 			// タスクを処理
 			result := w.processTaskWithContext(task)
 
@@ -266,7 +268,7 @@ func (w *ContextWorker) run() {
 	}
 }
 
-// processTaskWithContextはコンテキスト付きでタスクを処理します
+// processTaskWithContext コンテキスト付きでタスクを処理します
 func (w *ContextWorker) processTaskWithContext(task Task) TaskResult {
 	start := time.Now()
 
@@ -288,11 +290,8 @@ func (w *ContextWorker) processTaskWithContext(task Task) TaskResult {
 		CompletedAt: time.Now(),
 	}
 
-	// タスク固有のタイムアウトを決定
-	timeout := task.Timeout
-	if timeout == 0 {
-		timeout = w.controller.defaultTimeout
-	}
+	// タスク固有のタイムアウトを決定（未指定なら既定値）
+	timeout := cmp.Or(task.Timeout, w.controller.defaultTimeout)
 
 	// タイムアウト付きコンテキストを作成
 	taskCtx, cancel := context.WithTimeout(w.controller.rootCtx, timeout)
@@ -314,51 +313,44 @@ func (w *ContextWorker) processTaskWithContext(task Task) TaskResult {
 	result.Error = processingResult.Error
 
 	// エラーの種類に基づいてコンテキストタイプを更新
-	if result.Error != nil {
-		switch result.Error {
-		case context.DeadlineExceeded:
-			result.ContextType = ContextTypeTimeout
-			atomic.AddInt64(&w.stats.TasksTimeout, 1)
-			atomic.AddInt64(&w.processor.timeoutCount, 1)
-		case context.Canceled:
-			result.ContextType = ContextTypeCancel
-			atomic.AddInt64(&w.stats.TasksCancelled, 1)
-			atomic.AddInt64(&w.processor.cancelledCount, 1)
-		default:
-			atomic.AddInt64(&w.stats.TasksError, 1)
-			atomic.AddInt64(&w.processor.errorCount, 1)
-		}
-	} else {
-		atomic.AddInt64(&w.stats.TasksSuccess, 1)
+	switch {
+	case result.Error == nil:
+		w.stats.TasksSuccess.Add(1)
+	case errors.Is(result.Error, context.DeadlineExceeded):
+		result.ContextType = ContextTypeTimeout
+		w.stats.TasksTimeout.Add(1)
+		w.processor.timeoutCount.Add(1)
+	case errors.Is(result.Error, context.Canceled):
+		result.ContextType = ContextTypeCancel
+		w.stats.TasksCancelled.Add(1)
+		w.processor.cancelledCount.Add(1)
+	default:
+		w.stats.TasksError.Add(1)
+		w.processor.errorCount.Add(1)
 	}
 
 	// 統計更新
-	atomic.AddInt64(&w.stats.TasksProcessed, 1)
-	atomic.AddInt64(&w.processor.processedCount, 1)
-	w.stats.TotalProcessTime += result.Duration
-
-	if w.stats.TasksProcessed > 0 {
-		w.stats.AverageProcessTime = w.stats.TotalProcessTime / time.Duration(w.stats.TasksProcessed)
-	}
+	w.stats.TasksProcessed.Add(1)
+	w.processor.processedCount.Add(1)
+	w.stats.TotalProcessTime.Add(int64(result.Duration))
 
 	return result
 }
 
-// TaskProcessingResultはタスク処理結果です
+// TaskProcessingResult タスク処理結果です
 type TaskProcessingResult struct {
 	Success bool
-	Result  interface{}
+	Result  any
 	Error   error
 }
 
-// executeTaskWithContextはコンテキスト付きでタスクを実行します
+// executeTaskWithContext コンテキスト付きでタスクを実行します
 func (w *ContextWorker) executeTaskWithContext(ctx context.Context, task Task) TaskProcessingResult {
 	// 実際の処理をシミュレート
-	processingTime := time.Duration(rand.Intn(1000)+100) * time.Millisecond
+	processingTime := 100*time.Millisecond + rand.N(1000*time.Millisecond)
 
 	// 長時間処理をシミュレートするために、短い間隔でコンテキストをチェック
-	ticker := time.NewTicker(10 * time.Millisecond)
-	defer ticker.Stop()
+	tick := time.Tick(10 * time.Millisecond)
 
 	startTime := time.Now()
 
@@ -370,7 +362,7 @@ func (w *ContextWorker) executeTaskWithContext(ctx context.Context, task Task) T
 				Success: false,
 				Error:   ctx.Err(),
 			}
-		case <-ticker.C:
+		case <-tick:
 			if time.Since(startTime) >= processingTime {
 				// 処理完了
 				// ランダムにエラーを発生（10%の確率）
@@ -390,9 +382,9 @@ func (w *ContextWorker) executeTaskWithContext(ctx context.Context, task Task) T
 	}
 }
 
-// SubmitTaskはタスクをキューに追加します
+// SubmitTask タスクをキューに追加します
 func (c *ContextControlController) SubmitTask(task Task) error {
-	if atomic.LoadInt32(&c.isRunning) == 0 {
+	if !c.isRunning.Load() {
 		return fmt.Errorf("controller is not running")
 	}
 
@@ -400,13 +392,17 @@ func (c *ContextControlController) SubmitTask(task Task) error {
 	if task.CreatedAt.IsZero() {
 		task.CreatedAt = time.Now()
 	}
-	if task.Timeout == 0 {
-		task.Timeout = c.defaultTimeout
+	task.Timeout = cmp.Or(task.Timeout, c.defaultTimeout)
+
+	// 停止後の投入を拒否する。taskQueueはcloseせず、読む側はrootCtxのキャンセルで止める
+	// （closeするとこの送信と競合してpanic: send on closed channelになる）。
+	if c.rootCtx.Err() != nil {
+		return fmt.Errorf("controller is shutting down")
 	}
 
 	select {
 	case c.taskQueue <- task:
-		atomic.AddInt64(&c.stats.totalSubmitted, 1)
+		c.stats.totalSubmitted.Add(1)
 		return nil
 	case <-c.rootCtx.Done():
 		return fmt.Errorf("controller is shutting down")
@@ -415,24 +411,26 @@ func (c *ContextControlController) SubmitTask(task Task) error {
 	}
 }
 
-// SubmitTaskWithTimeoutはタイムアウト付きでタスクを追加します
+// SubmitTaskWithTimeout タイムアウト付きでタスクを追加します
 func (c *ContextControlController) SubmitTaskWithTimeout(task Task, submitTimeout time.Duration) error {
+	if c.rootCtx.Err() != nil {
+		return fmt.Errorf("controller is shutting down")
+	}
+
 	ctx, cancel := context.WithTimeout(c.rootCtx, submitTimeout)
 	defer cancel()
 
 	select {
 	case c.taskQueue <- task:
-		atomic.AddInt64(&c.stats.totalSubmitted, 1)
+		c.stats.totalSubmitted.Add(1)
 		return nil
 	case <-ctx.Done():
-		return fmt.Errorf("submit timeout: %v", ctx.Err())
+		return fmt.Errorf("submit timeout: %w", ctx.Err())
 	}
 }
 
-// handleResultsは結果を処理します
+// handleResults 結果を処理します
 func (c *ContextControlController) handleResults() {
-	defer c.wg.Done()
-
 	log.Println("Result handler started")
 
 	for {
@@ -447,23 +445,23 @@ func (c *ContextControlController) handleResults() {
 			}
 
 			// 統計更新
-			atomic.AddInt64(&c.stats.totalCompleted, 1)
+			c.stats.totalCompleted.Add(1)
 
 			if result.Success {
-				atomic.AddInt64(&c.stats.totalSuccess, 1)
+				c.stats.totalSuccess.Add(1)
 			} else {
 				switch result.ContextType {
 				case ContextTypeTimeout:
-					atomic.AddInt64(&c.stats.totalTimeouts, 1)
+					c.stats.totalTimeouts.Add(1)
 				case ContextTypeCancel:
-					atomic.AddInt64(&c.stats.totalCancellations, 1)
+					c.stats.totalCancellations.Add(1)
 				default:
-					atomic.AddInt64(&c.stats.totalErrors, 1)
+					c.stats.totalErrors.Add(1)
 				}
 			}
 
 			// 平均処理時間を更新
-			completed := atomic.LoadInt64(&c.stats.totalCompleted)
+			completed := c.stats.totalCompleted.Load()
 			if completed > 0 {
 				c.stats.mu.Lock()
 				c.stats.averageProcessTime = time.Duration(
@@ -483,21 +481,21 @@ func (c *ContextControlController) handleResults() {
 	}
 }
 
-// registerTaskはタスクのタイムアウトを登録します
+// registerTask タスクのタイムアウトを登録します
 func (tm *TimeoutManager) registerTask(taskID int64, cancel context.CancelFunc) {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 	tm.activeTimeouts[taskID] = cancel
 }
 
-// unregisterTaskはタスクのタイムアウトを登録解除します
+// unregisterTask タスクのタイムアウトを登録解除します
 func (tm *TimeoutManager) unregisterTask(taskID int64) {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 	delete(tm.activeTimeouts, taskID)
 }
 
-// cancelTaskはタスクをキャンセルします
+// cancelTask タスクをキャンセルします
 func (tm *TimeoutManager) cancelTask(taskID int64) bool {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
@@ -510,28 +508,29 @@ func (tm *TimeoutManager) cancelTask(taskID int64) bool {
 	return false
 }
 
-// cleanupは期限切れタイムアウトを清理します
-func (tm *TimeoutManager) cleanup() {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
+// cleanup 期限切れタイムアウトを後片付けします。ctxがキャンセルされたら終了します。
+func (tm *TimeoutManager) cleanup(ctx context.Context) {
+	tick := time.Tick(30 * time.Second)
 
-	for range ticker.C {
-		tm.mu.Lock()
-		activeCount := len(tm.activeTimeouts)
-		tm.mu.Unlock()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick:
+			tm.mu.Lock()
+			activeCount := len(tm.activeTimeouts)
+			tm.mu.Unlock()
 
-		if activeCount > 0 {
-			log.Printf("TimeoutManager: %d active timeouts", activeCount)
+			if activeCount > 0 {
+				log.Printf("TimeoutManager: %d active timeouts", activeCount)
+			}
 		}
 	}
 }
 
-// monitorMetricsはメトリクスを監視します
+// monitorMetrics メトリクスを監視します
 func (c *ContextControlController) monitorMetrics() {
-	defer c.wg.Done()
-
-	ticker := time.NewTicker(15 * time.Second)
-	defer ticker.Stop()
+	tick := time.Tick(15 * time.Second)
 
 	log.Println("Metrics monitor started")
 
@@ -540,23 +539,23 @@ func (c *ContextControlController) monitorMetrics() {
 		case <-c.rootCtx.Done():
 			log.Println("Metrics monitor stopping")
 			return
-		case <-ticker.C:
+		case <-tick:
 			c.reportMetrics()
 		}
 	}
 }
 
-// reportMetricsはメトリクスを報告します
+// reportMetrics メトリクスを報告します
 func (c *ContextControlController) reportMetrics() {
 	c.stats.mu.RLock()
 	defer c.stats.mu.RUnlock()
 
-	submitted := atomic.LoadInt64(&c.stats.totalSubmitted)
-	completed := atomic.LoadInt64(&c.stats.totalCompleted)
-	success := atomic.LoadInt64(&c.stats.totalSuccess)
-	errors := atomic.LoadInt64(&c.stats.totalErrors)
-	timeouts := atomic.LoadInt64(&c.stats.totalTimeouts)
-	cancellations := atomic.LoadInt64(&c.stats.totalCancellations)
+	submitted := c.stats.totalSubmitted.Load()
+	completed := c.stats.totalCompleted.Load()
+	success := c.stats.totalSuccess.Load()
+	errorCount := c.stats.totalErrors.Load()
+	timeouts := c.stats.totalTimeouts.Load()
+	cancellations := c.stats.totalCancellations.Load()
 
 	var successRate float64
 	if completed > 0 {
@@ -570,32 +569,32 @@ func (c *ContextControlController) reportMetrics() {
 	}
 
 	log.Printf("Controller Metrics: Submitted=%d, Completed=%d, Success=%.1f%%, Errors=%d, Timeouts=%d, Cancellations=%d",
-		submitted, completed, successRate, errors, timeouts, cancellations)
+		submitted, completed, successRate, errorCount, timeouts, cancellations)
 	log.Printf("Performance: AvgTime=%v, Throughput=%.2f tasks/sec, Uptime=%v",
 		c.stats.averageProcessTime, throughput, uptime)
 
 	// ワーカー別統計
 	for _, worker := range c.workers {
-		processed := atomic.LoadInt64(&worker.stats.TasksProcessed)
-		success := atomic.LoadInt64(&worker.stats.TasksSuccess)
-		errors := atomic.LoadInt64(&worker.stats.TasksError)
-		timeouts := atomic.LoadInt64(&worker.stats.TasksTimeout)
-		cancelled := atomic.LoadInt64(&worker.stats.TasksCancelled)
+		processed := worker.stats.TasksProcessed.Load()
+		success := worker.stats.TasksSuccess.Load()
+		errs := worker.stats.TasksError.Load()
+		timeouts := worker.stats.TasksTimeout.Load()
+		cancelled := worker.stats.TasksCancelled.Load()
 
 		if processed > 0 {
 			successRate := float64(success) / float64(processed) * 100
 			log.Printf("Worker %d: Processed=%d, Success=%.1f%%, Errors=%d, Timeouts=%d, Cancelled=%d, AvgTime=%v",
-				worker.ID, processed, successRate, errors, timeouts, cancelled, worker.stats.AverageProcessTime)
+				worker.ID, processed, successRate, errs, timeouts, cancelled, worker.stats.AverageProcessTime())
 		}
 	}
 }
 
-// CancelTaskはタスクをキャンセルします
+// CancelTask タスクをキャンセルします
 func (c *ContextControlController) CancelTask(taskID int64) bool {
 	return c.timeoutManager.cancelTask(taskID)
 }
 
-// GetCurrentTasksは現在実行中のタスクを取得します
+// GetCurrentTasks 現在実行中のタスクを取得します
 func (c *ContextControlController) GetCurrentTasks() map[int]*Task {
 	result := make(map[int]*Task)
 
@@ -611,25 +610,21 @@ func (c *ContextControlController) GetCurrentTasks() map[int]*Task {
 	return result
 }
 
-// Shutdownはコントローラーを停止します
+// Shutdown コントローラーを停止します
 func (c *ContextControlController) Shutdown(timeout time.Duration) error {
-	if !atomic.CompareAndSwapInt32(&c.isRunning, 1, 0) {
+	if !c.isRunning.CompareAndSwap(true, false) {
 		return fmt.Errorf("controller is not running")
 	}
 
 	log.Println("Shutting down context control controller...")
 
-	// 1. 新しいタスクの受付を停止
-	close(c.taskQueue)
+	// ワーカーに停止を指示する。taskQueueはcloseしない
+	// （SubmitTask/SubmitTaskWithTimeoutとの競合でpanic: send on closed channelになるため）。
+	// rootCtxのキャンセルは実行中タスクの派生コンテキストにも伝播するので、
+	// 個別タスクのキャンセルは不要。
+	c.cancel()
 
-	// 2. 現在実行中のタスクをキャンセル
-	currentTasks := c.GetCurrentTasks()
-	for workerID, task := range currentTasks {
-		c.timeoutManager.cancelTask(task.ID)
-		log.Printf("Cancelled task %d on worker %d", task.ID, workerID)
-	}
-
-	// 3. ワーカーの終了を待機
+	// ワーカーの終了を待機
 	done := make(chan struct{})
 	go func() {
 		c.wg.Wait()
@@ -640,36 +635,28 @@ func (c *ContextControlController) Shutdown(timeout time.Duration) error {
 	case <-done:
 		log.Println("All workers stopped gracefully")
 	case <-time.After(timeout):
-		log.Println("Timeout reached, forcing shutdown...")
-		c.cancel()
-
-		// 追加の待機時間
-		select {
-		case <-done:
-			log.Println("Workers stopped after cancellation")
-		case <-time.After(2 * time.Second):
-			log.Println("Some workers may not have stopped properly")
-		}
+		// 送信側のgoroutineが残っている可能性があるので、チャネルは閉じずにエラーを返す
+		return fmt.Errorf("shutdown timeout: some workers may not have stopped")
 	}
 
-	// 4. チャネルを閉じる
+	// resultQueueへの送信元（ワーカー）はwg.Waitの完了で全て止まっているのでcloseしてよい
 	close(c.resultQueue)
 
 	log.Println("Context control controller shutdown completed")
 	return nil
 }
 
-// GetStatsは統計情報を取得します
-func (c *ContextControlController) GetStats() map[string]interface{} {
+// GetStats 統計情報を取得します
+func (c *ContextControlController) GetStats() map[string]any {
 	c.stats.mu.RLock()
 	defer c.stats.mu.RUnlock()
 
-	submitted := atomic.LoadInt64(&c.stats.totalSubmitted)
-	completed := atomic.LoadInt64(&c.stats.totalCompleted)
-	success := atomic.LoadInt64(&c.stats.totalSuccess)
-	errors := atomic.LoadInt64(&c.stats.totalErrors)
-	timeouts := atomic.LoadInt64(&c.stats.totalTimeouts)
-	cancellations := atomic.LoadInt64(&c.stats.totalCancellations)
+	submitted := c.stats.totalSubmitted.Load()
+	completed := c.stats.totalCompleted.Load()
+	success := c.stats.totalSuccess.Load()
+	errorCount := c.stats.totalErrors.Load()
+	timeouts := c.stats.totalTimeouts.Load()
+	cancellations := c.stats.totalCancellations.Load()
 
 	uptime := time.Since(c.stats.startTime)
 	var throughput float64
@@ -677,23 +664,23 @@ func (c *ContextControlController) GetStats() map[string]interface{} {
 		throughput = float64(completed) / uptime.Seconds()
 	}
 
-	workerStats := make(map[string]interface{})
+	workerStats := make(map[string]any)
 	for id, stats := range c.stats.workerStats {
-		workerStats[fmt.Sprintf("worker_%d", id)] = map[string]interface{}{
-			"tasks_processed":      atomic.LoadInt64(&stats.TasksProcessed),
-			"tasks_success":        atomic.LoadInt64(&stats.TasksSuccess),
-			"tasks_error":          atomic.LoadInt64(&stats.TasksError),
-			"tasks_timeout":        atomic.LoadInt64(&stats.TasksTimeout),
-			"tasks_cancelled":      atomic.LoadInt64(&stats.TasksCancelled),
-			"average_process_time": stats.AverageProcessTime,
+		workerStats[fmt.Sprintf("worker_%d", id)] = map[string]any{
+			"tasks_processed":      stats.TasksProcessed.Load(),
+			"tasks_success":        stats.TasksSuccess.Load(),
+			"tasks_error":          stats.TasksError.Load(),
+			"tasks_timeout":        stats.TasksTimeout.Load(),
+			"tasks_cancelled":      stats.TasksCancelled.Load(),
+			"average_process_time": stats.AverageProcessTime(),
 		}
 	}
 
-	return map[string]interface{}{
+	return map[string]any{
 		"total_submitted":      submitted,
 		"total_completed":      completed,
 		"total_success":        success,
-		"total_errors":         errors,
+		"total_errors":         errorCount,
 		"total_timeouts":       timeouts,
 		"total_cancellations":  cancellations,
 		"average_process_time": c.stats.averageProcessTime,
@@ -720,7 +707,7 @@ func main() {
 
 	// テストタスクを並行で送信
 	go func() {
-		for i := 0; i < 500; i++ {
+		for i := range 500 {
 			// タスクタイプを変更してテスト
 			var timeout time.Duration
 			switch i % 4 {
@@ -738,9 +725,9 @@ func main() {
 				ID:       int64(i),
 				Name:     fmt.Sprintf("task_%d", i),
 				Data:     []byte(fmt.Sprintf("data_for_task_%d", i)),
-				Priority: rand.Intn(5),
+				Priority: rand.IntN(5),
 				Timeout:  timeout,
-				Metadata: map[string]interface{}{
+				Metadata: map[string]any{
 					"batch_id": i / 50,
 					"type":     "test",
 				},

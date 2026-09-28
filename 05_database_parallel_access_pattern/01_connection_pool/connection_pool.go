@@ -29,15 +29,17 @@ type Database struct {
 	db     *sql.DB
 	config *DBConfig
 	stats  *DatabaseStats
+	// lastPoolStats 前回の監視時点のDBStats。MonitorConnectionPoolのgoroutineだけが読み書きする
+	lastPoolStats sql.DBStats
 }
 
 // DatabaseStats データベース統計情報を管理します
 type DatabaseStats struct {
 	mu               sync.RWMutex
-	queryCount       int64
-	errorCount       int64
+	queryCount       atomic.Int64
+	errorCount       atomic.Int64
 	totalQueryTime   time.Duration
-	connectionErrors int64
+	connectionErrors atomic.Int64
 	lastHealthCheck  time.Time
 	avgResponseTime  time.Duration
 }
@@ -46,7 +48,7 @@ type DatabaseStats struct {
 func NewDatabase(config *DBConfig) (*Database, error) {
 	db, err := sql.Open("postgres", config.DSN)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open database: %v", err)
+		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
 
 	// コネクションプール設定
@@ -66,38 +68,7 @@ func NewDatabase(config *DBConfig) (*Database, error) {
 		if closeErr := db.Close(); closeErr != nil {
 			log.Printf("Failed to close database connection: %v", closeErr)
 		}
-		return nil, fmt.Errorf("initial connection test failed: %v", err)
-	}
-
-	return database, nil
-}
-
-// NewDatabaseSQLite SQLite用のデータベースインスタンスを作成（テスト用）
-func NewDatabaseSQLite(config *DBConfig) (*Database, error) {
-	// SQLiteの場合は "sqlite3" ドライバーを使用
-	db, err := sql.Open("sqlite3", config.DSN)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open database: %v", err)
-	}
-
-	// コネクションプール設定
-	db.SetMaxOpenConns(config.MaxOpenConns)
-	db.SetMaxIdleConns(config.MaxIdleConns)
-	db.SetConnMaxLifetime(config.ConnMaxLifetime)
-	db.SetConnMaxIdleTime(config.ConnMaxIdleTime)
-
-	database := &Database{
-		db:     db,
-		config: config,
-		stats:  &DatabaseStats{},
-	}
-
-	// 初期接続テスト
-	if err := database.ping(); err != nil {
-		if closeErr := db.Close(); closeErr != nil {
-			log.Printf("Failed to close database connection: %v", closeErr)
-		}
-		return nil, fmt.Errorf("initial connection test failed: %v", err)
+		return nil, fmt.Errorf("initial connection test failed: %w", err)
 	}
 
 	return database, nil
@@ -115,7 +86,7 @@ func (d *Database) ping() error {
 	d.stats.mu.Lock()
 	d.stats.lastHealthCheck = time.Now()
 	if err != nil {
-		atomic.AddInt64(&d.stats.connectionErrors, 1)
+		d.stats.connectionErrors.Add(1)
 	} else {
 		d.updateResponseTime(elapsed)
 	}
@@ -126,7 +97,7 @@ func (d *Database) ping() error {
 
 // updateResponseTime 平均応答時間を更新します
 func (d *Database) updateResponseTime(elapsed time.Duration) {
-	queryCount := atomic.LoadInt64(&d.stats.queryCount)
+	queryCount := d.stats.queryCount.Load()
 	if queryCount == 0 {
 		d.stats.avgResponseTime = elapsed
 	} else {
@@ -139,15 +110,14 @@ func (d *Database) updateResponseTime(elapsed time.Duration) {
 
 // MonitorConnectionPool 接続プールを監視します
 func (d *Database) MonitorConnectionPool(ctx context.Context) {
-	ticker := time.NewTicker(d.config.PingInterval)
-	defer ticker.Stop()
+	tick := time.Tick(d.config.PingInterval)
 
 	for {
 		select {
 		case <-ctx.Done():
 			log.Println("Connection pool monitor stopping")
 			return
-		case <-ticker.C:
+		case <-tick:
 			d.healthCheck()
 			d.logPoolStats()
 			d.adjustPoolIfNeeded()
@@ -177,14 +147,21 @@ func (d *Database) logPoolStats() {
 		dbStats.QueryCount, dbStats.ErrorCount, dbStats.AvgResponseTime, dbStats.ConnectionErrors)
 }
 
+// connWaitSince prevからcurまでに増えた接続待ちの回数と時間を返します
+func connWaitSince(prev, cur sql.DBStats) (int64, time.Duration) {
+	return cur.WaitCount - prev.WaitCount, cur.WaitDuration - prev.WaitDuration
+}
+
 // adjustPoolIfNeeded 必要に応じて接続プールを調整します
 func (d *Database) adjustPoolIfNeeded() {
 	stats := d.db.Stats()
 
-	// 待機が多い場合の警告
-	if stats.WaitCount > 0 && stats.WaitDuration > 100*time.Millisecond {
+	// WaitCountとWaitDurationは起動からの累計なので、前回の監視からの増分で判定する
+	waitCount, waitDuration := connWaitSince(d.lastPoolStats, stats)
+	d.lastPoolStats = stats
+	if waitCount > 0 && waitDuration > 100*time.Millisecond {
 		log.Printf("High connection wait detected: Count=%d, Duration=%v. Consider increasing MaxOpenConns",
-			stats.WaitCount, stats.WaitDuration)
+			waitCount, waitDuration)
 	}
 
 	// アイドル接続が多すぎる場合の警告
@@ -195,15 +172,15 @@ func (d *Database) adjustPoolIfNeeded() {
 }
 
 // Query クエリを実行し統計を記録します
-func (d *Database) Query(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error) {
+func (d *Database) Query(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
 	start := time.Now()
 	rows, err := d.db.QueryContext(ctx, query, args...)
 	elapsed := time.Since(start)
 
 	// 統計更新
-	atomic.AddInt64(&d.stats.queryCount, 1)
+	d.stats.queryCount.Add(1)
 	if err != nil {
-		atomic.AddInt64(&d.stats.errorCount, 1)
+		d.stats.errorCount.Add(1)
 	}
 
 	d.stats.mu.Lock()
@@ -215,13 +192,13 @@ func (d *Database) Query(ctx context.Context, query string, args ...interface{})
 }
 
 // QueryRow 単一行クエリを実行します
-func (d *Database) QueryRow(ctx context.Context, query string, args ...interface{}) *sql.Row {
+func (d *Database) QueryRow(ctx context.Context, query string, args ...any) *sql.Row {
 	start := time.Now()
 	row := d.db.QueryRowContext(ctx, query, args...)
 	elapsed := time.Since(start)
 
 	// 統計更新
-	atomic.AddInt64(&d.stats.queryCount, 1)
+	d.stats.queryCount.Add(1)
 
 	d.stats.mu.Lock()
 	d.updateResponseTime(elapsed)
@@ -232,15 +209,15 @@ func (d *Database) QueryRow(ctx context.Context, query string, args ...interface
 }
 
 // Exec クエリを実行します
-func (d *Database) Exec(ctx context.Context, query string, args ...interface{}) (sql.Result, error) {
+func (d *Database) Exec(ctx context.Context, query string, args ...any) (sql.Result, error) {
 	start := time.Now()
 	result, err := d.db.ExecContext(ctx, query, args...)
 	elapsed := time.Since(start)
 
 	// 統計更新
-	atomic.AddInt64(&d.stats.queryCount, 1)
+	d.stats.queryCount.Add(1)
 	if err != nil {
-		atomic.AddInt64(&d.stats.errorCount, 1)
+		d.stats.errorCount.Add(1)
 	}
 
 	d.stats.mu.Lock()
@@ -262,10 +239,10 @@ func (d *Database) GetStats() DatabaseStatsSnapshot {
 	defer d.stats.mu.RUnlock()
 
 	return DatabaseStatsSnapshot{
-		QueryCount:       atomic.LoadInt64(&d.stats.queryCount),
-		ErrorCount:       atomic.LoadInt64(&d.stats.errorCount),
+		QueryCount:       d.stats.queryCount.Load(),
+		ErrorCount:       d.stats.errorCount.Load(),
 		TotalQueryTime:   d.stats.totalQueryTime,
-		ConnectionErrors: atomic.LoadInt64(&d.stats.connectionErrors),
+		ConnectionErrors: d.stats.connectionErrors.Load(),
 		LastHealthCheck:  d.stats.lastHealthCheck,
 		AvgResponseTime:  d.stats.avgResponseTime,
 	}
@@ -336,12 +313,9 @@ func testConnectionPool(db *Database) {
 
 	// 並行クエリの実行
 	var wg sync.WaitGroup
-	for i := 0; i < 10; i++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-
-			for j := 0; j < 5; j++ {
+	for i := range 10 {
+		wg.Go(func() {
+			for j := range 5 {
 				// 商品情報の取得
 				rows, err := db.Query(ctx, "SELECT id, name, price FROM products LIMIT 10")
 				if err != nil {
@@ -363,10 +337,10 @@ func testConnectionPool(db *Database) {
 					log.Printf("Failed to close rows: %v", err)
 				}
 
-				log.Printf("Worker %d: Query %d completed, got %d rows", id, j+1, count)
+				log.Printf("Worker %d: Query %d completed, got %d rows", i, j+1, count)
 				time.Sleep(100 * time.Millisecond)
 			}
-		}(i)
+		})
 	}
 
 	wg.Wait()

@@ -5,13 +5,15 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/lib/pq"
+	_ "github.com/lib/pq"
 )
 
 // BatchConfig バッチ処理設定です
@@ -48,10 +50,10 @@ type BatchProcessor struct {
 // BatchStats バッチ処理統計です
 type BatchStats struct {
 	mu               sync.RWMutex
-	totalBatches     int64
-	completedBatches int64
-	failedBatches    int64
-	totalRetries     int64
+	totalBatches     atomic.Int64
+	completedBatches atomic.Int64
+	failedBatches    atomic.Int64
+	totalRetries     atomic.Int64
 	avgBatchTime     time.Duration
 	maxBatchTime     time.Duration
 	minBatchTime     time.Duration
@@ -129,31 +131,28 @@ func (bp *BatchProcessor) ProcessBatch(ctx context.Context, records []Record,
 	// 並行処理制御用のセマフォ
 	semaphore := make(chan struct{}, bp.config.Concurrency)
 	var wg sync.WaitGroup
-	errors := make(chan error, len(chunks))
+	errCh := make(chan error, len(chunks))
 
 	// 各チャンクを並行処理
 	for i, chunk := range chunks {
-		wg.Add(1)
-		go func(chunkIndex int, chunkData []Record) {
-			defer wg.Done()
-
+		wg.Go(func() {
 			// セマフォで並行数制御
 			semaphore <- struct{}{}
 			defer func() { <-semaphore }()
 
-			if err := bp.processChunk(ctx, chunkIndex, chunkData, processFn); err != nil {
-				errors <- fmt.Errorf("chunk %d failed: %v", chunkIndex, err)
+			if err := bp.processChunk(ctx, i, chunk, processFn); err != nil {
+				errCh <- fmt.Errorf("chunk %d failed: %w", i, err)
 			}
-		}(i, chunk)
+		})
 	}
 
 	// 全チャンク完了を待機
 	wg.Wait()
-	close(errors)
+	close(errCh)
 
 	// エラー収集
 	var allErrors []error
-	for err := range errors {
+	for err := range errCh {
 		allErrors = append(allErrors, err)
 	}
 
@@ -161,7 +160,7 @@ func (bp *BatchProcessor) ProcessBatch(ctx context.Context, records []Record,
 	bp.updateFinalStats()
 
 	if len(allErrors) > 0 {
-		return fmt.Errorf("batch processing completed with %d errors: %v", len(allErrors), allErrors)
+		return fmt.Errorf("batch processing completed with %d errors: %w", len(allErrors), errors.Join(allErrors...))
 	}
 
 	log.Printf("Batch processing completed successfully: %d records processed", len(records))
@@ -170,18 +169,7 @@ func (bp *BatchProcessor) ProcessBatch(ctx context.Context, records []Record,
 
 // createChunks レコードをチャンクに分割します
 func (bp *BatchProcessor) createChunks(records []Record) [][]Record {
-	chunks := make([][]Record, 0)
-	chunkSize := bp.config.ChunkSize
-
-	for i := 0; i < len(records); i += chunkSize {
-		end := i + chunkSize
-		if end > len(records) {
-			end = len(records)
-		}
-		chunks = append(chunks, records[i:end])
-	}
-
-	return chunks
+	return slices.Collect(slices.Chunk(records, bp.config.ChunkSize))
 }
 
 // processChunk 単一チャンクを処理します
@@ -189,7 +177,7 @@ func (bp *BatchProcessor) processChunk(ctx context.Context, chunkIndex int, chun
 	processFn func(context.Context, *sql.Tx, []Record) error) error {
 
 	start := time.Now()
-	atomic.AddInt64(&bp.stats.totalBatches, 1)
+	bp.stats.totalBatches.Add(1)
 
 	// タイムアウト設定
 	chunkCtx := ctx
@@ -214,9 +202,9 @@ func (bp *BatchProcessor) executeWithRetry(ctx context.Context, chunkIndex int, 
 
 	var lastErr error
 
-	for attempt := 0; attempt <= bp.config.RetryAttempts; attempt++ {
+	for attempt := range bp.config.RetryAttempts + 1 {
 		if attempt > 0 {
-			atomic.AddInt64(&bp.stats.totalRetries, 1)
+			bp.stats.totalRetries.Add(1)
 			log.Printf("Retrying chunk %d (attempt %d/%d)", chunkIndex, attempt+1, bp.config.RetryAttempts+1)
 
 			// リトライ前の待機
@@ -239,7 +227,7 @@ func (bp *BatchProcessor) executeWithRetry(ctx context.Context, chunkIndex int, 
 
 	// 全試行失敗
 	bp.updateProgress(0, int64(len(chunk)))
-	return fmt.Errorf("chunk %d failed after %d attempts: %v", chunkIndex, bp.config.RetryAttempts+1, lastErr)
+	return fmt.Errorf("chunk %d failed after %d attempts: %w", chunkIndex, bp.config.RetryAttempts+1, lastErr)
 }
 
 // executeSingleChunk 単一チャンクを実行します
@@ -250,12 +238,12 @@ func (bp *BatchProcessor) executeSingleChunk(ctx context.Context, _ int, chunk [
 		Isolation: sql.LevelReadCommitted,
 	})
 	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %v", err)
+		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
 
 	defer func() {
 		if r := recover(); r != nil {
-			if err := tx.Rollback(); err != nil {
+			if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
 				log.Printf("Failed to rollback transaction during panic: %v", err)
 			}
 			panic(r)
@@ -265,16 +253,16 @@ func (bp *BatchProcessor) executeSingleChunk(ctx context.Context, _ int, chunk [
 	// バリデーション実行
 	for _, record := range chunk {
 		if err := record.Validate(); err != nil {
-			if rollbackErr := tx.Rollback(); rollbackErr != nil {
+			if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
 				log.Printf("Failed to rollback transaction: %v", rollbackErr)
 			}
-			return fmt.Errorf("validation failed for record %d: %v", record.GetID(), err)
+			return fmt.Errorf("validation failed for record %d: %w", record.GetID(), err)
 		}
 	}
 
 	// 処理関数実行
 	if err := processFn(ctx, tx, chunk); err != nil {
-		if rollbackErr := tx.Rollback(); rollbackErr != nil {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
 			log.Printf("Failed to rollback transaction: %v", rollbackErr)
 		}
 		return err
@@ -282,7 +270,7 @@ func (bp *BatchProcessor) executeSingleChunk(ctx context.Context, _ int, chunk [
 
 	// コミット
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %v", err)
+		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
 	return nil
@@ -318,21 +306,17 @@ func (bp *BatchProcessor) updateBatchStats(elapsed time.Duration, success bool) 
 	defer bp.stats.mu.Unlock()
 
 	if success {
-		atomic.AddInt64(&bp.stats.completedBatches, 1)
+		bp.stats.completedBatches.Add(1)
 	} else {
-		atomic.AddInt64(&bp.stats.failedBatches, 1)
+		bp.stats.failedBatches.Add(1)
 	}
 
 	// 実行時間統計更新
-	if elapsed > bp.stats.maxBatchTime {
-		bp.stats.maxBatchTime = elapsed
-	}
-	if elapsed < bp.stats.minBatchTime {
-		bp.stats.minBatchTime = elapsed
-	}
+	bp.stats.maxBatchTime = max(bp.stats.maxBatchTime, elapsed)
+	bp.stats.minBatchTime = min(bp.stats.minBatchTime, elapsed)
 
 	// 平均時間更新
-	totalBatches := atomic.LoadInt64(&bp.stats.totalBatches)
+	totalBatches := bp.stats.totalBatches.Load()
 	if totalBatches == 1 {
 		bp.stats.avgBatchTime = elapsed
 	} else {
@@ -352,14 +336,13 @@ func (bp *BatchProcessor) updateFinalStats() {
 
 // monitorProgress 進捗を監視します
 func (bp *BatchProcessor) monitorProgress(ctx context.Context) {
-	ticker := time.NewTicker(bp.config.ProgressInterval)
-	defer ticker.Stop()
+	tick := time.Tick(bp.config.ProgressInterval)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-tick:
 			bp.logProgress()
 		}
 	}
@@ -420,10 +403,10 @@ func (bp *BatchProcessor) GetStats() BatchStatsSnapshot {
 	defer bp.stats.mu.RUnlock()
 
 	return BatchStatsSnapshot{
-		TotalBatches:     atomic.LoadInt64(&bp.stats.totalBatches),
-		CompletedBatches: atomic.LoadInt64(&bp.stats.completedBatches),
-		FailedBatches:    atomic.LoadInt64(&bp.stats.failedBatches),
-		TotalRetries:     atomic.LoadInt64(&bp.stats.totalRetries),
+		TotalBatches:     bp.stats.totalBatches.Load(),
+		CompletedBatches: bp.stats.completedBatches.Load(),
+		FailedBatches:    bp.stats.failedBatches.Load(),
+		TotalRetries:     bp.stats.totalRetries.Load(),
 		AvgBatchTime:     bp.stats.avgBatchTime,
 		MaxBatchTime:     bp.stats.maxBatchTime,
 		MinBatchTime:     bp.stats.minBatchTime,
@@ -453,48 +436,58 @@ func NewBulkInsertProcessor(db *sql.DB) *BulkInsertProcessor {
 
 // BulkInsertProducts 商品を一括挿入します
 func (bip *BulkInsertProcessor) BulkInsertProducts(ctx context.Context, products []*ProductRecord) error {
+	// COPY を途中で放棄すると lib/pq の受信 goroutine と Rollback が同じ接続を読み合うため、
+	// 検証は COPY を始める前に済ませる
+	for _, product := range products {
+		if err := product.Validate(); err != nil {
+			return fmt.Errorf("validation failed for product %s: %w", product.Name, err)
+		}
+	}
+
 	tx, err := bip.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %v", err)
+		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer func() {
-		if err := tx.Rollback(); err != nil {
+		if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
 			log.Printf("Failed to rollback transaction: %v", err)
 		}
 	}()
 
 	// COPY文用のステートメント準備
-	stmt, err := tx.PrepareContext(ctx, pq.CopyIn("products", "name", "price", "category_id"))
+	stmt, err := tx.PrepareContext(ctx, "COPY products (name, price, category_id) FROM STDIN")
 	if err != nil {
-		return fmt.Errorf("failed to prepare copy statement: %v", err)
+		return fmt.Errorf("failed to prepare copy statement: %w", err)
 	}
+	// 途中で失敗したときも Rollback より先に COPY を終わらせる（defer は後入れ先出し）
+	defer func() {
+		if err := stmt.Close(); err != nil {
+			log.Printf("Failed to close copy statement: %v", err)
+		}
+	}()
 
 	// データを一括挿入
 	for _, product := range products {
-		if err := product.Validate(); err != nil {
-			return fmt.Errorf("validation failed for product %s: %v", product.Name, err)
-		}
-
 		_, err = stmt.ExecContext(ctx, product.Name, product.Price, product.CategoryID)
 		if err != nil {
-			return fmt.Errorf("failed to add product to batch: %v", err)
+			return fmt.Errorf("failed to add product to batch: %w", err)
 		}
 	}
 
 	// COPY実行
 	_, err = stmt.ExecContext(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to execute bulk insert: %v", err)
+		return fmt.Errorf("failed to execute bulk insert: %w", err)
 	}
 
 	// ステートメントクローズ
 	if err = stmt.Close(); err != nil {
-		return fmt.Errorf("failed to close statement: %v", err)
+		return fmt.Errorf("failed to close statement: %w", err)
 	}
 
 	// コミット
 	if err = tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %v", err)
+		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
 	log.Printf("Successfully bulk inserted %d products", len(products))
@@ -562,7 +555,7 @@ func generateTestRecords(count int) []Record {
 	records := make([]Record, count)
 	categories := []int64{1, 2, 3, 4, 5}
 
-	for i := 0; i < count; i++ {
+	for i := range count {
 		records[i] = &ProductRecord{
 			ID:         int64(i + 1),
 			Name:       fmt.Sprintf("Test Product %d", i+1),
@@ -587,7 +580,7 @@ func processProducts(ctx context.Context, tx *sql.Tx, records []Record) error {
 			"UPDATE products SET price = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
 			newPrice, product.ID)
 		if err != nil {
-			return fmt.Errorf("failed to update product %d: %v", product.ID, err)
+			return fmt.Errorf("failed to update product %d: %w", product.ID, err)
 		}
 	}
 

@@ -21,9 +21,9 @@ type TaskQueueSystem struct {
 	tasks          chan Task
 	maxQueueSize   int
 	maxWorkers     int
-	currentWorkers int64
-	processedCount int64
-	droppedCount   int64
+	currentWorkers atomic.Int64
+	processedCount atomic.Int64
+	droppedCount   atomic.Int64
 	mu             sync.RWMutex
 	workerWG       sync.WaitGroup
 	shutdownChan   chan struct{}
@@ -43,9 +43,8 @@ func NewTaskQueueSystem(maxQueueSize, maxWorkers int) *TaskQueueSystem {
 // Start システムを開始します
 func (tqs *TaskQueueSystem) Start(ctx context.Context) {
 	// ワーカーを開始
-	for i := 0; i < tqs.maxWorkers; i++ {
-		tqs.workerWG.Add(1)
-		go tqs.worker(ctx, i)
+	for i := range tqs.maxWorkers {
+		tqs.workerWG.Go(func() { tqs.worker(ctx, i) })
 	}
 
 	// 統計情報を定期的に出力
@@ -54,9 +53,8 @@ func (tqs *TaskQueueSystem) Start(ctx context.Context) {
 
 // worker タスクを処理するワーカーです
 func (tqs *TaskQueueSystem) worker(ctx context.Context, workerID int) {
-	defer tqs.workerWG.Done()
-	atomic.AddInt64(&tqs.currentWorkers, 1)
-	defer atomic.AddInt64(&tqs.currentWorkers, -1)
+	tqs.currentWorkers.Add(1)
+	defer tqs.currentWorkers.Add(-1)
 
 	fmt.Printf("Worker %d started\n", workerID)
 
@@ -65,10 +63,8 @@ func (tqs *TaskQueueSystem) worker(ctx context.Context, workerID int) {
 		case <-ctx.Done():
 			fmt.Printf("Worker %d stopping due to context cancellation\n", workerID)
 			return
-		case <-tqs.shutdownChan:
-			fmt.Printf("Worker %d stopping due to shutdown\n", workerID)
-			return
 		case task, ok := <-tqs.tasks:
+			// Shutdown tasksを閉じるだけなので、キューに残ったタスクを処理し終えてから抜ける
 			if !ok {
 				fmt.Printf("Worker %d stopping due to closed channel\n", workerID)
 				return
@@ -81,18 +77,18 @@ func (tqs *TaskQueueSystem) worker(ctx context.Context, workerID int) {
 				fmt.Printf("Worker %d: Task %d completed\n", workerID, task.ID)
 			}
 
-			atomic.AddInt64(&tqs.processedCount, 1)
+			tqs.processedCount.Add(1)
 		}
 	}
 }
 
 // SubmitTask タスクをキューに追加します
 func (tqs *TaskQueueSystem) SubmitTask(task Task) error {
+	// 送信が終わるまで読み取りロックを持ち、Shutdownのclose(tasks)と重ならないようにする
 	tqs.mu.RLock()
-	isShuttingDown := tqs.isShuttingDown
-	tqs.mu.RUnlock()
+	defer tqs.mu.RUnlock()
 
-	if isShuttingDown {
+	if tqs.isShuttingDown {
 		return fmt.Errorf("system is shutting down")
 	}
 
@@ -103,7 +99,7 @@ func (tqs *TaskQueueSystem) SubmitTask(task Task) error {
 		// キューが満杯の場合、古いタスクを破棄
 		select {
 		case <-tqs.tasks:
-			atomic.AddInt64(&tqs.droppedCount, 1)
+			tqs.droppedCount.Add(1)
 			fmt.Printf("Dropped old task to make room for task %d\n", task.ID)
 		default:
 		}
@@ -113,7 +109,7 @@ func (tqs *TaskQueueSystem) SubmitTask(task Task) error {
 		case tqs.tasks <- task:
 			return nil
 		default:
-			atomic.AddInt64(&tqs.droppedCount, 1)
+			tqs.droppedCount.Add(1)
 			return fmt.Errorf("failed to submit task %d: queue is full", task.ID)
 		}
 	}
@@ -127,15 +123,12 @@ func (tqs *TaskQueueSystem) Shutdown(timeout time.Duration) error {
 		return fmt.Errorf("already shutting down")
 	}
 	tqs.isShuttingDown = true
+	// 新しいタスクの受付を停止する。書き込みロック中なのでSubmitTaskの送信とは重ならない
+	close(tqs.tasks)
 	tqs.mu.Unlock()
 
 	fmt.Println("Starting graceful shutdown...")
-
-	// 新しいタスクの受付を停止
 	close(tqs.shutdownChan)
-
-	// タスクチャンネルを閉じる
-	close(tqs.tasks)
 
 	// ワーカーの完了を待機（タイムアウト付き）
 	done := make(chan struct{})
@@ -155,9 +148,9 @@ func (tqs *TaskQueueSystem) Shutdown(timeout time.Duration) error {
 
 // GetStats 統計情報を取得します
 func (tqs *TaskQueueSystem) GetStats() (int64, int64, int64, int) {
-	processed := atomic.LoadInt64(&tqs.processedCount)
-	dropped := atomic.LoadInt64(&tqs.droppedCount)
-	workers := atomic.LoadInt64(&tqs.currentWorkers)
+	processed := tqs.processedCount.Load()
+	dropped := tqs.droppedCount.Load()
+	workers := tqs.currentWorkers.Load()
 	queueLength := len(tqs.tasks)
 
 	return processed, dropped, workers, queueLength
@@ -165,8 +158,7 @@ func (tqs *TaskQueueSystem) GetStats() (int64, int64, int64, int) {
 
 // statsReporter 統計情報を定期的に出力します
 func (tqs *TaskQueueSystem) statsReporter(ctx context.Context) {
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
+	tick := time.Tick(2 * time.Second)
 
 	for {
 		select {
@@ -174,7 +166,7 @@ func (tqs *TaskQueueSystem) statsReporter(ctx context.Context) {
 			return
 		case <-tqs.shutdownChan:
 			return
-		case <-ticker.C:
+		case <-tick:
 			processed, dropped, workers, queueLength := tqs.GetStats()
 			fmt.Printf("Stats: Processed=%d, Dropped=%d, Workers=%d, Queue=%d\n",
 				processed, dropped, workers, queueLength)
@@ -194,14 +186,14 @@ func main() {
 
 	// タスクを生成して送信
 	go func() {
-		for i := 1; i <= 20; i++ {
-			taskID := i
+		for i := range 20 {
+			taskID := i + 1
 			task := Task{
 				ID:        taskID,
 				CreatedAt: time.Now(),
 				Execute: func() error {
 					// 処理時間をシミュレート
-					time.Sleep(time.Duration(500) * time.Millisecond)
+					time.Sleep(500 * time.Millisecond)
 
 					// 10%の確率でエラーを発生
 					if taskID%10 == 0 {

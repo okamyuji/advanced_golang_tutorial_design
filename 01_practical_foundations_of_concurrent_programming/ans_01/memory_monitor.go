@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// MemoryMonitorはメモリとGoroutineの監視を行います
+// MemoryMonitor メモリとGoroutineの監視を行います
 type MemoryMonitor struct {
 	mu                      sync.RWMutex
 	previousMemoryMB        float64
@@ -19,7 +19,7 @@ type MemoryMonitor struct {
 	memoryIncreaseThreshold float64
 }
 
-// AlertInfoはアラート情報を格納します
+// AlertInfo アラート情報を格納します
 type AlertInfo struct {
 	Timestamp     time.Time
 	Type          string
@@ -28,7 +28,7 @@ type AlertInfo struct {
 	PreviousValue float64
 }
 
-// NewMemoryMonitorは新しいメモリモニターを作成します
+// NewMemoryMonitor 新しいメモリモニターを作成します
 func NewMemoryMonitor(maxGoroutines int, memoryIncreaseThreshold float64) *MemoryMonitor {
 	return &MemoryMonitor{
 		maxGoroutines:           maxGoroutines,
@@ -39,17 +39,16 @@ func NewMemoryMonitor(maxGoroutines int, memoryIncreaseThreshold float64) *Memor
 	}
 }
 
-// SetAlertCallbackはアラートコールバック関数を設定します
+// SetAlertCallback アラートコールバック関数を設定します
 func (mm *MemoryMonitor) SetAlertCallback(callback func(string)) {
 	mm.mu.Lock()
 	defer mm.mu.Unlock()
 	mm.alertCallback = callback
 }
 
-// Startは監視を開始します
+// Start 監視を開始します
 func (mm *MemoryMonitor) Start(ctx context.Context, interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	tick := time.Tick(interval)
 
 	// 初期値を設定
 	mm.updateMetrics()
@@ -59,13 +58,13 @@ func (mm *MemoryMonitor) Start(ctx context.Context, interval time.Duration) {
 		case <-ctx.Done():
 			fmt.Println("Memory monitor stopping")
 			return
-		case <-ticker.C:
+		case <-tick:
 			mm.checkAndAlert()
 		}
 	}
 }
 
-// updateMetricsはメトリクスを更新します
+// updateMetrics メトリクスを更新します
 func (mm *MemoryMonitor) updateMetrics() {
 	var memStats runtime.MemStats
 	runtime.ReadMemStats(&memStats)
@@ -77,7 +76,7 @@ func (mm *MemoryMonitor) updateMetrics() {
 	mm.previousGoroutines = runtime.NumGoroutine()
 }
 
-// checkAndAlertはメトリクスをチェックしてアラートを発行します
+// checkAndAlert メトリクスをチェックしてアラートを発行します
 func (mm *MemoryMonitor) checkAndAlert() {
 	var memStats runtime.MemStats
 	runtime.ReadMemStats(&memStats)
@@ -117,7 +116,7 @@ func (mm *MemoryMonitor) checkAndAlert() {
 	mm.mu.Unlock()
 }
 
-// GetCurrentMetricsは現在のメトリクスを取得します
+// GetCurrentMetrics 現在のメトリクスを取得します
 func (mm *MemoryMonitor) GetCurrentMetrics() (int, float64) {
 	var memStats runtime.MemStats
 	runtime.ReadMemStats(&memStats)
@@ -152,7 +151,7 @@ func main() {
 		time.Sleep(3 * time.Second)
 		fmt.Println("Creating many goroutines...")
 
-		for i := 0; i < 150; i++ {
+		for range 150 {
 			go func() {
 				time.Sleep(10 * time.Second)
 			}()

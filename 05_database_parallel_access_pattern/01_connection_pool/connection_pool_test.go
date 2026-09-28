@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"sync"
 	"testing"
@@ -14,7 +13,7 @@ import (
 
 // setupTestDB テスト用のPostgreSQLコンテナを起動し、初期化されたDatabaseを返す
 func setupTestDB(t *testing.T) (*Database, func()) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// PostgreSQLコンテナを起動
 	pgContainer, err := postgres.Run(ctx,
@@ -81,11 +80,12 @@ func setupTestDB(t *testing.T) (*Database, func()) {
 		t.Fatalf("Failed to create test table: %v", err)
 	}
 
-	// テストデータ挿入
-	for i := 1; i <= 10; i++ {
+	// テストデータ挿入（ID 1〜10）
+	for i := range 10 {
+		n := i + 1
 		_, err = db.Exec(ctx,
 			"INSERT INTO products (name, price) VALUES ($1, $2)",
-			fmt.Sprintf("Product %d", i), float64(i)*10.5)
+			fmt.Sprintf("Product %d", n), float64(n)*10.5)
 		if err != nil {
 			if closeErr := db.Close(); closeErr != nil {
 				t.Logf("Failed to close database: %v", closeErr)
@@ -131,7 +131,7 @@ func TestDatabase_Query_WithRealData(t *testing.T) {
 	db, cleanup := setupTestDB(t)
 	defer cleanup()
 
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// クエリ実行
 	rows, err := db.Query(ctx, "SELECT id, name, price FROM products WHERE price > $1 ORDER BY id LIMIT 3", 50.0)
@@ -187,7 +187,7 @@ func TestDatabase_Transaction_WithRealPostgreSQL(t *testing.T) {
 	db, cleanup := setupTestDB(t)
 	defer cleanup()
 
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// トランザクション開始
 	tx, err := db.BeginTx(ctx, nil)
@@ -233,26 +233,23 @@ func TestDatabase_ConcurrentQueries(t *testing.T) {
 	db, cleanup := setupTestDB(t)
 	defer cleanup()
 
-	ctx := context.Background()
+	ctx := t.Context()
 	const numGoroutines = 10
 	const queriesPerGoroutine = 5
 
 	var wg sync.WaitGroup
-	errors := make(chan error, numGoroutines)
+	errCh := make(chan error, numGoroutines)
 
-	for i := 0; i < numGoroutines; i++ {
-		wg.Add(1)
-		go func(goroutineID int) {
-			defer wg.Done()
-
-			for j := 0; j < queriesPerGoroutine; j++ {
+	for goroutineID := range numGoroutines {
+		wg.Go(func() {
+			for j := range queriesPerGoroutine {
 				// 異なるクエリパターンを実行
 				switch j % 3 {
 				case 0:
 					// SELECT クエリ
 					rows, err := db.Query(ctx, "SELECT COUNT(*) FROM products WHERE price > $1", float64(goroutineID*10))
 					if err != nil {
-						errors <- fmt.Errorf("goroutine %d query failed: %v", goroutineID, err)
+						errCh <- fmt.Errorf("goroutine %d query failed: %w", goroutineID, err)
 						return
 					}
 					var count int
@@ -270,7 +267,7 @@ func TestDatabase_ConcurrentQueries(t *testing.T) {
 					_, err := db.Exec(ctx, "UPDATE products SET name = $1 WHERE id = $2",
 						fmt.Sprintf("Updated by goroutine %d", goroutineID), (goroutineID%10)+1)
 					if err != nil {
-						errors <- fmt.Errorf("goroutine %d update failed: %v", goroutineID, err)
+						errCh <- fmt.Errorf("goroutine %d update failed: %w", goroutineID, err)
 						return
 					}
 
@@ -279,7 +276,7 @@ func TestDatabase_ConcurrentQueries(t *testing.T) {
 					_, err := db.Exec(ctx, "INSERT INTO products (name, price) VALUES ($1, $2)",
 						fmt.Sprintf("Temp product %d-%d", goroutineID, j), float64(goroutineID+j))
 					if err != nil {
-						errors <- fmt.Errorf("goroutine %d insert failed: %v", goroutineID, err)
+						errCh <- fmt.Errorf("goroutine %d insert failed: %w", goroutineID, err)
 						return
 					}
 				}
@@ -287,14 +284,14 @@ func TestDatabase_ConcurrentQueries(t *testing.T) {
 				// 短時間待機
 				time.Sleep(10 * time.Millisecond)
 			}
-		}(i)
+		})
 	}
 
 	wg.Wait()
-	close(errors)
+	close(errCh)
 
 	// エラーがないことを確認
-	for err := range errors {
+	for err := range errCh {
 		t.Errorf("Concurrent query error: %v", err)
 	}
 
@@ -315,17 +312,14 @@ func TestDatabase_ConnectionPoolStats(t *testing.T) {
 	db, cleanup := setupTestDB(t)
 	defer cleanup()
 
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// 複数の並行接続を作成
 	const numConnections = 8
 	var wg sync.WaitGroup
 
-	for i := 0; i < numConnections; i++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-
+	for id := range numConnections {
+		wg.Go(func() {
 			// 長時間実行クエリ
 			rows, err := db.Query(ctx, "SELECT pg_sleep(0.1), id FROM products WHERE id = $1", id%10+1)
 			if err != nil {
@@ -334,7 +328,7 @@ func TestDatabase_ConnectionPoolStats(t *testing.T) {
 			}
 
 			for rows.Next() {
-				var sleepResult interface{}
+				var sleepResult any
 				var id int
 				if err := rows.Scan(&sleepResult, &id); err != nil {
 					t.Logf("Failed to scan row: %v", err)
@@ -343,7 +337,7 @@ func TestDatabase_ConnectionPoolStats(t *testing.T) {
 			if err := rows.Close(); err != nil {
 				t.Logf("Failed to close rows: %v", err)
 			}
-		}(i)
+		})
 	}
 
 	wg.Wait()
@@ -363,7 +357,7 @@ func TestDatabase_ErrorHandling(t *testing.T) {
 	db, cleanup := setupTestDB(t)
 	defer cleanup()
 
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// 意図的にエラーを発生させる
 	_, err := db.Query(ctx, "SELECT * FROM nonexistent_table")
@@ -398,5 +392,37 @@ func TestDatabase_ErrorHandling(t *testing.T) {
 
 	if count != 10 {
 		t.Errorf("Expected 10 products, got %d", count)
+	}
+}
+
+func TestDatabase_CloseConcurrentWithQueries(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := t.Context()
+
+	// Close と並行して投入しても panic しない（結果は成功・失敗のどちらでもよい）
+	var wg sync.WaitGroup
+	for range 50 {
+		wg.Go(func() {
+			rows, err := db.Query(ctx, "SELECT id FROM products LIMIT 1")
+			if err != nil {
+				return
+			}
+			if err := rows.Close(); err != nil {
+				t.Logf("Failed to close rows: %v", err)
+			}
+		})
+	}
+	wg.Go(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("Close failed: %v", err)
+		}
+	})
+	wg.Wait()
+
+	// 停止後の投入はエラーになる
+	if _, err := db.Query(ctx, "SELECT 1"); err == nil {
+		t.Error("Query after Close should fail")
 	}
 }

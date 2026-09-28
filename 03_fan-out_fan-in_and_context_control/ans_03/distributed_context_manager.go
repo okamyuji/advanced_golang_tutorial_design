@@ -4,19 +4,21 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"math/rand"
+	"maps"
+	"math/rand/v2"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-// DistributedContextは分散コンテキストです
+// DistributedContext 分散コンテキストです
 type DistributedContext struct {
 	ID           string
 	ParentID     string
 	TraceID      string
 	SpanID       string
-	Values       map[string]interface{}
+	Values       map[string]any
 	Deadline     time.Time
 	Metadata     map[string]string
 	CreatedAt    time.Time
@@ -25,17 +27,17 @@ type DistributedContext struct {
 	PropagatedTo map[string]bool
 }
 
-// ContextEventはコンテキストイベントです
+// ContextEvent コンテキストイベントです
 type ContextEvent struct {
 	Type      ContextEventType
 	ContextID string
 	NodeID    string
 	Timestamp time.Time
-	Data      map[string]interface{}
+	Data      map[string]any
 	Source    string
 }
 
-// ContextEventTypeはコンテキストイベントタイプです
+// ContextEventType コンテキストイベントタイプです
 type ContextEventType int
 
 const (
@@ -48,7 +50,7 @@ const (
 	EventNodeLeft
 )
 
-// DistributedContextManagerは分散コンテキスト管理システムです
+// DistributedContextManager 分散コンテキスト管理システムです
 type DistributedContextManager struct {
 	// ノード情報
 	nodeID       string
@@ -81,11 +83,11 @@ type DistributedContextManager struct {
 	config *ManagerConfig
 
 	// 制御フラグ
-	isRunning int32
+	isRunning atomic.Bool
 	startTime time.Time
 }
 
-// ClusterNodeはクラスターノードです
+// ClusterNode クラスターノードです
 type ClusterNode struct {
 	ID           string
 	Address      string
@@ -98,7 +100,7 @@ type ClusterNode struct {
 	JoinedAt     time.Time
 }
 
-// NodeStatusはノードステータスです
+// NodeStatus ノードステータスです
 type NodeStatus int
 
 const (
@@ -108,19 +110,19 @@ const (
 	StatusFailed
 )
 
-// ContextMessageはコンテキストメッセージです
+// ContextMessage コンテキストメッセージです
 type ContextMessage struct {
 	Type       MessageType
 	SourceNode string
 	TargetNode string
 	ContextID  string
 	Context    *DistributedContext
-	Data       map[string]interface{}
+	Data       map[string]any
 	Timestamp  time.Time
 	MessageID  string
 }
 
-// MessageTypeはメッセージタイプです
+// MessageType メッセージタイプです
 type MessageType int
 
 const (
@@ -133,22 +135,22 @@ const (
 	MessageLeave
 )
 
-// EventHandlerはイベントハンドラーです
+// EventHandler イベントハンドラーです
 type EventHandler func(event ContextEvent) error
 
-// ManagerStatsはマネージャー統計です
+// ManagerStats マネージャー統計です
 type ManagerStats struct {
 	mu                 sync.RWMutex
-	contextsCreated    int64
-	contextsPropagated int64
-	contextsCancelled  int64
-	contextsExpired    int64
-	messagesSent       int64
-	messagesReceived   int64
+	contextsCreated    atomic.Int64
+	contextsPropagated atomic.Int64
+	contextsCancelled  atomic.Int64
+	contextsExpired    atomic.Int64
+	messagesSent       atomic.Int64
+	messagesReceived   atomic.Int64
 	startTime          time.Time
 }
 
-// ManagerConfigはマネージャー設定です
+// ManagerConfig マネージャー設定です
 type ManagerConfig struct {
 	NodeID             string
 	ClusterSize        int
@@ -163,7 +165,7 @@ type ManagerConfig struct {
 	MetricsInterval    time.Duration
 }
 
-// NewManagerConfigはデフォルト設定を作成します
+// NewManagerConfig デフォルト設定を作成します
 func NewManagerConfig(nodeID string) *ManagerConfig {
 	return &ManagerConfig{
 		NodeID:             nodeID,
@@ -180,7 +182,7 @@ func NewManagerConfig(nodeID string) *ManagerConfig {
 	}
 }
 
-// NewDistributedContextManagerは新しい分散コンテキストマネージャーを作成します
+// NewDistributedContextManager 新しい分散コンテキストマネージャーを作成します
 func NewDistributedContextManager(config *ManagerConfig) *DistributedContextManager {
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -206,7 +208,7 @@ func NewDistributedContextManager(config *ManagerConfig) *DistributedContextMana
 	return manager
 }
 
-// registerDefaultEventHandlersはデフォルトイベントハンドラーを登録します
+// registerDefaultEventHandlers デフォルトイベントハンドラーを登録します
 func (dcm *DistributedContextManager) registerDefaultEventHandlers() {
 	dcm.RegisterEventHandler(EventContextCreated, dcm.handleContextCreated)
 	dcm.RegisterEventHandler(EventContextUpdated, dcm.handleContextUpdated)
@@ -217,9 +219,9 @@ func (dcm *DistributedContextManager) registerDefaultEventHandlers() {
 	dcm.RegisterEventHandler(EventNodeLeft, dcm.handleNodeLeft)
 }
 
-// Startはマネージャーを開始します
+// Start マネージャーを開始します
 func (dcm *DistributedContextManager) Start() error {
-	if !atomic.CompareAndSwapInt32(&dcm.isRunning, 0, 1) {
+	if !dcm.isRunning.CompareAndSwap(false, true) {
 		return fmt.Errorf("manager is already running")
 	}
 
@@ -229,42 +231,48 @@ func (dcm *DistributedContextManager) Start() error {
 	log.Printf("Starting distributed context manager: node=%s", dcm.nodeID)
 
 	// イベント処理を開始
-	dcm.wg.Add(1)
-	go dcm.processEvents()
+	dcm.wg.Go(dcm.processEvents)
 
 	// メッセージ処理を開始
-	dcm.wg.Add(1)
-	go dcm.handleIncomingMessages()
-
-	dcm.wg.Add(1)
-	go dcm.handleOutgoingMessages()
+	dcm.wg.Go(dcm.handleIncomingMessages)
+	dcm.wg.Go(dcm.handleOutgoingMessages)
 
 	// ハートビートを開始
-	dcm.wg.Add(1)
-	go dcm.heartbeatLoop()
+	dcm.wg.Go(dcm.heartbeatLoop)
 
 	// 同期処理を開始
-	dcm.wg.Add(1)
-	go dcm.syncLoop()
+	dcm.wg.Go(dcm.syncLoop)
 
 	// コンテキスト期限管理を開始
-	dcm.wg.Add(1)
-	go dcm.contextExpirationLoop()
+	dcm.wg.Go(dcm.contextExpirationLoop)
 
 	// メトリクス監視を開始
 	if dcm.config.EnableMetrics {
-		dcm.wg.Add(1)
-		go dcm.monitorMetrics()
+		dcm.wg.Go(dcm.monitorMetrics)
 	}
 
 	log.Printf("Distributed context manager started successfully")
 	return nil
 }
 
-// CreateContextは新しい分散コンテキストを作成します
-func (dcm *DistributedContextManager) CreateContext(parentID string, values map[string]interface{}, deadline time.Time) (*DistributedContext, error) {
-	if atomic.LoadInt32(&dcm.isRunning) == 0 {
-		return nil, fmt.Errorf("manager is not running")
+// ensureRunning マネージャーが稼働中であることを確認します。
+// eventQueue/incomingChannel/outgoingChannelはどれもcloseしない
+// （Shutdownとの競合でpanic: send on closed channelになるため）ので、
+// 停止後の呼び出しはここで早期に拒否する。
+func (dcm *DistributedContextManager) ensureRunning() error {
+	if !dcm.isRunning.Load() {
+		return fmt.Errorf("manager is not running")
+	}
+	if dcm.rootCtx.Err() != nil {
+		return fmt.Errorf("manager is shutting down")
+	}
+	return nil
+}
+
+// CreateContext 新しい分散コンテキストを作成します
+func (dcm *DistributedContextManager) CreateContext(parentID string, values map[string]any, deadline time.Time) (*DistributedContext, error) {
+	if err := dcm.ensureRunning(); err != nil {
+		return nil, err
 	}
 
 	contextID := dcm.generateContextID()
@@ -310,7 +318,7 @@ func (dcm *DistributedContextManager) CreateContext(parentID string, values map[
 		ContextID: contextID,
 		NodeID:    dcm.nodeID,
 		Timestamp: time.Now(),
-		Data: map[string]interface{}{
+		Data: map[string]any{
 			"parent_id": parentID,
 			"trace_id":  traceID,
 			"deadline":  deadline,
@@ -327,14 +335,18 @@ func (dcm *DistributedContextManager) CreateContext(parentID string, values map[
 	}
 
 	// 統計更新
-	atomic.AddInt64(&dcm.stats.contextsCreated, 1)
+	dcm.stats.contextsCreated.Add(1)
 
 	log.Printf("Context created: %s (parent=%s, trace=%s)", contextID, parentID, traceID)
 	return ctx, nil
 }
 
-// PropagateContextはコンテキストを他のノードに伝播します
+// PropagateContext コンテキストを他のノードに伝播します
 func (dcm *DistributedContextManager) PropagateContext(contextID string, targetNodes []string) error {
+	if err := dcm.ensureRunning(); err != nil {
+		return err
+	}
+
 	dcm.contextsMutex.RLock()
 	ctx, exists := dcm.contexts[contextID]
 	dcm.contextsMutex.RUnlock()
@@ -391,7 +403,7 @@ func (dcm *DistributedContextManager) PropagateContext(contextID string, targetN
 		ContextID: contextID,
 		NodeID:    dcm.nodeID,
 		Timestamp: time.Now(),
-		Data: map[string]interface{}{
+		Data: map[string]any{
 			"target_nodes": targets,
 			"target_count": len(targets),
 		},
@@ -407,14 +419,18 @@ func (dcm *DistributedContextManager) PropagateContext(contextID string, targetN
 	}
 
 	// 統計更新
-	atomic.AddInt64(&dcm.stats.contextsPropagated, int64(len(targets)))
+	dcm.stats.contextsPropagated.Add(int64(len(targets)))
 
 	log.Printf("Context %s propagated to %d nodes: %v", contextID, len(targets), targets)
 	return nil
 }
 
-// UpdateContextはコンテキストを更新します
-func (dcm *DistributedContextManager) UpdateContext(contextID string, values map[string]interface{}) error {
+// UpdateContext コンテキストを更新します
+func (dcm *DistributedContextManager) UpdateContext(contextID string, values map[string]any) error {
+	if err := dcm.ensureRunning(); err != nil {
+		return err
+	}
+
 	dcm.contextsMutex.Lock()
 	defer dcm.contextsMutex.Unlock()
 
@@ -424,9 +440,7 @@ func (dcm *DistributedContextManager) UpdateContext(contextID string, values map
 	}
 
 	// 値を更新
-	for key, value := range values {
-		ctx.Values[key] = value
-	}
+	maps.Copy(ctx.Values, values)
 	ctx.UpdatedAt = time.Now()
 
 	// 更新をすべての伝播先ノードに送信
@@ -457,7 +471,7 @@ func (dcm *DistributedContextManager) UpdateContext(contextID string, values map
 		ContextID: contextID,
 		NodeID:    dcm.nodeID,
 		Timestamp: time.Now(),
-		Data: map[string]interface{}{
+		Data: map[string]any{
 			"updated_values": values,
 			"propagated_to":  len(ctx.PropagatedTo),
 		},
@@ -474,8 +488,12 @@ func (dcm *DistributedContextManager) UpdateContext(contextID string, values map
 	return nil
 }
 
-// CancelContextはコンテキストをキャンセルします
+// CancelContext コンテキストをキャンセルします
 func (dcm *DistributedContextManager) CancelContext(contextID string) error {
+	if err := dcm.ensureRunning(); err != nil {
+		return err
+	}
+
 	dcm.contextsMutex.Lock()
 	ctx, exists := dcm.contexts[contextID]
 	if !exists {
@@ -513,7 +531,7 @@ func (dcm *DistributedContextManager) CancelContext(contextID string) error {
 		ContextID: contextID,
 		NodeID:    dcm.nodeID,
 		Timestamp: time.Now(),
-		Data: map[string]interface{}{
+		Data: map[string]any{
 			"lifetime":      time.Since(ctx.CreatedAt),
 			"propagated_to": len(ctx.PropagatedTo),
 		},
@@ -527,13 +545,13 @@ func (dcm *DistributedContextManager) CancelContext(contextID string) error {
 	}
 
 	// 統計更新
-	atomic.AddInt64(&dcm.stats.contextsCancelled, 1)
+	dcm.stats.contextsCancelled.Add(1)
 
 	log.Printf("Context %s cancelled", contextID)
 	return nil
 }
 
-// GetContextはコンテキストを取得します
+// GetContext コンテキストを取得します
 func (dcm *DistributedContextManager) GetContext(contextID string) (*DistributedContext, error) {
 	dcm.contextsMutex.RLock()
 	defer dcm.contextsMutex.RUnlock()
@@ -547,39 +565,32 @@ func (dcm *DistributedContextManager) GetContext(contextID string) (*Distributed
 	return dcm.copyContext(ctx), nil
 }
 
-// copyContextはコンテキストのコピーを作成します
+// copyContext コンテキストのコピーを作成します
 func (dcm *DistributedContextManager) copyContext(ctx *DistributedContext) *DistributedContext {
-	copy := &DistributedContext{
+	ctxCopy := &DistributedContext{
 		ID:           ctx.ID,
 		ParentID:     ctx.ParentID,
 		TraceID:      ctx.TraceID,
 		SpanID:       ctx.SpanID,
-		Values:       make(map[string]interface{}),
+		Values:       maps.Clone(ctx.Values),
 		Deadline:     ctx.Deadline,
-		Metadata:     make(map[string]string),
+		Metadata:     maps.Clone(ctx.Metadata),
 		CreatedAt:    ctx.CreatedAt,
 		UpdatedAt:    ctx.UpdatedAt,
-		NodeIDs:      make([]string, len(ctx.NodeIDs)),
-		PropagatedTo: make(map[string]bool),
+		NodeIDs:      slices.Clone(ctx.NodeIDs),
+		PropagatedTo: maps.Clone(ctx.PropagatedTo),
 	}
 
-	// 値をコピー
-	for k, v := range ctx.Values {
-		copy.Values[k] = v
-	}
-	for k, v := range ctx.Metadata {
-		copy.Metadata[k] = v
-	}
-	copy.NodeIDs = append(copy.NodeIDs, ctx.NodeIDs...)
-	for k, v := range ctx.PropagatedTo {
-		copy.PropagatedTo[k] = v
-	}
-
-	return copy
+	return ctxCopy
 }
 
-// JoinClusterはクラスターに参加します
+// JoinCluster クラスターに参加します。Start前の初期セットアップでも呼べるように
+// isRunningの値は見ずに、Shutdown後の呼び出しだけをctxで拒否する。
 func (dcm *DistributedContextManager) JoinCluster(nodeID, address string) error {
+	if dcm.rootCtx.Err() != nil {
+		return fmt.Errorf("manager is shutting down")
+	}
+
 	node := &ClusterNode{
 		ID:       nodeID,
 		Address:  address,
@@ -597,7 +608,7 @@ func (dcm *DistributedContextManager) JoinCluster(nodeID, address string) error 
 		Type:      EventNodeJoined,
 		NodeID:    nodeID,
 		Timestamp: time.Now(),
-		Data: map[string]interface{}{
+		Data: map[string]any{
 			"address": address,
 		},
 		Source: dcm.nodeID,
@@ -613,8 +624,12 @@ func (dcm *DistributedContextManager) JoinCluster(nodeID, address string) error 
 	return nil
 }
 
-// LeaveClusterはクラスターから離脱します
+// LeaveCluster クラスターから離脱します
 func (dcm *DistributedContextManager) LeaveCluster(nodeID string) error {
+	if dcm.rootCtx.Err() != nil {
+		return fmt.Errorf("manager is shutting down")
+	}
+
 	dcm.nodesMutex.Lock()
 	delete(dcm.clusterNodes, nodeID)
 	dcm.nodesMutex.Unlock()
@@ -637,7 +652,7 @@ func (dcm *DistributedContextManager) LeaveCluster(nodeID string) error {
 	return nil
 }
 
-// RegisterEventHandlerはイベントハンドラーを登録します
+// RegisterEventHandler イベントハンドラーを登録します
 func (dcm *DistributedContextManager) RegisterEventHandler(eventType ContextEventType, handler EventHandler) {
 	if dcm.eventHandlers[eventType] == nil {
 		dcm.eventHandlers[eventType] = make([]EventHandler, 0)
@@ -645,10 +660,8 @@ func (dcm *DistributedContextManager) RegisterEventHandler(eventType ContextEven
 	dcm.eventHandlers[eventType] = append(dcm.eventHandlers[eventType], handler)
 }
 
-// processEventsはイベントを処理します
+// processEvents イベントを処理します
 func (dcm *DistributedContextManager) processEvents() {
-	defer dcm.wg.Done()
-
 	log.Println("Event processor started")
 
 	for {
@@ -656,12 +669,7 @@ func (dcm *DistributedContextManager) processEvents() {
 		case <-dcm.rootCtx.Done():
 			log.Println("Event processor stopping due to context cancellation")
 			return
-		case event, ok := <-dcm.eventQueue:
-			if !ok {
-				log.Println("Event processor stopping due to event queue closure")
-				return
-			}
-
+		case event := <-dcm.eventQueue:
 			// 対応するハンドラーを呼び出し
 			handlers, exists := dcm.eventHandlers[event.Type]
 			if exists {
@@ -675,10 +683,8 @@ func (dcm *DistributedContextManager) processEvents() {
 	}
 }
 
-// handleIncomingMessagesは受信メッセージを処理します
+// handleIncomingMessages 受信メッセージを処理します
 func (dcm *DistributedContextManager) handleIncomingMessages() {
-	defer dcm.wg.Done()
-
 	log.Println("Incoming message handler started")
 
 	for {
@@ -686,19 +692,30 @@ func (dcm *DistributedContextManager) handleIncomingMessages() {
 		case <-dcm.rootCtx.Done():
 			log.Println("Incoming message handler stopping due to context cancellation")
 			return
-		case message, ok := <-dcm.incomingChannel:
-			if !ok {
-				log.Println("Incoming message handler stopping due to channel closure")
-				return
-			}
-
+		case message := <-dcm.incomingChannel:
 			dcm.processIncomingMessage(message)
-			atomic.AddInt64(&dcm.stats.messagesReceived, 1)
+			dcm.stats.messagesReceived.Add(1)
 		}
 	}
 }
 
-// processIncomingMessageは受信メッセージを処理します
+// SubmitIncomingMessage 他ノードからのメッセージを受信キューに追加します
+func (dcm *DistributedContextManager) SubmitIncomingMessage(message *ContextMessage) error {
+	if err := dcm.ensureRunning(); err != nil {
+		return err
+	}
+
+	select {
+	case dcm.incomingChannel <- message:
+		return nil
+	case <-dcm.rootCtx.Done():
+		return fmt.Errorf("manager is shutting down")
+	default:
+		return fmt.Errorf("incoming message queue is full")
+	}
+}
+
+// processIncomingMessage 受信メッセージを処理します
 func (dcm *DistributedContextManager) processIncomingMessage(message *ContextMessage) {
 	switch message.Type {
 	case MessagePropagate:
@@ -716,7 +733,7 @@ func (dcm *DistributedContextManager) processIncomingMessage(message *ContextMes
 	}
 }
 
-// handlePropagateMessageは伝播メッセージを処理します
+// handlePropagateMessage 伝播メッセージを処理します
 func (dcm *DistributedContextManager) handlePropagateMessage(message *ContextMessage) {
 	if message.Context == nil {
 		log.Printf("Propagate message without context: %s", message.MessageID)
@@ -731,7 +748,7 @@ func (dcm *DistributedContextManager) handlePropagateMessage(message *ContextMes
 	log.Printf("Context %s propagated from node %s", message.ContextID, message.SourceNode)
 }
 
-// handleUpdateMessageは更新メッセージを処理します
+// handleUpdateMessage 更新メッセージを処理します
 func (dcm *DistributedContextManager) handleUpdateMessage(message *ContextMessage) {
 	dcm.contextsMutex.Lock()
 	defer dcm.contextsMutex.Unlock()
@@ -743,15 +760,13 @@ func (dcm *DistributedContextManager) handleUpdateMessage(message *ContextMessag
 	}
 
 	// 値を更新
-	for key, value := range message.Data {
-		ctx.Values[key] = value
-	}
+	maps.Copy(ctx.Values, message.Data)
 	ctx.UpdatedAt = time.Now()
 
 	log.Printf("Context %s updated from node %s", message.ContextID, message.SourceNode)
 }
 
-// handleCancelMessageはキャンセルメッセージを処理します
+// handleCancelMessage キャンセルメッセージを処理します
 func (dcm *DistributedContextManager) handleCancelMessage(message *ContextMessage) {
 	dcm.contextsMutex.Lock()
 	defer dcm.contextsMutex.Unlock()
@@ -761,13 +776,13 @@ func (dcm *DistributedContextManager) handleCancelMessage(message *ContextMessag
 	log.Printf("Context %s cancelled by node %s", message.ContextID, message.SourceNode)
 }
 
-// handleSyncMessageは同期メッセージを処理します
+// handleSyncMessage 同期メッセージを処理します
 func (dcm *DistributedContextManager) handleSyncMessage(message *ContextMessage) {
 	// 同期処理の実装
 	log.Printf("Sync message from node %s", message.SourceNode)
 }
 
-// handleHeartbeatMessageはハートビートメッセージを処理します
+// handleHeartbeatMessage ハートビートメッセージを処理します
 func (dcm *DistributedContextManager) handleHeartbeatMessage(message *ContextMessage) {
 	dcm.nodesMutex.Lock()
 	defer dcm.nodesMutex.Unlock()
@@ -778,10 +793,8 @@ func (dcm *DistributedContextManager) handleHeartbeatMessage(message *ContextMes
 	}
 }
 
-// handleOutgoingMessagesは送信メッセージを処理します
+// handleOutgoingMessages 送信メッセージを処理します
 func (dcm *DistributedContextManager) handleOutgoingMessages() {
-	defer dcm.wg.Done()
-
 	log.Println("Outgoing message handler started")
 
 	for {
@@ -789,25 +802,20 @@ func (dcm *DistributedContextManager) handleOutgoingMessages() {
 		case <-dcm.rootCtx.Done():
 			log.Println("Outgoing message handler stopping due to context cancellation")
 			return
-		case message, ok := <-dcm.outgoingChannel:
-			if !ok {
-				log.Println("Outgoing message handler stopping due to channel closure")
-				return
-			}
-
+		case message := <-dcm.outgoingChannel:
 			// 実際のネットワーク送信をシミュレート
 			dcm.simulateMessageSend(message)
-			atomic.AddInt64(&dcm.stats.messagesSent, 1)
+			dcm.stats.messagesSent.Add(1)
 		}
 	}
 }
 
-// simulateMessageSendはメッセージ送信をシミュレートします
+// simulateMessageSend メッセージ送信をシミュレートします
 func (dcm *DistributedContextManager) simulateMessageSend(message *ContextMessage) {
 	// 実際の実装では、HTTP、gRPC、TCP等でメッセージを送信
 
 	// ネットワーク遅延をシミュレート
-	time.Sleep(time.Duration(rand.Intn(100)+10) * time.Millisecond)
+	time.Sleep(time.Duration(rand.IntN(100)+10) * time.Millisecond)
 
 	// 送信エラーをランダムに発生（5%の確率）
 	if rand.Float64() < 0.05 {
@@ -818,12 +826,9 @@ func (dcm *DistributedContextManager) simulateMessageSend(message *ContextMessag
 	log.Printf("Message %s sent to node %s (type=%v)", message.MessageID, message.TargetNode, message.Type)
 }
 
-// heartbeatLoopはハートビートループを実行します
+// heartbeatLoop ハートビートループを実行します
 func (dcm *DistributedContextManager) heartbeatLoop() {
-	defer dcm.wg.Done()
-
-	ticker := time.NewTicker(dcm.config.HeartbeatInterval)
-	defer ticker.Stop()
+	tick := time.Tick(dcm.config.HeartbeatInterval)
 
 	log.Println("Heartbeat loop started")
 
@@ -832,13 +837,13 @@ func (dcm *DistributedContextManager) heartbeatLoop() {
 		case <-dcm.rootCtx.Done():
 			log.Println("Heartbeat loop stopping due to context cancellation")
 			return
-		case <-ticker.C:
+		case <-tick:
 			dcm.sendHeartbeats()
 		}
 	}
 }
 
-// sendHeartbeatsはハートビートを送信します
+// sendHeartbeats ハートビートを送信します
 func (dcm *DistributedContextManager) sendHeartbeats() {
 	dcm.nodesMutex.RLock()
 	defer dcm.nodesMutex.RUnlock()
@@ -866,12 +871,9 @@ func (dcm *DistributedContextManager) sendHeartbeats() {
 	}
 }
 
-// syncLoopは同期ループを実行します
+// syncLoop 同期ループを実行します
 func (dcm *DistributedContextManager) syncLoop() {
-	defer dcm.wg.Done()
-
-	ticker := time.NewTicker(dcm.config.SyncInterval)
-	defer ticker.Stop()
+	tick := time.Tick(dcm.config.SyncInterval)
 
 	log.Println("Sync loop started")
 
@@ -880,13 +882,13 @@ func (dcm *DistributedContextManager) syncLoop() {
 		case <-dcm.rootCtx.Done():
 			log.Println("Sync loop stopping due to context cancellation")
 			return
-		case <-ticker.C:
+		case <-tick:
 			dcm.performSync()
 		}
 	}
 }
 
-// performSyncは同期処理を実行します
+// performSync 同期処理を実行します
 func (dcm *DistributedContextManager) performSync() {
 	// 非アクティブなノードを検出
 	dcm.detectInactiveNodes()
@@ -895,7 +897,7 @@ func (dcm *DistributedContextManager) performSync() {
 	dcm.syncContextStates()
 }
 
-// detectInactiveNodesは非アクティブなノードを検出します
+// detectInactiveNodes 非アクティブなノードを検出します
 func (dcm *DistributedContextManager) detectInactiveNodes() {
 	dcm.nodesMutex.Lock()
 	defer dcm.nodesMutex.Unlock()
@@ -910,7 +912,7 @@ func (dcm *DistributedContextManager) detectInactiveNodes() {
 	}
 }
 
-// syncContextStatesはコンテキスト状態を同期します
+// syncContextStates コンテキスト状態を同期します
 func (dcm *DistributedContextManager) syncContextStates() {
 	// 実際の実装では、他のノードとコンテキストリストを比較・同期
 	dcm.contextsMutex.RLock()
@@ -920,12 +922,9 @@ func (dcm *DistributedContextManager) syncContextStates() {
 	log.Printf("Context sync: managing %d contexts", contextCount)
 }
 
-// contextExpirationLoopはコンテキスト期限管理ループを実行します
+// contextExpirationLoop コンテキスト期限管理ループを実行します
 func (dcm *DistributedContextManager) contextExpirationLoop() {
-	defer dcm.wg.Done()
-
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
+	tick := time.Tick(30 * time.Second)
 
 	log.Println("Context expiration loop started")
 
@@ -934,13 +933,13 @@ func (dcm *DistributedContextManager) contextExpirationLoop() {
 		case <-dcm.rootCtx.Done():
 			log.Println("Context expiration loop stopping due to context cancellation")
 			return
-		case <-ticker.C:
+		case <-tick:
 			dcm.expireContexts()
 		}
 	}
 }
 
-// expireContextsは期限切れコンテキストを削除します
+// expireContexts 期限切れコンテキストを削除します
 func (dcm *DistributedContextManager) expireContexts() {
 	now := time.Now()
 	var expired []string
@@ -970,7 +969,7 @@ func (dcm *DistributedContextManager) expireContexts() {
 			log.Printf("Event queue is full, dropping context expired event")
 		}
 
-		atomic.AddInt64(&dcm.stats.contextsExpired, 1)
+		dcm.stats.contextsExpired.Add(1)
 	}
 
 	if len(expired) > 0 {
@@ -978,12 +977,9 @@ func (dcm *DistributedContextManager) expireContexts() {
 	}
 }
 
-// monitorMetricsはメトリクスを監視します
+// monitorMetrics メトリクスを監視します
 func (dcm *DistributedContextManager) monitorMetrics() {
-	defer dcm.wg.Done()
-
-	ticker := time.NewTicker(dcm.config.MetricsInterval)
-	defer ticker.Stop()
+	tick := time.Tick(dcm.config.MetricsInterval)
 
 	log.Println("Metrics monitor started")
 
@@ -992,23 +988,23 @@ func (dcm *DistributedContextManager) monitorMetrics() {
 		case <-dcm.rootCtx.Done():
 			log.Println("Metrics monitor stopping")
 			return
-		case <-ticker.C:
+		case <-tick:
 			dcm.reportMetrics()
 		}
 	}
 }
 
-// reportMetricsはメトリクスを報告します
+// reportMetrics メトリクスを報告します
 func (dcm *DistributedContextManager) reportMetrics() {
 	dcm.stats.mu.RLock()
 	defer dcm.stats.mu.RUnlock()
 
-	created := atomic.LoadInt64(&dcm.stats.contextsCreated)
-	propagated := atomic.LoadInt64(&dcm.stats.contextsPropagated)
-	cancelled := atomic.LoadInt64(&dcm.stats.contextsCancelled)
-	expired := atomic.LoadInt64(&dcm.stats.contextsExpired)
-	sentMsgs := atomic.LoadInt64(&dcm.stats.messagesSent)
-	recvMsgs := atomic.LoadInt64(&dcm.stats.messagesReceived)
+	created := dcm.stats.contextsCreated.Load()
+	propagated := dcm.stats.contextsPropagated.Load()
+	cancelled := dcm.stats.contextsCancelled.Load()
+	expired := dcm.stats.contextsExpired.Load()
+	sentMsgs := dcm.stats.messagesSent.Load()
+	recvMsgs := dcm.stats.messagesReceived.Load()
 
 	dcm.contextsMutex.RLock()
 	activeContexts := len(dcm.contexts)
@@ -1070,38 +1066,40 @@ func (dcm *DistributedContextManager) handleNodeLeft(event ContextEvent) error {
 
 // ユーティリティメソッド
 
-// generateContextIDはコンテキストIDを生成します
+// generateContextID コンテキストIDを生成します
 func (dcm *DistributedContextManager) generateContextID() string {
-	return fmt.Sprintf("ctx_%s_%d_%d", dcm.nodeID, time.Now().UnixNano(), rand.Int63())
+	return fmt.Sprintf("ctx_%s_%d_%d", dcm.nodeID, time.Now().UnixNano(), rand.Int64())
 }
 
-// generateTraceIDはトレースIDを生成します
+// generateTraceID トレースIDを生成します
 func (dcm *DistributedContextManager) generateTraceID() string {
-	return fmt.Sprintf("trace_%d_%d", time.Now().UnixNano(), rand.Int63())
+	return fmt.Sprintf("trace_%d_%d", time.Now().UnixNano(), rand.Int64())
 }
 
-// generateSpanIDはスパンIDを生成します
+// generateSpanID スパンIDを生成します
 func (dcm *DistributedContextManager) generateSpanID() string {
-	return fmt.Sprintf("span_%d_%d", time.Now().UnixNano(), rand.Int63())
+	return fmt.Sprintf("span_%d_%d", time.Now().UnixNano(), rand.Int64())
 }
 
-// generateMessageIDはメッセージIDを生成します
+// generateMessageID メッセージIDを生成します
 func (dcm *DistributedContextManager) generateMessageID() string {
-	return fmt.Sprintf("msg_%s_%d_%d", dcm.nodeID, time.Now().UnixNano(), rand.Int63())
+	return fmt.Sprintf("msg_%s_%d_%d", dcm.nodeID, time.Now().UnixNano(), rand.Int64())
 }
 
-// Shutdownはマネージャーを停止します
+// Shutdown マネージャーを停止します
 func (dcm *DistributedContextManager) Shutdown(timeout time.Duration) error {
-	if !atomic.CompareAndSwapInt32(&dcm.isRunning, 1, 0) {
+	if !dcm.isRunning.CompareAndSwap(true, false) {
 		return fmt.Errorf("manager is not running")
 	}
 
 	log.Println("Shutting down distributed context manager...")
 
-	// 1. 新しいイベントの受付を停止
-	close(dcm.eventQueue)
+	// ワーカーに停止を指示する。eventQueue/incomingChannel/outgoingChannelは
+	// どれもcloseしない（CreateContext等の投入メソッドとの競合で
+	// panic: send on closed channelになるため）。
+	dcm.cancel()
 
-	// 2. ワーカーの終了を待機
+	// ワーカーの終了を待機
 	done := make(chan struct{})
 	go func() {
 		dcm.wg.Wait()
@@ -1112,46 +1110,33 @@ func (dcm *DistributedContextManager) Shutdown(timeout time.Duration) error {
 	case <-done:
 		log.Println("All workers stopped gracefully")
 	case <-time.After(timeout):
-		log.Println("Timeout reached, forcing shutdown...")
-		dcm.cancel()
-
-		// 追加の待機時間
-		select {
-		case <-done:
-			log.Println("Workers stopped after cancellation")
-		case <-time.After(2 * time.Second):
-			log.Println("Some workers may not have stopped properly")
-		}
+		log.Println("Some workers may not have stopped properly")
 	}
-
-	// 3. チャネルを閉じる
-	close(dcm.incomingChannel)
-	close(dcm.outgoingChannel)
 
 	log.Println("Distributed context manager shutdown completed")
 	return nil
 }
 
-// GetStatsは統計情報を取得します
-func (dcm *DistributedContextManager) GetStats() map[string]interface{} {
+// GetStats 統計情報を取得します
+func (dcm *DistributedContextManager) GetStats() map[string]any {
 	dcm.stats.mu.RLock()
 	defer dcm.stats.mu.RUnlock()
 
-	created := atomic.LoadInt64(&dcm.stats.contextsCreated)
-	propagated := atomic.LoadInt64(&dcm.stats.contextsPropagated)
-	cancelled := atomic.LoadInt64(&dcm.stats.contextsCancelled)
-	expired := atomic.LoadInt64(&dcm.stats.contextsExpired)
-	sentMsgs := atomic.LoadInt64(&dcm.stats.messagesSent)
-	recvMsgs := atomic.LoadInt64(&dcm.stats.messagesReceived)
+	created := dcm.stats.contextsCreated.Load()
+	propagated := dcm.stats.contextsPropagated.Load()
+	cancelled := dcm.stats.contextsCancelled.Load()
+	expired := dcm.stats.contextsExpired.Load()
+	sentMsgs := dcm.stats.messagesSent.Load()
+	recvMsgs := dcm.stats.messagesReceived.Load()
 
 	dcm.contextsMutex.RLock()
 	activeContexts := len(dcm.contexts)
 	dcm.contextsMutex.RUnlock()
 
 	dcm.nodesMutex.RLock()
-	nodeStats := make(map[string]interface{})
+	nodeStats := make(map[string]any)
 	for nodeID, node := range dcm.clusterNodes {
-		nodeStats[nodeID] = map[string]interface{}{
+		nodeStats[nodeID] = map[string]any{
 			"status":        node.Status,
 			"last_seen":     node.LastSeen,
 			"latency":       node.Latency,
@@ -1164,7 +1149,7 @@ func (dcm *DistributedContextManager) GetStats() map[string]interface{} {
 
 	uptime := time.Since(dcm.stats.startTime)
 
-	return map[string]interface{}{
+	return map[string]any{
 		"node_id":             dcm.nodeID,
 		"contexts_created":    created,
 		"contexts_propagated": propagated,
@@ -1203,16 +1188,16 @@ func main() {
 
 	// テストコンテキストを作成・操作
 	go func() {
-		for i := 0; i < 100; i++ {
+		for i := range 100 {
 			// ルートコンテキストを作成
-			values := map[string]interface{}{
-				"user_id":    fmt.Sprintf("user_%d", rand.Intn(20)),
-				"session_id": fmt.Sprintf("session_%d", rand.Intn(50)),
+			values := map[string]any{
+				"user_id":    fmt.Sprintf("user_%d", rand.IntN(20)),
+				"session_id": fmt.Sprintf("session_%d", rand.IntN(50)),
 				"request_id": fmt.Sprintf("req_%d", i),
 				"timestamp":  time.Now().Unix(),
 			}
 
-			deadline := time.Now().Add(time.Duration(rand.Intn(120)+60) * time.Second)
+			deadline := time.Now().Add(time.Duration(rand.IntN(120)+60) * time.Second)
 			ctx, err := manager.CreateContext("", values, deadline)
 			if err != nil {
 				log.Printf("Failed to create context: %v", err)
@@ -1226,7 +1211,7 @@ func main() {
 
 			// 子コンテキストを作成
 			if i%3 == 0 {
-				childValues := map[string]interface{}{
+				childValues := map[string]any{
 					"child_data": fmt.Sprintf("child_%d", i),
 					"operation":  "sub_task",
 				}
@@ -1243,7 +1228,7 @@ func main() {
 
 			// 一部のコンテキストを更新
 			if i%5 == 0 {
-				updateValues := map[string]interface{}{
+				updateValues := map[string]any{
 					"updated_at": time.Now().Unix(),
 					"status":     "processing",
 				}
@@ -1255,14 +1240,14 @@ func main() {
 			// 一部のコンテキストをキャンセル
 			if i%10 == 0 {
 				go func(contextID string) {
-					time.Sleep(time.Duration(rand.Intn(30)+10) * time.Second)
+					time.Sleep(time.Duration(rand.IntN(30)+10) * time.Second)
 					if err := manager.CancelContext(contextID); err != nil {
 						log.Printf("Failed to cancel context: %v", err)
 					}
 				}(ctx.ID)
 			}
 
-			time.Sleep(time.Duration(rand.Intn(500)+200) * time.Millisecond)
+			time.Sleep(time.Duration(rand.IntN(500)+200) * time.Millisecond)
 		}
 
 		log.Println("All test contexts created")
@@ -1270,23 +1255,21 @@ func main() {
 
 	// 受信メッセージをシミュレート
 	go func() {
-		for i := 0; i < 50; i++ {
+		for i := range 50 {
 			// 他のノードからのメッセージをシミュレート
 			message := &ContextMessage{
 				Type:       MessageHeartbeat,
-				SourceNode: fmt.Sprintf("node-%d", rand.Intn(3)+2),
+				SourceNode: fmt.Sprintf("node-%d", rand.IntN(3)+2),
 				TargetNode: "node-1",
 				Timestamp:  time.Now(),
 				MessageID:  fmt.Sprintf("sim_msg_%d", i),
 			}
 
-			select {
-			case manager.incomingChannel <- message:
-			case <-time.After(1 * time.Second):
-				log.Printf("Failed to send simulated message")
+			if err := manager.SubmitIncomingMessage(message); err != nil {
+				log.Printf("Failed to send simulated message: %v", err)
 			}
 
-			time.Sleep(time.Duration(rand.Intn(5)+2) * time.Second)
+			time.Sleep(time.Duration(rand.IntN(5)+2) * time.Second)
 		}
 	}()
 

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"log"
 	"runtime"
@@ -9,7 +10,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"multi-db/internal/adapters"
 	"multi-db/internal/config"
 	"multi-db/internal/manager"
 	"multi-db/internal/models"
@@ -22,14 +22,18 @@ func main() {
 
 	// ワーカープール設定
 	poolConfig := manager.WorkerPoolConfig{
-		MaxWorkers:      runtime.NumCPU() * 2,
+		MaxWorkers:      runtime.GOMAXPROCS(0) * 2,
 		QueueSize:       100,
 		TimeoutDuration: 30 * time.Second,
 	}
 
 	// DBマネージャー初期化
 	dbManager := manager.NewConcurrentDBManager(poolConfig)
-	defer dbManager.Close()
+	defer func() {
+		if err := dbManager.Close(); err != nil {
+			log.Printf("DBマネージャー終了エラー: %v", err)
+		}
+	}()
 
 	// データベース設定（実際の環境に合わせて調整）
 	postgresConfig := config.DatabaseConfig{
@@ -104,11 +108,8 @@ func runBasicQueryExample(dbManager *manager.ConcurrentDBManager) {
 		fmt.Printf("✅ PostgreSQL結果: %d件取得 (レスポンス時間: %v)\n",
 			len(result.Data), result.Elapsed)
 
-		// 結果の一部を表示
-		for i, row := range result.Data {
-			if i >= 3 { // 最初の3件のみ表示
-				break
-			}
+		// 結果の一部を表示（最初の3件のみ）
+		for _, row := range result.Data[:min(3, len(result.Data))] {
 			fmt.Printf("   ID: %v, Name: %v, Email: %v\n",
 				row["id"], row["name"], row["email"])
 		}
@@ -155,7 +156,7 @@ func runBulkOperationExample(dbManager *manager.ConcurrentDBManager) {
 
 	// テストユーザーデータ作成
 	users := make([]*models.User, 100)
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		users[i] = &models.User{
 			Name:  fmt.Sprintf("BulkUser%d", i),
 			Email: fmt.Sprintf("bulk%d@example.com", i),
@@ -186,29 +187,17 @@ func runTransactionExample(dbManager *manager.ConcurrentDBManager) {
 	defer cancel()
 
 	// トランザクション実行
-	resultChan := dbManager.ExecuteTransaction(ctx, "PostgreSQL", func(adapter adapters.DBAdapter) error {
-		// 複数操作をトランザクションで実行
-		user1 := &models.User{
-			Name:  "TransactionUser1",
-			Email: "tx1@example.com",
-			Age:   28,
+	resultChan := dbManager.ExecuteTransaction(ctx, "PostgreSQL", func(tx *sql.Tx) error {
+		// 2件のINSERTを同じトランザクションで行う。どちらかが失敗すれば両方とも取り消される
+		users := []*models.User{
+			{Name: "TransactionUser1", Email: "tx1@example.com", Age: 28},
+			{Name: "TransactionUser2", Email: "tx2@example.com", Age: 32},
 		}
-
-		user2 := &models.User{
-			Name:  "TransactionUser2",
-			Email: "tx2@example.com",
-			Age:   32,
+		for i, u := range users {
+			if _, err := tx.ExecContext(ctx, "INSERT INTO users (name, email, age) VALUES ($1, $2, $3)", u.Name, u.Email, u.Age); err != nil {
+				return fmt.Errorf("ユーザー%d作成エラー: %w", i+1, err)
+			}
 		}
-
-		// ユーザー作成（実際の実装では適切なメソッドを使用）
-		if _, err := adapter.CreateUser(ctx, user1); err != nil {
-			return fmt.Errorf("ユーザー1作成エラー: %w", err)
-		}
-
-		if _, err := adapter.CreateUser(ctx, user2); err != nil {
-			return fmt.Errorf("ユーザー2作成エラー: %w", err)
-		}
-
 		return nil
 	})
 
@@ -235,19 +224,14 @@ func runPerformanceExample(dbManager *manager.ConcurrentDBManager) {
 		concurrentClients, requestsPerClient)
 
 	var wg sync.WaitGroup
-	var totalRequests int64
-	var successfulRequests int64
-	var totalLatency int64
+	var totalRequestsCounter, successfulRequestsCounter, totalLatencyCounter atomic.Int64
 
 	start := time.Now()
 
 	// 並行クライアント実行
-	for i := 0; i < concurrentClients; i++ {
-		wg.Add(1)
-		go func(clientID int) {
-			defer wg.Done()
-
-			for j := 0; j < requestsPerClient; j++ {
+	for range concurrentClients {
+		wg.Go(func() {
+			for j := range requestsPerClient {
 				requestStart := time.Now()
 
 				// PostgreSQLクエリ実行
@@ -257,24 +241,26 @@ func runPerformanceExample(dbManager *manager.ConcurrentDBManager) {
 				result := <-resultChan
 				requestDuration := time.Since(requestStart)
 
-				atomic.AddInt64(&totalRequests, 1)
-				atomic.AddInt64(&totalLatency, requestDuration.Nanoseconds())
+				totalRequestsCounter.Add(1)
+				totalLatencyCounter.Add(requestDuration.Nanoseconds())
 
 				if result.Error == nil {
-					atomic.AddInt64(&successfulRequests, 1)
+					successfulRequestsCounter.Add(1)
 				}
 
 				// 短い間隔でリクエスト
 				time.Sleep(10 * time.Millisecond)
 			}
-		}(i)
+		})
 	}
 
 	wg.Wait()
 	elapsed := time.Since(start)
+	totalRequests := totalRequestsCounter.Load()
+	successfulRequests := successfulRequestsCounter.Load()
 
 	// 結果計算
-	avgLatency := time.Duration(totalLatency / totalRequests)
+	avgLatency := time.Duration(totalLatencyCounter.Load() / totalRequests)
 	successRate := float64(successfulRequests) / float64(totalRequests) * 100
 	throughput := float64(totalRequests) / elapsed.Seconds()
 

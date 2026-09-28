@@ -1,9 +1,11 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"sync"
@@ -51,7 +53,7 @@ type Settings struct {
 	ReadyToTrip         func(counts Counts) bool
 	OnStateChange       func(name string, from State, to State)
 	IsSuccessful        func(err error) bool
-	Fallback            func(err error) (interface{}, error)
+	Fallback            func(err error) (any, error)
 	SlowCallThreshold   time.Duration
 	FailureThreshold    float64
 	MinRequestThreshold uint32
@@ -66,7 +68,7 @@ type CircuitBreaker struct {
 	readyToTrip         func(counts Counts) bool
 	onStateChange       func(name string, from State, to State)
 	isSuccessful        func(err error) bool
-	fallback            func(err error) (interface{}, error)
+	fallback            func(err error) (any, error)
 	slowCallThreshold   time.Duration
 	failureThreshold    float64
 	minRequestThreshold uint32
@@ -96,21 +98,16 @@ func NewCircuitBreaker(st Settings) *CircuitBreaker {
 		fallback:            st.Fallback,
 		slowCallThreshold:   st.SlowCallThreshold,
 		failureThreshold:    st.FailureThreshold,
-		minRequestThreshold: st.MinRequestThreshold,
-	}
-
-	if st.MaxRequests == 0 {
-		cb.maxRequests = 1
-	} else {
-		cb.maxRequests = st.MaxRequests
+		minRequestThreshold: cmp.Or(st.MinRequestThreshold, 10),
+		maxRequests:         cmp.Or(st.MaxRequests, 1),
 	}
 
 	if cb.interval <= 0 {
-		cb.interval = time.Duration(60) * time.Second
+		cb.interval = 60 * time.Second
 	}
 
 	if cb.timeout <= 0 {
-		cb.timeout = time.Duration(60) * time.Second
+		cb.timeout = 60 * time.Second
 	}
 
 	if cb.readyToTrip == nil {
@@ -127,10 +124,6 @@ func NewCircuitBreaker(st Settings) *CircuitBreaker {
 
 	if cb.failureThreshold <= 0 {
 		cb.failureThreshold = 0.5
-	}
-
-	if cb.minRequestThreshold == 0 {
-		cb.minRequestThreshold = 10
 	}
 
 	cb.toNewGeneration(time.Now())
@@ -168,7 +161,7 @@ func (cb *CircuitBreaker) Counts() Counts {
 }
 
 // Execute サーキットブレーカーを通してリクエストを実行します
-func (cb *CircuitBreaker) Execute(req func() (interface{}, error)) (interface{}, error) {
+func (cb *CircuitBreaker) Execute(req func() (any, error)) (any, error) {
 	generation, err := cb.beforeRequest()
 	if err != nil {
 		if cb.fallback != nil {
@@ -200,7 +193,7 @@ func (cb *CircuitBreaker) Execute(req func() (interface{}, error)) (interface{},
 }
 
 // ExecuteWithTimeout タイムアウト付きでリクエストを実行します
-func (cb *CircuitBreaker) ExecuteWithTimeout(ctx context.Context, timeout time.Duration, req func() (interface{}, error)) (interface{}, error) {
+func (cb *CircuitBreaker) ExecuteWithTimeout(ctx context.Context, timeout time.Duration, req func() (any, error)) (any, error) {
 	generation, err := cb.beforeRequest()
 	if err != nil {
 		if cb.fallback != nil {
@@ -210,7 +203,7 @@ func (cb *CircuitBreaker) ExecuteWithTimeout(ctx context.Context, timeout time.D
 	}
 
 	type result struct {
-		value    interface{}
+		value    any
 		err      error
 		duration time.Duration
 	}
@@ -400,7 +393,7 @@ func NewHTTPClientWrapper(client *http.Client, cb *CircuitBreaker) *HTTPClientWr
 
 // Get サーキットブレーカー付きのGETリクエストを実行します
 func (w *HTTPClientWrapper) Get(url string) (*http.Response, error) {
-	result, err := w.circuitBreaker.Execute(func() (interface{}, error) {
+	result, err := w.circuitBreaker.Execute(func() (any, error) {
 		return w.client.Get(url)
 	})
 
@@ -412,10 +405,9 @@ func (w *HTTPClientWrapper) Get(url string) (*http.Response, error) {
 }
 
 // Post サーキットブレーカー付きのPOSTリクエストを実行します
-func (w *HTTPClientWrapper) Post(url, contentType string, body interface{}) (*http.Response, error) {
-	result, err := w.circuitBreaker.Execute(func() (interface{}, error) {
-		// bodyをio.Readerに変換する処理は簡略化
-		return w.client.Post(url, contentType, nil)
+func (w *HTTPClientWrapper) Post(url, contentType string, body io.Reader) (*http.Response, error) {
+	result, err := w.circuitBreaker.Execute(func() (any, error) {
+		return w.client.Post(url, contentType, body)
 	})
 
 	if err != nil {
@@ -447,7 +439,7 @@ func main() {
 		IsSuccessful: func(err error) bool {
 			return err == nil
 		},
-		Fallback: func(err error) (interface{}, error) {
+		Fallback: func(err error) (any, error) {
 			log.Printf("Using fallback due to: %v", err)
 			return "fallback response", nil
 		},
@@ -468,7 +460,7 @@ func main() {
 
 	log.Println("=== サーキットブレーカーテスト開始 ===")
 
-	for i := 0; i < 20; i++ {
+	for i := range 20 {
 		url := testURLs[i%len(testURLs)]
 
 		log.Printf("Request %d: %s", i+1, url)

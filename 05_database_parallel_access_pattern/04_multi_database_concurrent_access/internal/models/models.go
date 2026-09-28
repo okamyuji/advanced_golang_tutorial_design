@@ -1,6 +1,7 @@
 package models
 
 import (
+	"cmp"
 	"fmt"
 	"time"
 )
@@ -158,16 +159,8 @@ func (req *UserSearchRequest) SetDefaults() {
 	if req.Limit <= 0 {
 		req.Limit = 50
 	}
-	if req.Limit > 10000 {
-		req.Limit = 10000
-	}
-	if req.Offset < 0 {
-		req.Offset = 0
-	}
-	if req.OrderBy == "" {
-		req.OrderBy = "created_at"
-	}
-	if req.OrderDir == "" {
-		req.OrderDir = "DESC"
-	}
+	req.Limit = min(req.Limit, 10000)
+	req.Offset = max(req.Offset, 0)
+	req.OrderBy = cmp.Or(req.OrderBy, "created_at")
+	req.OrderDir = cmp.Or(req.OrderDir, "DESC")
 }

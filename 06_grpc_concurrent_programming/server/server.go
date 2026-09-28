@@ -1,8 +1,11 @@
 package server
 
 import (
+	"cmp"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"runtime"
@@ -10,7 +13,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
 	"grpc-concurrent-programming/monitoring"
 	pb "grpc-concurrent-programming/proto"
 	"grpc-concurrent-programming/security"
@@ -18,8 +20,18 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
+
+// sampleUserCount 起動時に投入するサンプルユーザー数
+const sampleUserCount = 1000
+
+// ErrWorkerPoolClosed 停止済みのワーカープールに投入したときのエラーです
+var ErrWorkerPoolClosed = errors.New("ワーカープールが停止されています")
+
+// ErrWorkerPoolFull キューが満杯のときのエラーです
+var ErrWorkerPoolFull = errors.New("ワーカープールが満杯です")
 
 // ServerConfig 高性能gRPCサーバーの設定を定義します
 type ServerConfig struct {
@@ -35,10 +47,24 @@ type ServerConfig struct {
 	MaxConnectionAge      time.Duration `json:"max_connection_age"`
 	MaxConnectionAgeGrace time.Duration `json:"max_connection_age_grace"`
 	EnableTLS             bool          `json:"enable_tls"`
+	TLSCertFile           string        `json:"tls_cert_file"` // EnableTLSのときに使うサーバー証明書（PEM）
+	TLSKeyFile            string        `json:"tls_key_file"`  // EnableTLSのときに使う秘密鍵（PEM）
 }
 
 // ServerMetrics サーバーのパフォーマンス指標を追跡します
 type ServerMetrics struct {
+	TotalRequests      atomic.Int64
+	ActiveRequests     atomic.Int64
+	SuccessfulRequests atomic.Int64
+	FailedRequests     atomic.Int64
+	AverageLatency     atomic.Int64
+	MaxLatency         atomic.Int64
+	ActiveStreams      atomic.Int64
+	TotalStreams       atomic.Int64
+}
+
+// ServerMetricsSnapshot ある時点のServerMetricsの値を保持します
+type ServerMetricsSnapshot struct {
 	TotalRequests      int64 `json:"total_requests"`
 	ActiveRequests     int64 `json:"active_requests"`
 	SuccessfulRequests int64 `json:"successful_requests"`
@@ -72,17 +98,14 @@ func NewWorkerPool(maxWorkers, queueSize int) *WorkerPool {
 	}
 
 	// ワーカーゴルーチン起動
-	for i := 0; i < maxWorkers; i++ {
-		wp.wg.Add(1)
-		go wp.worker()
+	for range maxWorkers {
+		wp.wg.Go(wp.worker)
 	}
 
 	return wp
 }
 
 func (wp *WorkerPool) worker() {
-	defer wp.wg.Done()
-
 	for {
 		select {
 		case job := <-wp.jobQueue:
@@ -97,13 +120,18 @@ func (wp *WorkerPool) worker() {
 
 // Submit ワーカープールにジョブを送信します
 func (wp *WorkerPool) Submit(job func()) error {
+	// キューに空きがあると下のselectは停止後でも送信を選びうるので、先に停止を確かめる
+	if wp.ctx.Err() != nil {
+		return ErrWorkerPoolClosed
+	}
+
 	select {
 	case wp.jobQueue <- job:
 		return nil
 	case <-wp.ctx.Done():
-		return fmt.Errorf("ワーカープールが停止されています")
+		return ErrWorkerPoolClosed
 	default:
-		return fmt.Errorf("ワーカープールが満杯です")
+		return ErrWorkerPoolFull
 	}
 }
 
@@ -115,10 +143,10 @@ func (wp *WorkerPool) Close() {
 
 // StreamManager ストリーミング接続を管理します
 type StreamManager struct {
-	streams sync.Map
-	events  chan UserEvent
-	ctx     context.Context
-	cancel  context.CancelFunc
+	subscribers sync.Map // key: chan *pb.UserEvent
+	events      chan UserEvent
+	ctx         context.Context
+	cancel      context.CancelFunc
 }
 
 // UserEvent ユーザーイベントを表します
@@ -147,22 +175,17 @@ func (sm *StreamManager) eventDistributor() {
 	for {
 		select {
 		case event := <-sm.events:
-			sm.streams.Range(func(key, value interface{}) bool {
-				if stream, ok := value.(pb.UserService_WatchUserChangesServer); ok {
-					grpcEvent := &pb.UserEvent{
-						Type:      pb.UserEvent_EventType(pb.UserEvent_EventType_value[event.Type]),
-						User:      event.User,
-						Timestamp: event.Timestamp,
-					}
-
-					select {
-					case <-stream.Context().Done():
-						sm.streams.Delete(key)
-					default:
-						if err := stream.Send(grpcEvent); err != nil {
-							sm.streams.Delete(key)
-						}
-					}
+			grpcEvent := &pb.UserEvent{
+				Type:      pb.UserEvent_EventType(pb.UserEvent_EventType_value[event.Type]),
+				User:      event.User,
+				Timestamp: event.Timestamp,
+			}
+			// 1つのストリームのSendを複数のgoroutineから呼ぶのは安全でないので、ここでは購読チャネルに渡すだけにし、Sendは各ハンドラーのgoroutineが呼ぶ
+			sm.subscribers.Range(func(key, _ any) bool {
+				select {
+				case key.(chan *pb.UserEvent) <- grpcEvent:
+				default:
+					// 受信が追いつかない購読者の分はドロップ
 				}
 				return true
 			})
@@ -172,14 +195,11 @@ func (sm *StreamManager) eventDistributor() {
 	}
 }
 
-// RegisterStream ストリームを登録します
-func (sm *StreamManager) RegisterStream(streamID string, stream pb.UserService_WatchUserChangesServer) {
-	sm.streams.Store(streamID, stream)
-}
-
-// UnregisterStream ストリームの登録を解除します
-func (sm *StreamManager) UnregisterStream(streamID string) {
-	sm.streams.Delete(streamID)
+// Subscribe イベントを受け取るチャネルと、購読を解除する関数を返します
+func (sm *StreamManager) Subscribe() (<-chan *pb.UserEvent, func()) {
+	ch := make(chan *pb.UserEvent, 100)
+	sm.subscribers.Store(ch, struct{}{})
+	return ch, func() { sm.subscribers.Delete(ch) }
 }
 
 // PublishEvent イベントを発行します
@@ -191,6 +211,11 @@ func (sm *StreamManager) PublishEvent(event UserEvent) {
 	}
 }
 
+// Close イベント配信を停止します
+func (sm *StreamManager) Close() {
+	sm.cancel()
+}
+
 // HighPerformanceUserServer 高性能ユーザーサーバーを実装します
 type HighPerformanceUserServer struct {
 	pb.UnimplementedUserServiceServer
@@ -199,15 +224,14 @@ type HighPerformanceUserServer struct {
 	metrics    *ServerMetrics
 	workerPool *WorkerPool
 	userStore  sync.Map // 簡易ユーザーストア
+	nextID     atomic.Int64
 	streamMgr  *StreamManager
 }
 
 // NewHighPerformanceUserServer 新しい高性能ユーザーサーバーを作成します
 func NewHighPerformanceUserServer(config ServerConfig) *HighPerformanceUserServer {
-	// CPUコア数に基づいてワーカー数を調整
-	if config.MaxWorkers == 0 {
-		config.MaxWorkers = runtime.NumCPU() * 4
-	}
+	// コンテナのCPU制限を反映するGOMAXPROCSに基づいてワーカー数を調整
+	config.MaxWorkers = cmp.Or(config.MaxWorkers, runtime.GOMAXPROCS(0)*4)
 
 	server := &HighPerformanceUserServer{
 		config:     config,
@@ -222,54 +246,63 @@ func NewHighPerformanceUserServer(config ServerConfig) *HighPerformanceUserServe
 	return server
 }
 
+// Close ワーカープールとイベント配信を停止します
+func (s *HighPerformanceUserServer) Close() {
+	s.workerPool.Close()
+	s.streamMgr.Close()
+}
+
 func (s *HighPerformanceUserServer) initSampleData() {
-	for i := int64(1); i <= 1000; i++ {
+	for n := range int64(sampleUserCount) {
+		id := n + 1
 		user := &pb.User{
-			Id:        i,
-			Name:      fmt.Sprintf("User%d", i),
-			Email:     fmt.Sprintf("user%d@example.com", i),
+			Id:        id,
+			Name:      fmt.Sprintf("User%d", id),
+			Email:     fmt.Sprintf("user%d@example.com", id),
 			CreatedAt: time.Now().Unix(),
 			UpdatedAt: time.Now().Unix(),
 		}
-		s.userStore.Store(i, user)
+		s.userStore.Store(id, user)
 	}
+	s.nextID.Store(sampleUserCount)
+}
+
+// newUserID 並行に呼んでも重複しないユーザーIDを払い出します（実際のアプリケーションではデータベースから取得）
+func (s *HighPerformanceUserServer) newUserID() int64 {
+	return s.nextID.Add(1)
 }
 
 // メトリクス更新ヘルパー
 func (s *HighPerformanceUserServer) updateMetrics(start time.Time, success bool) {
 	elapsed := time.Since(start).Nanoseconds()
 
-	atomic.AddInt64(&s.metrics.TotalRequests, 1)
-	atomic.AddInt64(&s.metrics.ActiveRequests, -1)
+	s.metrics.TotalRequests.Add(1)
+	s.metrics.ActiveRequests.Add(-1)
 
 	if success {
-		atomic.AddInt64(&s.metrics.SuccessfulRequests, 1)
+		s.metrics.SuccessfulRequests.Add(1)
 	} else {
-		atomic.AddInt64(&s.metrics.FailedRequests, 1)
+		s.metrics.FailedRequests.Add(1)
 	}
 
 	// レイテンシー更新（簡易移動平均）
-	currentAvg := atomic.LoadInt64(&s.metrics.AverageLatency)
-	newAvg := (currentAvg + elapsed) / 2
-	atomic.StoreInt64(&s.metrics.AverageLatency, newAvg)
+	currentAvg := s.metrics.AverageLatency.Load()
+	s.metrics.AverageLatency.Store((currentAvg + elapsed) / 2)
 
 	// 最大レイテンシー更新
 	for {
-		currentMax := atomic.LoadInt64(&s.metrics.MaxLatency)
-		if elapsed <= currentMax {
-			break
-		}
-		if atomic.CompareAndSwapInt64(&s.metrics.MaxLatency, currentMax, elapsed) {
+		currentMax := s.metrics.MaxLatency.Load()
+		if elapsed <= currentMax || s.metrics.MaxLatency.CompareAndSwap(currentMax, elapsed) {
 			break
 		}
 	}
 }
 
 // GetUser Unary RPC実装です
-func (s *HighPerformanceUserServer) GetUser(ctx context.Context, req *pb.GetUserRequest) (*pb.GetUserResponse, error) {
+func (s *HighPerformanceUserServer) GetUser(ctx context.Context, req *pb.GetUserRequest) (_ *pb.GetUserResponse, err error) {
 	start := time.Now()
-	atomic.AddInt64(&s.metrics.ActiveRequests, 1)
-	defer s.updateMetrics(start, true)
+	s.metrics.ActiveRequests.Add(1)
+	defer func() { s.updateMetrics(start, err == nil) }()
 
 	// 入力検証
 	if req.Id <= 0 {
@@ -298,22 +331,19 @@ func (s *HighPerformanceUserServer) GetUser(ctx context.Context, req *pb.GetUser
 	case result := <-resultChan:
 		return result, nil
 	case err := <-errorChan:
-		s.updateMetrics(start, false)
 		return nil, err
 	case <-ctx.Done():
-		s.updateMetrics(start, false)
 		return nil, status.Errorf(codes.Canceled, "リクエストがキャンセルされました")
 	case <-time.After(5 * time.Second):
-		s.updateMetrics(start, false)
 		return nil, status.Errorf(codes.DeadlineExceeded, "リクエストタイムアウト")
 	}
 }
 
 // CreateUser Unary RPC実装です
-func (s *HighPerformanceUserServer) CreateUser(ctx context.Context, req *pb.CreateUserRequest) (*pb.CreateUserResponse, error) {
+func (s *HighPerformanceUserServer) CreateUser(ctx context.Context, req *pb.CreateUserRequest) (_ *pb.CreateUserResponse, err error) {
 	start := time.Now()
-	atomic.AddInt64(&s.metrics.ActiveRequests, 1)
-	defer s.updateMetrics(start, true)
+	s.metrics.ActiveRequests.Add(1)
+	defer func() { s.updateMetrics(start, err == nil) }()
 
 	// 入力検証
 	if req.Name == "" || req.Email == "" {
@@ -321,11 +351,9 @@ func (s *HighPerformanceUserServer) CreateUser(ctx context.Context, req *pb.Crea
 	}
 
 	resultChan := make(chan *pb.CreateUserResponse, 1)
-	errorChan := make(chan error, 1)
 
 	job := func() {
-		// 新しいIDを生成（実際のアプリケーションではデータベースから取得）
-		newID := time.Now().UnixNano()
+		newID := s.newUserID()
 
 		user := &pb.User{
 			Id:        newID,
@@ -354,20 +382,16 @@ func (s *HighPerformanceUserServer) CreateUser(ctx context.Context, req *pb.Crea
 	select {
 	case result := <-resultChan:
 		return result, nil
-	case err := <-errorChan:
-		s.updateMetrics(start, false)
-		return nil, err
 	case <-ctx.Done():
-		s.updateMetrics(start, false)
 		return nil, status.Errorf(codes.Canceled, "リクエストがキャンセルされました")
 	}
 }
 
 // ListUsers Server Streaming RPC実装です
 func (s *HighPerformanceUserServer) ListUsers(req *pb.ListUsersRequest, stream pb.UserService_ListUsersServer) error {
-	atomic.AddInt64(&s.metrics.ActiveStreams, 1)
-	atomic.AddInt64(&s.metrics.TotalStreams, 1)
-	defer atomic.AddInt64(&s.metrics.ActiveStreams, -1)
+	s.metrics.ActiveStreams.Add(1)
+	s.metrics.TotalStreams.Add(1)
+	defer s.metrics.ActiveStreams.Add(-1)
 
 	pageSize := req.PageSize
 	if pageSize <= 0 || pageSize > 100 {
@@ -375,14 +399,15 @@ func (s *HighPerformanceUserServer) ListUsers(req *pb.ListUsersRequest, stream p
 	}
 
 	sentCount := int32(0)
+	var sendErr error
 
-	s.userStore.Range(func(key, value interface{}) bool {
+	s.userStore.Range(func(key, value any) bool {
 		if sentCount >= pageSize {
 			return false
 		}
 
 		if user, ok := value.(*pb.User); ok {
-			if err := stream.Send(user); err != nil {
+			if sendErr = stream.Send(user); sendErr != nil {
 				return false
 			}
 			sentCount++
@@ -396,52 +421,64 @@ func (s *HighPerformanceUserServer) ListUsers(req *pb.ListUsersRequest, stream p
 		return true
 	})
 
-	return nil
+	return sendErr
 }
 
 // WatchUserChanges Server Streaming RPC実装です
 func (s *HighPerformanceUserServer) WatchUserChanges(req *pb.WatchUserChangesRequest, stream pb.UserService_WatchUserChangesServer) error {
-	atomic.AddInt64(&s.metrics.ActiveStreams, 1)
-	atomic.AddInt64(&s.metrics.TotalStreams, 1)
-	defer atomic.AddInt64(&s.metrics.ActiveStreams, -1)
+	s.metrics.ActiveStreams.Add(1)
+	s.metrics.TotalStreams.Add(1)
+	defer s.metrics.ActiveStreams.Add(-1)
 
-	streamID := fmt.Sprintf("stream_%d", time.Now().UnixNano())
-	s.streamMgr.RegisterStream(streamID, stream)
-	defer s.streamMgr.UnregisterStream(streamID)
+	events, unsubscribe := s.streamMgr.Subscribe()
+	defer unsubscribe()
 
-	// ストリームが終了するまで待機
-	<-stream.Context().Done()
+	// 購読の開始をクライアントに知らせる。以降に発行されたイベントはこのストリームに届く
+	if err := stream.SendHeader(metadata.MD{}); err != nil {
+		return err
+	}
 
-	return nil
+	for {
+		select {
+		case event := <-events:
+			if err := stream.Send(event); err != nil {
+				return err
+			}
+		case <-stream.Context().Done():
+			return nil
+		case <-s.streamMgr.ctx.Done():
+			return status.Error(codes.Unavailable, "サーバーが停止しています")
+		}
+	}
 }
 
 // BulkCreateUsers Client Streaming RPC実装です
 func (s *HighPerformanceUserServer) BulkCreateUsers(stream pb.UserService_BulkCreateUsersServer) error {
-	atomic.AddInt64(&s.metrics.ActiveStreams, 1)
-	atomic.AddInt64(&s.metrics.TotalStreams, 1)
-	defer atomic.AddInt64(&s.metrics.ActiveStreams, -1)
+	s.metrics.ActiveStreams.Add(1)
+	s.metrics.TotalStreams.Add(1)
+	defer s.metrics.ActiveStreams.Add(-1)
 
 	var createdUsers []*pb.User
-	var errors []string
+	var validationErrors []string
 	totalCreated := int32(0)
 
 	for {
 		req, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			break
+		}
 		if err != nil {
-			if err.Error() == "EOF" {
-				break
-			}
 			return status.Errorf(codes.Internal, "ストリーム受信エラー: %v", err)
 		}
 
 		// 入力検証
 		if req.Name == "" || req.Email == "" {
-			errors = append(errors, "名前とメールアドレスは必須です")
+			validationErrors = append(validationErrors, "名前とメールアドレスは必須です")
 			continue
 		}
 
 		// ユーザー作成
-		newID := time.Now().UnixNano() + int64(totalCreated)
+		newID := s.newUserID()
 		user := &pb.User{
 			Id:        newID,
 			Name:      req.Name,
@@ -470,7 +507,7 @@ func (s *HighPerformanceUserServer) BulkCreateUsers(stream pb.UserService_BulkCr
 	response := &pb.BulkCreateUsersResponse{
 		Users:        createdUsers,
 		TotalCreated: totalCreated,
-		Errors:       errors,
+		Errors:       validationErrors,
 	}
 
 	return stream.SendAndClose(response)
@@ -478,34 +515,44 @@ func (s *HighPerformanceUserServer) BulkCreateUsers(stream pb.UserService_BulkCr
 
 // UserChat Bidirectional Streaming RPC実装です
 func (s *HighPerformanceUserServer) UserChat(stream pb.UserService_UserChatServer) error {
-	atomic.AddInt64(&s.metrics.ActiveStreams, 1)
-	atomic.AddInt64(&s.metrics.TotalStreams, 1)
-	defer atomic.AddInt64(&s.metrics.ActiveStreams, -1)
+	s.metrics.ActiveStreams.Add(1)
+	s.metrics.TotalStreams.Add(1)
+	defer s.metrics.ActiveStreams.Add(-1)
 
 	// 受信ゴルーチン
 	messageChan := make(chan *pb.ChatMessage, 100)
 	errorChan := make(chan error, 1)
 
 	go func() {
+		// errorChanへの送信はcloseより先に済むので、close後にerrorChanを見れば受信エラーを取りこぼさない
 		defer close(messageChan)
 		for {
 			msg, err := stream.Recv()
 			if err != nil {
-				if err.Error() != "EOF" {
+				if !errors.Is(err, io.EOF) {
 					errorChan <- err
 				}
 				return
 			}
-			messageChan <- msg
+			select {
+			case messageChan <- msg:
+			case <-stream.Context().Done():
+				return
+			}
 		}
 	}()
 
 	// メッセージ処理ループ
 	for {
 		select {
-		case msg := <-messageChan:
-			if msg == nil {
-				return nil // ストリーム終了
+		case msg, ok := <-messageChan:
+			if !ok {
+				select {
+				case err := <-errorChan:
+					return err
+				default:
+					return nil // ストリーム終了
+				}
 			}
 
 			// エコー応答（実際のアプリケーションではビジネスロジックを実装）
@@ -520,9 +567,6 @@ func (s *HighPerformanceUserServer) UserChat(stream pb.UserService_UserChatServe
 				return err
 			}
 
-		case err := <-errorChan:
-			return err
-
 		case <-stream.Context().Done():
 			return nil
 		}
@@ -530,21 +574,82 @@ func (s *HighPerformanceUserServer) UserChat(stream pb.UserService_UserChatServe
 }
 
 // GetMetrics メトリクス取得します
-func (s *HighPerformanceUserServer) GetMetrics() ServerMetrics {
-	return ServerMetrics{
-		TotalRequests:      atomic.LoadInt64(&s.metrics.TotalRequests),
-		ActiveRequests:     atomic.LoadInt64(&s.metrics.ActiveRequests),
-		SuccessfulRequests: atomic.LoadInt64(&s.metrics.SuccessfulRequests),
-		FailedRequests:     atomic.LoadInt64(&s.metrics.FailedRequests),
-		AverageLatency:     atomic.LoadInt64(&s.metrics.AverageLatency),
-		MaxLatency:         atomic.LoadInt64(&s.metrics.MaxLatency),
-		ActiveStreams:      atomic.LoadInt64(&s.metrics.ActiveStreams),
-		TotalStreams:       atomic.LoadInt64(&s.metrics.TotalStreams),
+func (s *HighPerformanceUserServer) GetMetrics() ServerMetricsSnapshot {
+	return ServerMetricsSnapshot{
+		TotalRequests:      s.metrics.TotalRequests.Load(),
+		ActiveRequests:     s.metrics.ActiveRequests.Load(),
+		SuccessfulRequests: s.metrics.SuccessfulRequests.Load(),
+		FailedRequests:     s.metrics.FailedRequests.Load(),
+		AverageLatency:     s.metrics.AverageLatency.Load(),
+		MaxLatency:         s.metrics.MaxLatency.Load(),
+		ActiveStreams:      s.metrics.ActiveStreams.Load(),
+		TotalStreams:       s.metrics.TotalStreams.Load(),
 	}
+}
+
+// NewGRPCServer 認証とメトリクスのインターセプターを組み込んだgRPCサーバーを作成し、ユーザーサービスを登録します
+func NewGRPCServer(config ServerConfig) (*grpc.Server, *HighPerformanceUserServer, error) {
+	opts := []grpc.ServerOption{
+		grpc.MaxConcurrentStreams(config.MaxConcurrentStreams),
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			Time:                  config.KeepaliveTime,
+			Timeout:               config.KeepaliveTimeout,
+			MaxConnectionIdle:     config.MaxConnectionIdle,
+			MaxConnectionAge:      config.MaxConnectionAge,
+			MaxConnectionAgeGrace: config.MaxConnectionAgeGrace,
+		}),
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             config.KeepaliveTime / 2,
+			PermitWithoutStream: true,
+		}),
+		// 先に渡したインターセプターほど外側で動く
+		grpc.ChainUnaryInterceptor(
+			monitoring.MetricsInterceptor(),
+			security.AuthInterceptor(),
+		),
+		grpc.ChainStreamInterceptor(
+			monitoring.StreamMetricsInterceptor(),
+			security.StreamAuthInterceptor(),
+		),
+	}
+	// 0を渡すと、サイズは上限0バイト、ConnectionTimeoutは即時タイムアウトになるので、未設定ならgRPCの既定値に任せる
+	if config.MaxReceiveMessageSize > 0 {
+		opts = append(opts, grpc.MaxRecvMsgSize(config.MaxReceiveMessageSize))
+	}
+	if config.MaxSendMessageSize > 0 {
+		opts = append(opts, grpc.MaxSendMsgSize(config.MaxSendMessageSize))
+	}
+	if config.ConnectionTimeout > 0 {
+		opts = append(opts, grpc.ConnectionTimeout(config.ConnectionTimeout))
+	}
+
+	// TLS設定を追加（プロダクション環境の場合）
+	if config.EnableTLS {
+		creds, err := security.ServerTLSCredentials(config.TLSCertFile, config.TLSKeyFile)
+		if err != nil {
+			return nil, nil, err
+		}
+		opts = append(opts, grpc.Creds(creds))
+	}
+
+	srv := grpc.NewServer(opts...)
+	userServer := NewHighPerformanceUserServer(config)
+	pb.RegisterUserServiceServer(srv, userServer)
+
+	return srv, userServer, nil
 }
 
 // StartHighPerformanceServer 高性能サーバーを起動します
 func StartHighPerformanceServer(config ServerConfig) error {
+	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", config.Port))
+	if err != nil {
+		return fmt.Errorf("リスナー作成エラー: %w", err)
+	}
+	return Serve(lis, config)
+}
+
+// Serve 作成済みのリスナーで高性能サーバーを動かします。呼び出し側はServeを待たずにlisへ接続できます
+func Serve(lis net.Listener, config ServerConfig) error {
 	// Prometheusメトリクス初期化
 	monitoring.InitMetrics()
 
@@ -556,49 +661,30 @@ func StartHighPerformanceServer(config ServerConfig) error {
 		}
 	}()
 
-	// gRPCサーバー設定
-	opts := []grpc.ServerOption{
-		grpc.MaxConcurrentStreams(config.MaxConcurrentStreams),
-		grpc.MaxRecvMsgSize(config.MaxReceiveMessageSize),
-		grpc.MaxSendMsgSize(config.MaxSendMessageSize),
-		grpc.KeepaliveParams(keepalive.ServerParameters{
-			Time:    config.KeepaliveTime,
-			Timeout: config.KeepaliveTimeout,
-		}),
-		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
-			MinTime:             config.KeepaliveTime / 2,
-			PermitWithoutStream: true,
-		}),
-		grpc.ConnectionTimeout(config.ConnectionTimeout),
-		// セキュリティインターセプターを追加
-		grpc.UnaryInterceptor(grpc_middleware.ChainUnaryServer(
-			monitoring.MetricsInterceptor(),
-			security.AuthInterceptor(),
-		)),
-		grpc.StreamInterceptor(grpc_middleware.ChainStreamServer(
-			monitoring.StreamMetricsInterceptor(),
-			security.StreamAuthInterceptor(),
-		)),
+	srv, userServer, err := NewGRPCServer(config)
+	if err != nil {
+		return err
 	}
+	defer userServer.Close()
 
-	// TLS設定を追加（プロダクション環境の場合）
-	if config.EnableTLS {
-		creds := security.CreateTLSCredentials()
-		opts = append(opts, grpc.Creds(creds))
-		log.Printf("TLSが有効化されています")
-	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go logMetrics(ctx, userServer)
 
-	server := grpc.NewServer(opts...)
-	userServer := NewHighPerformanceUserServer(config)
+	log.Printf("高性能gRPCサーバーを開始しました。アドレス: %s", lis.Addr())
+	log.Printf("最大ワーカー数: %d, 最大同時ストリーム数: %d", userServer.config.MaxWorkers, config.MaxConcurrentStreams)
+	log.Printf("TLS有効: %v", config.EnableTLS)
+	log.Printf("メトリクスURL: http://localhost:9090/metrics")
 
-	pb.RegisterUserServiceServer(server, userServer)
+	return srv.Serve(lis)
+}
 
-	// メトリクス監視ゴルーチン
-	go func() {
-		ticker := time.NewTicker(10 * time.Second)
-		defer ticker.Stop()
-
-		for range ticker.C {
+// logMetrics ctxが終わるまで10秒ごとにメトリクスをログに出します
+func logMetrics(ctx context.Context, userServer *HighPerformanceUserServer) {
+	tick := time.Tick(10 * time.Second)
+	for {
+		select {
+		case <-tick:
 			metrics := userServer.GetMetrics()
 			log.Printf("メトリクス - 総リクエスト: %d, アクティブ: %d, 成功: %d, 失敗: %d, 平均レイテンシー: %dms, アクティブストリーム: %d",
 				metrics.TotalRequests,
@@ -608,19 +694,8 @@ func StartHighPerformanceServer(config ServerConfig) error {
 				metrics.AverageLatency/1000000, // nsをmsに変換
 				metrics.ActiveStreams,
 			)
+		case <-ctx.Done():
+			return
 		}
-	}()
-
-	// リスナー作成
-	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", config.Port))
-	if err != nil {
-		return fmt.Errorf("リスナー作成エラー: %w", err)
 	}
-
-	log.Printf("高性能gRPCサーバーを開始しました。ポート: %d", config.Port)
-	log.Printf("最大ワーカー数: %d, 最大同時ストリーム数: %d", config.MaxWorkers, config.MaxConcurrentStreams)
-	log.Printf("TLS有効: %v", config.EnableTLS)
-	log.Printf("メトリクスURL: http://localhost:9090/metrics")
-
-	return server.Serve(lis)
 }

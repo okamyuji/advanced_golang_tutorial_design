@@ -3,18 +3,24 @@ package main
 import (
 	"context"
 	"errors"
+	"slices"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
 // MockHealthChecker テスト用の健全性チェッカーです
+// テストの goroutine が状態を書き換え、監視ループの goroutine が読むので、共有する状態はすべて同期して扱います。
 type MockHealthChecker struct {
 	name       string
-	status     string
-	message    string
 	critical   bool
-	shouldFail bool
+	shouldFail atomic.Bool
+
+	mu      sync.Mutex
+	status  string
+	message string
 }
 
 func NewMockHealthChecker(name string, critical bool) *MockHealthChecker {
@@ -35,7 +41,7 @@ func (mhc *MockHealthChecker) Critical() bool {
 }
 
 func (mhc *MockHealthChecker) Check(ctx context.Context) HealthStatus {
-	if mhc.shouldFail {
+	if mhc.shouldFail.Load() {
 		return HealthStatus{
 			Name:      mhc.name,
 			Status:    "critical",
@@ -45,34 +51,40 @@ func (mhc *MockHealthChecker) Check(ctx context.Context) HealthStatus {
 		}
 	}
 
+	mhc.mu.Lock()
+	status, message := mhc.status, mhc.message
+	mhc.mu.Unlock()
+
 	return HealthStatus{
 		Name:      mhc.name,
-		Status:    mhc.status,
-		Message:   mhc.message,
+		Status:    status,
+		Message:   message,
 		Timestamp: time.Now(),
 		Score:     1.0,
 	}
 }
 
 func (mhc *MockHealthChecker) SetStatus(status, message string) {
+	mhc.mu.Lock()
+	defer mhc.mu.Unlock()
 	mhc.status = status
 	mhc.message = message
 }
 
 func (mhc *MockHealthChecker) SimulateFailure() {
-	mhc.shouldFail = true
+	mhc.shouldFail.Store(true)
 }
 
 func (mhc *MockHealthChecker) SimulateRecovery() {
-	mhc.shouldFail = false
+	mhc.shouldFail.Store(false)
 }
 
 // MockHealingAction テスト用の復旧アクションです
 type MockHealingAction struct {
 	name           string
 	handledTypes   []string
-	shouldFail     bool
-	executionCount int64
+	shouldFail     atomic.Bool
+	executionCount atomic.Int64
 	duration       time.Duration
 }
 
@@ -89,12 +101,7 @@ func (mha *MockHealingAction) Name() string {
 }
 
 func (mha *MockHealingAction) CanHandle(issueType string) bool {
-	for _, t := range mha.handledTypes {
-		if t == issueType {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(mha.handledTypes, issueType)
 }
 
 func (mha *MockHealingAction) EstimatedDuration() time.Duration {
@@ -102,11 +109,11 @@ func (mha *MockHealingAction) EstimatedDuration() time.Duration {
 }
 
 func (mha *MockHealingAction) Execute(ctx context.Context, issue HealthIssue) error {
-	atomic.AddInt64(&mha.executionCount, 1)
+	mha.executionCount.Add(1)
 
 	time.Sleep(mha.duration)
 
-	if mha.shouldFail {
+	if mha.shouldFail.Load() {
 		return errors.New("simulated healing action failure")
 	}
 
@@ -114,247 +121,275 @@ func (mha *MockHealingAction) Execute(ctx context.Context, issue HealthIssue) er
 }
 
 func (mha *MockHealingAction) GetExecutionCount() int64 {
-	return atomic.LoadInt64(&mha.executionCount)
+	return mha.executionCount.Load()
 }
 
 func (mha *MockHealingAction) SetShouldFail(shouldFail bool) {
-	mha.shouldFail = shouldFail
+	mha.shouldFail.Store(shouldFail)
 }
 
 func TestAutoHealingSystem_BasicOperation(t *testing.T) {
-	ahs := NewAutoHealingSystem(100*time.Millisecond, 2)
+	synctest.Test(t, func(t *testing.T) {
+		ahs := NewAutoHealingSystem(100*time.Millisecond, 2)
 
-	// モックチェッカーとアクションを追加
-	mockChecker := NewMockHealthChecker("test_service", true)
-	mockAction := NewMockHealingAction("restart_service", []string{"test_service"})
+		// モックチェッカーとアクションを追加
+		mockChecker := NewMockHealthChecker("test_service", true)
+		mockAction := NewMockHealingAction("restart_service", []string{"test_service"})
 
-	ahs.AddHealthChecker(mockChecker)
-	ahs.AddHealingAction("test_service", mockAction)
+		ahs.AddHealthChecker(mockChecker)
+		ahs.AddHealingAction("test_service", mockAction)
 
-	// システム開始
-	err := ahs.Start()
-	if err != nil {
-		t.Fatalf("Failed to start auto-healing system: %v", err)
-	}
-	defer ahs.Stop()
+		// システム開始
+		if err := ahs.Start(); err != nil {
+			t.Fatalf("Failed to start auto-healing system: %v", err)
+		}
+		defer ahs.Stop()
 
-	// 正常状態での動作確認
-	time.Sleep(300 * time.Millisecond)
+		// 100ms 間隔なので 300ms で 3 回チェックされる
+		synctest.Sleep(300 * time.Millisecond)
 
-	status := ahs.GetStatus()
-	if !status["is_running"].(bool) {
-		t.Error("Expected system to be running")
-	}
+		status := ahs.GetStatus()
+		if !status["is_running"].(bool) {
+			t.Error("Expected system to be running")
+		}
 
-	if status["total_checks"].(int64) == 0 {
-		t.Error("Expected some health checks to be performed")
-	}
+		if got := status["total_checks"].(int64); got != 3 {
+			t.Errorf("Expected 3 health checks, got %d", got)
+		}
+
+		if got := mockAction.GetExecutionCount(); got != 0 {
+			t.Errorf("Expected no healing action while healthy, got %d", got)
+		}
+	})
 }
 
 func TestAutoHealingSystem_IssueDetectionAndHealing(t *testing.T) {
-	ahs := NewAutoHealingSystem(100*time.Millisecond, 2)
+	synctest.Test(t, func(t *testing.T) {
+		ahs := NewAutoHealingSystem(100*time.Millisecond, 2)
 
-	mockChecker := NewMockHealthChecker("test_service", true)
-	mockAction := NewMockHealingAction("fix_service", []string{"test_service"})
+		mockChecker := NewMockHealthChecker("test_service", true)
+		mockAction := NewMockHealingAction("fix_service", []string{"test_service"})
 
-	ahs.AddHealthChecker(mockChecker)
-	ahs.AddHealingAction("test_service", mockAction)
+		ahs.AddHealthChecker(mockChecker)
+		ahs.AddHealingAction("test_service", mockAction)
 
-	err := ahs.Start()
-	if err != nil {
-		t.Fatalf("Failed to start auto-healing system: %v", err)
-	}
-	defer ahs.Stop()
+		if err := ahs.Start(); err != nil {
+			t.Fatalf("Failed to start auto-healing system: %v", err)
+		}
+		defer ahs.Stop()
 
-	// 最初は正常状態
-	time.Sleep(200 * time.Millisecond)
+		// 最初は正常状態
+		synctest.Sleep(200 * time.Millisecond)
 
-	// 障害を発生させる
-	mockChecker.SimulateFailure()
+		// 障害を発生させる
+		mockChecker.SimulateFailure()
 
-	// 復旧アクションが実行されるまで待機
-	time.Sleep(500 * time.Millisecond)
+		// 復旧アクションが実行されるまで待機
+		synctest.Sleep(500 * time.Millisecond)
 
-	// 復旧アクションが実行されたことを確認
-	if mockAction.GetExecutionCount() == 0 {
-		t.Error("Expected healing action to be executed")
-	}
+		// 復旧アクションが実行されたことを確認
+		if mockAction.GetExecutionCount() == 0 {
+			t.Error("Expected healing action to be executed")
+		}
 
-	status := ahs.GetStatus()
-	if status["total_issues"].(int64) == 0 {
-		t.Error("Expected issues to be detected")
-	}
+		status := ahs.GetStatus()
+		if status["total_issues"].(int64) == 0 {
+			t.Error("Expected issues to be detected")
+		}
 
-	if status["total_actions"].(int64) == 0 {
-		t.Error("Expected healing actions to be executed")
-	}
+		if status["total_actions"].(int64) == 0 {
+			t.Error("Expected healing actions to be executed")
+		}
+
+		// Stop は実行中の復旧処理が終わるまで待つので、この後は件数が動かない
+		ahs.Stop()
+
+		// 復旧確認に失敗した成功アクションも、履歴には1回の実行として1件だけ残る
+		ahs.mutex.RLock()
+		historyLen := len(ahs.actionHistory)
+		ahs.mutex.RUnlock()
+		if want := int(mockAction.GetExecutionCount()); historyLen != want {
+			t.Errorf("Expected %d action history entries (one per execution), got %d", want, historyLen)
+		}
+	})
 }
 
 func TestAutoHealingSystem_HealingActionRetry(t *testing.T) {
-	ahs := NewAutoHealingSystem(50*time.Millisecond, 3)
-	ahs.escalationDelay = 100 * time.Millisecond // 短い遅延
+	synctest.Test(t, func(t *testing.T) {
+		ahs := NewAutoHealingSystem(50*time.Millisecond, 3)
+		ahs.escalationDelay = 100 * time.Millisecond // 短い遅延
 
-	mockChecker := NewMockHealthChecker("failing_service", true)
-	mockAction := NewMockHealingAction("unreliable_fix", []string{"failing_service"})
+		mockChecker := NewMockHealthChecker("failing_service", true)
+		mockAction := NewMockHealingAction("unreliable_fix", []string{"failing_service"})
 
-	// 最初は失敗するように設定
-	mockAction.SetShouldFail(true)
-	mockChecker.SimulateFailure()
+		// 最初は失敗するように設定
+		mockAction.SetShouldFail(true)
+		mockChecker.SimulateFailure()
 
-	ahs.AddHealthChecker(mockChecker)
-	ahs.AddHealingAction("failing_service", mockAction)
+		ahs.AddHealthChecker(mockChecker)
+		ahs.AddHealingAction("failing_service", mockAction)
 
-	err := ahs.Start()
-	if err != nil {
-		t.Fatalf("Failed to start auto-healing system: %v", err)
-	}
-	defer ahs.Stop()
+		if err := ahs.Start(); err != nil {
+			t.Fatalf("Failed to start auto-healing system: %v", err)
+		}
+		defer ahs.Stop()
 
-	// リトライが発生するまで待機
-	time.Sleep(1 * time.Second)
+		// リトライが発生するまで待機
+		synctest.Sleep(1 * time.Second)
 
-	// 複数回実行されたことを確認
-	executionCount := mockAction.GetExecutionCount()
-	if executionCount < 2 {
-		t.Errorf("Expected multiple retry attempts, got %d", executionCount)
-	}
+		// 複数回実行されたことを確認
+		if executionCount := mockAction.GetExecutionCount(); executionCount < 2 {
+			t.Errorf("Expected multiple retry attempts, got %d", executionCount)
+		}
 
-	// アクションを成功するように変更
-	mockAction.SetShouldFail(false)
-	mockChecker.SimulateRecovery()
+		// アクションを成功するように変更
+		mockAction.SetShouldFail(false)
+		mockChecker.SimulateRecovery()
 
-	// 復旧処理を待機
-	time.Sleep(500 * time.Millisecond)
+		// 実行中のリトライが復旧確認で終わるまで待つ
+		synctest.Sleep(1 * time.Second)
+		settled := mockAction.GetExecutionCount()
+
+		// 復旧後は新しい問題が検出されないので、実行回数は増えない
+		synctest.Sleep(500 * time.Millisecond)
+		if got := mockAction.GetExecutionCount(); got != settled {
+			t.Errorf("Expected no more healing actions after recovery, got %d -> %d", settled, got)
+		}
+	})
 }
 
 func TestAutoHealingSystem_MultipleCheckers(t *testing.T) {
-	ahs := NewAutoHealingSystem(100*time.Millisecond, 2)
+	synctest.Test(t, func(t *testing.T) {
+		ahs := NewAutoHealingSystem(100*time.Millisecond, 2)
 
-	// 複数のチェッカーを追加
-	checker1 := NewMockHealthChecker("service_1", true)
-	checker2 := NewMockHealthChecker("service_2", false)
-	checker3 := NewMockHealthChecker("service_3", true)
+		// 複数のチェッカーを追加
+		checker1 := NewMockHealthChecker("service_1", true)
+		checker2 := NewMockHealthChecker("service_2", false)
+		checker3 := NewMockHealthChecker("service_3", true)
 
-	action1 := NewMockHealingAction("fix_service_1", []string{"service_1"})
-	action2 := NewMockHealingAction("fix_service_2", []string{"service_2"})
-	action3 := NewMockHealingAction("fix_service_3", []string{"service_3"})
+		action1 := NewMockHealingAction("fix_service_1", []string{"service_1"})
+		action2 := NewMockHealingAction("fix_service_2", []string{"service_2"})
+		action3 := NewMockHealingAction("fix_service_3", []string{"service_3"})
 
-	ahs.AddHealthChecker(checker1)
-	ahs.AddHealthChecker(checker2)
-	ahs.AddHealthChecker(checker3)
+		ahs.AddHealthChecker(checker1)
+		ahs.AddHealthChecker(checker2)
+		ahs.AddHealthChecker(checker3)
 
-	ahs.AddHealingAction("service_1", action1)
-	ahs.AddHealingAction("service_2", action2)
-	ahs.AddHealingAction("service_3", action3)
+		ahs.AddHealingAction("service_1", action1)
+		ahs.AddHealingAction("service_2", action2)
+		ahs.AddHealingAction("service_3", action3)
 
-	err := ahs.Start()
-	if err != nil {
-		t.Fatalf("Failed to start auto-healing system: %v", err)
-	}
-	defer ahs.Stop()
+		if err := ahs.Start(); err != nil {
+			t.Fatalf("Failed to start auto-healing system: %v", err)
+		}
+		defer ahs.Stop()
 
-	// すべてのサービスで障害を発生
-	checker1.SimulateFailure()
-	checker2.SimulateFailure()
-	checker3.SimulateFailure()
+		// すべてのサービスで障害を発生
+		checker1.SimulateFailure()
+		checker2.SimulateFailure()
+		checker3.SimulateFailure()
 
-	// 復旧処理を待機
-	time.Sleep(800 * time.Millisecond)
+		// 復旧処理を待機
+		synctest.Sleep(800 * time.Millisecond)
 
-	// すべてのアクションが実行されたことを確認
-	if action1.GetExecutionCount() == 0 {
-		t.Error("Expected action1 to be executed")
-	}
-	if action2.GetExecutionCount() == 0 {
-		t.Error("Expected action2 to be executed")
-	}
-	if action3.GetExecutionCount() == 0 {
-		t.Error("Expected action3 to be executed")
-	}
+		// すべてのアクションが実行されたことを確認
+		if action1.GetExecutionCount() == 0 {
+			t.Error("Expected action1 to be executed")
+		}
+		if action2.GetExecutionCount() == 0 {
+			t.Error("Expected action2 to be executed")
+		}
+		if action3.GetExecutionCount() == 0 {
+			t.Error("Expected action3 to be executed")
+		}
 
-	status := ahs.GetStatus()
-	if status["total_issues"].(int64) < 3 {
-		t.Errorf("Expected at least 3 issues, got %d", status["total_issues"].(int64))
-	}
+		status := ahs.GetStatus()
+		if status["total_issues"].(int64) < 3 {
+			t.Errorf("Expected at least 3 issues, got %d", status["total_issues"].(int64))
+		}
+	})
 }
 
 func TestAutoHealingSystem_AlertGeneration(t *testing.T) {
-	ahs := NewAutoHealingSystem(100*time.Millisecond, 2)
+	synctest.Test(t, func(t *testing.T) {
+		ahs := NewAutoHealingSystem(100*time.Millisecond, 2)
 
-	mockChecker := NewMockHealthChecker("alerting_service", true)
-	mockAction := NewMockHealingAction("fix_alerting", []string{"alerting_service"})
+		mockChecker := NewMockHealthChecker("alerting_service", true)
+		mockAction := NewMockHealingAction("fix_alerting", []string{"alerting_service"})
 
-	ahs.AddHealthChecker(mockChecker)
-	ahs.AddHealingAction("alerting_service", mockAction)
+		ahs.AddHealthChecker(mockChecker)
+		ahs.AddHealingAction("alerting_service", mockAction)
 
-	var alertReceived bool
-	ahs.alertManager.AddCallback(func(alert Alert) {
-		if alert.Level == AlertLevelWarning || alert.Level == AlertLevelError {
-			alertReceived = true
+		// コールバックは別の goroutine で呼ばれる
+		var alertReceived atomic.Bool
+		ahs.alertManager.AddCallback(func(alert Alert) {
+			if alert.Level == AlertLevelWarning || alert.Level == AlertLevelError {
+				alertReceived.Store(true)
+			}
+		})
+
+		if err := ahs.Start(); err != nil {
+			t.Fatalf("Failed to start auto-healing system: %v", err)
+		}
+		defer ahs.Stop()
+
+		// 障害を発生させる
+		mockChecker.SimulateFailure()
+
+		// アラートが生成されるまで待機
+		synctest.Sleep(500 * time.Millisecond)
+
+		if !alertReceived.Load() {
+			t.Error("Expected alert to be generated")
+		}
+
+		// アラート履歴を確認
+		alerts := ahs.alertManager.GetAlerts(10)
+		if len(alerts) == 0 {
+			t.Error("Expected alerts to be stored in history")
 		}
 	})
-
-	err := ahs.Start()
-	if err != nil {
-		t.Fatalf("Failed to start auto-healing system: %v", err)
-	}
-	defer ahs.Stop()
-
-	// 障害を発生させる
-	mockChecker.SimulateFailure()
-
-	// アラートが生成されるまで待機
-	time.Sleep(500 * time.Millisecond)
-
-	if !alertReceived {
-		t.Error("Expected alert to be generated")
-	}
-
-	// アラート履歴を確認
-	alerts := ahs.alertManager.GetAlerts(10)
-	if len(alerts) == 0 {
-		t.Error("Expected alerts to be stored in history")
-	}
 }
 
 func TestAutoHealingSystem_StatusReporting(t *testing.T) {
-	ahs := NewAutoHealingSystem(200*time.Millisecond, 2)
+	synctest.Test(t, func(t *testing.T) {
+		ahs := NewAutoHealingSystem(200*time.Millisecond, 2)
 
-	mockChecker := NewMockHealthChecker("status_service", true)
-	ahs.AddHealthChecker(mockChecker)
+		mockChecker := NewMockHealthChecker("status_service", true)
+		ahs.AddHealthChecker(mockChecker)
 
-	err := ahs.Start()
-	if err != nil {
-		t.Fatalf("Failed to start auto-healing system: %v", err)
-	}
-	defer ahs.Stop()
-
-	// しばらく実行させる
-	time.Sleep(500 * time.Millisecond)
-
-	status := ahs.GetStatus()
-
-	// 必要なフィールドが含まれているかチェック
-	expectedFields := []string{
-		"is_running", "total_checks", "total_issues",
-		"total_actions", "total_successful_actions",
-		"system_metrics", "recent_alerts",
-		"health_checkers", "healing_actions",
-	}
-
-	for _, field := range expectedFields {
-		if _, exists := status[field]; !exists {
-			t.Errorf("Expected field %s to be present in status", field)
+		if err := ahs.Start(); err != nil {
+			t.Fatalf("Failed to start auto-healing system: %v", err)
 		}
-	}
+		defer ahs.Stop()
 
-	if !status["is_running"].(bool) {
-		t.Error("Expected system to be running")
-	}
+		// しばらく実行させる
+		synctest.Sleep(500 * time.Millisecond)
 
-	if status["health_checkers"].(int) != 1 {
-		t.Errorf("Expected 1 health checker, got %d", status["health_checkers"].(int))
-	}
+		status := ahs.GetStatus()
+
+		// 必要なフィールドが含まれているかチェック
+		expectedFields := []string{
+			"is_running", "total_checks", "total_issues",
+			"total_actions", "total_successful_actions",
+			"system_metrics", "recent_alerts",
+			"health_checkers", "healing_actions",
+		}
+
+		for _, field := range expectedFields {
+			if _, exists := status[field]; !exists {
+				t.Errorf("Expected field %s to be present in status", field)
+			}
+		}
+
+		if !status["is_running"].(bool) {
+			t.Error("Expected system to be running")
+		}
+
+		if status["health_checkers"].(int) != 1 {
+			t.Errorf("Expected 1 health checker, got %d", status["health_checkers"].(int))
+		}
+	})
 }
 
 func TestAutoHealingSystem_StartStop(t *testing.T) {
@@ -367,8 +402,7 @@ func TestAutoHealingSystem_StartStop(t *testing.T) {
 	}
 
 	// 開始
-	err := ahs.Start()
-	if err != nil {
+	if err := ahs.Start(); err != nil {
 		t.Fatalf("Failed to start auto-healing system: %v", err)
 	}
 
@@ -379,19 +413,41 @@ func TestAutoHealingSystem_StartStop(t *testing.T) {
 	}
 
 	// 重複開始はエラーになるはず
-	err = ahs.Start()
-	if err == nil {
+	if err := ahs.Start(); err == nil {
 		t.Error("Expected error when starting already running system")
 	}
 
-	// 停止
+	// Stop は監視ループの終了まで待ってから戻る
 	ahs.Stop()
 
-	// 停止状態を確認
-	time.Sleep(100 * time.Millisecond)
 	status = ahs.GetStatus()
 	if status["is_running"].(bool) {
 		t.Error("Expected system to be stopped after stop")
+	}
+
+	// 停止後の再開始は監視ループが動かないのでエラーにする
+	if err := ahs.Start(); err == nil {
+		t.Error("Expected error when starting a stopped system")
+	}
+}
+
+func TestAutoHealingSystem_ConcurrentStartStop(t *testing.T) {
+	for range 50 {
+		ahs := NewAutoHealingSystem(time.Millisecond, 1)
+		ahs.AddHealthChecker(NewMockHealthChecker("svc", true))
+
+		var wg sync.WaitGroup
+		wg.Go(func() { _ = ahs.Start() })
+		wg.Go(ahs.Stop)
+		wg.Wait()
+		ahs.Stop()
+
+		if err := ahs.Start(); err == nil {
+			t.Fatal("Expected error when starting after stop")
+		}
+		if ahs.GetStatus()["is_running"].(bool) {
+			t.Fatal("Expected system to stay stopped")
+		}
 	}
 }
 
@@ -406,8 +462,7 @@ func TestMemoryHealthChecker(t *testing.T) {
 		t.Error("Expected memory checker to be critical")
 	}
 
-	ctx := context.Background()
-	result := checker.Check(ctx)
+	result := checker.Check(t.Context())
 
 	if result.Name != "memory_usage" {
 		t.Errorf("Expected result name 'memory_usage', got %s", result.Name)
@@ -438,8 +493,7 @@ func TestGoroutineHealthChecker(t *testing.T) {
 		t.Errorf("Expected name 'goroutine_count', got %s", checker.Name())
 	}
 
-	ctx := context.Background()
-	result := checker.Check(ctx)
+	result := checker.Check(t.Context())
 
 	if result.Name != "goroutine_count" {
 		t.Errorf("Expected result name 'goroutine_count', got %s", result.Name)
@@ -470,20 +524,17 @@ func TestGCTriggerAction(t *testing.T) {
 		t.Error("Expected action to not handle disk_usage issues")
 	}
 
-	ctx := context.Background()
 	issue := HealthIssue{
 		Type:        "memory_usage",
 		Severity:    SeverityHigh,
 		Description: "High memory usage detected",
 	}
 
-	err := action.Execute(ctx, issue)
-	if err != nil {
+	if err := action.Execute(t.Context(), issue); err != nil {
 		t.Errorf("Expected no error from GC trigger, got %v", err)
 	}
 
-	duration := action.EstimatedDuration()
-	if duration <= 0 {
+	if duration := action.EstimatedDuration(); duration <= 0 {
 		t.Error("Expected positive estimated duration")
 	}
 }
@@ -495,9 +546,8 @@ func BenchmarkAutoHealingSystem_HealthCheck(b *testing.B) {
 	checker := NewMockHealthChecker("benchmark_service", false)
 	ahs.AddHealthChecker(checker)
 
-	ctx := context.Background()
+	ctx := b.Context()
 
-	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			checker.Check(ctx)

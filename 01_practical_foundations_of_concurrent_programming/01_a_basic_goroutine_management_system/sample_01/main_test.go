@@ -2,46 +2,42 @@ package main
 
 import (
 	"context"
-	"sync"
+	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
 func TestGoroutineManager_StartWorker(t *testing.T) {
-	gm := NewGoroutineManager()
+	synctest.Test(t, func(t *testing.T) {
+		gm := NewGoroutineManager()
 
-	// 正常系: ワーカーの開始
-	taskExecuted := false
-	var mu sync.Mutex
+		// 正常系: ワーカーの開始
+		var taskExecuted atomic.Bool
 
-	taskFunc := func(ctx context.Context) {
-		mu.Lock()
-		taskExecuted = true
-		mu.Unlock()
+		taskFunc := func(ctx context.Context) {
+			taskExecuted.Store(true)
 
-		// 短時間で終了するタスク
-		select {
-		case <-ctx.Done():
-		case <-time.After(100 * time.Millisecond):
+			// 短時間で終了するタスク
+			select {
+			case <-ctx.Done():
+			case <-time.After(100 * time.Millisecond):
+			}
 		}
-	}
 
-	err := gm.StartWorker("test-worker", taskFunc)
-	if err != nil {
-		t.Fatalf("Expected no error, got %v", err)
-	}
+		if err := gm.StartWorker("test-worker", taskFunc); err != nil {
+			t.Fatalf("Expected no error, got %v", err)
+		}
 
-	// ワーカーが実行されることを確認
-	time.Sleep(150 * time.Millisecond)
+		// ワーカーがselectで待機状態に入るまで待つ（実時間は経過しない）
+		synctest.Wait()
 
-	mu.Lock()
-	if !taskExecuted {
-		t.Error("Task was not executed")
-	}
-	mu.Unlock()
+		if !taskExecuted.Load() {
+			t.Error("Task was not executed")
+		}
 
-	// クリーンアップ
-	gm.StopAll()
+		gm.StopAll()
+	})
 }
 
 func TestGoroutineManager_StartWorker_Duplicate(t *testing.T) {

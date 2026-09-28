@@ -3,7 +3,11 @@ package adapters
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"log"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -37,7 +41,7 @@ func (o *OracleAdapter) Connect(ctx context.Context, cfg config.DatabaseConfig) 
 
 	db, err := sql.Open("oracle", dsn)
 	if err != nil {
-		return fmt.Errorf("Oracle接続エラー: %w", err)
+		return fmt.Errorf("データベース接続エラー (Oracle): %w", err)
 	}
 
 	// Oracle特有の接続プール設定
@@ -51,14 +55,12 @@ func (o *OracleAdapter) Connect(ctx context.Context, cfg config.DatabaseConfig) 
 	defer cancel()
 
 	if err := db.PingContext(ctxTimeout); err != nil {
-		db.Close()
-		return fmt.Errorf("Oracle接続テストエラー: %w", err)
+		return fmt.Errorf("データベース接続テストエラー (Oracle): %w", errors.Join(err, db.Close()))
 	}
 
 	// Oracle固有の設定を実行
 	if err := o.configureOracleSession(ctx, db); err != nil {
-		db.Close()
-		return fmt.Errorf("Oracleセッション設定エラー: %w", err)
+		return fmt.Errorf("データベースセッション設定エラー (Oracle): %w", errors.Join(err, db.Close()))
 	}
 
 	o.db = db
@@ -91,7 +93,7 @@ func (o *OracleAdapter) configureOracleSession(ctx context.Context, db *sql.DB) 
 }
 
 // Query データを取得
-func (o *OracleAdapter) Query(ctx context.Context, query string, args ...interface{}) (*QueryResult, error) {
+func (o *OracleAdapter) Query(ctx context.Context, query string, args ...any) (*QueryResult, error) {
 	start := time.Now()
 
 	o.mutex.RLock()
@@ -104,12 +106,12 @@ func (o *OracleAdapter) Query(ctx context.Context, query string, args ...interfa
 	rows, err := o.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return &QueryResult{
-			Error:   fmt.Errorf("Oracleクエリエラー: %w", err),
+			Error:   fmt.Errorf("クエリエラー (Oracle): %w", err),
 			Elapsed: time.Since(start),
 			DBType:  "Oracle",
 		}, nil
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 
 	columns, err := rows.Columns()
 	if err != nil {
@@ -120,10 +122,10 @@ func (o *OracleAdapter) Query(ctx context.Context, query string, args ...interfa
 		}, nil
 	}
 
-	var results []map[string]interface{}
+	var results []map[string]any
 	for rows.Next() {
-		values := make([]interface{}, len(columns))
-		valuePtrs := make([]interface{}, len(columns))
+		values := make([]any, len(columns))
+		valuePtrs := make([]any, len(columns))
 		for i := range columns {
 			valuePtrs[i] = &values[i]
 		}
@@ -136,7 +138,7 @@ func (o *OracleAdapter) Query(ctx context.Context, query string, args ...interfa
 			}, nil
 		}
 
-		row := make(map[string]interface{})
+		row := make(map[string]any)
 		for i, col := range columns {
 			// Oracle特有のデータ型変換
 			val := values[i]
@@ -172,7 +174,7 @@ func (o *OracleAdapter) Query(ctx context.Context, query string, args ...interfa
 }
 
 // Execute データを変更
-func (o *OracleAdapter) Execute(ctx context.Context, query string, args ...interface{}) (sql.Result, error) {
+func (o *OracleAdapter) Execute(ctx context.Context, query string, args ...any) (sql.Result, error) {
 	o.mutex.RLock()
 	defer o.mutex.RUnlock()
 
@@ -196,18 +198,22 @@ func (o *OracleAdapter) Transaction(ctx context.Context, fn func(*sql.Tx) error)
 		Isolation: sql.LevelReadCommitted,
 	})
 	if err != nil {
-		return fmt.Errorf("Oracleトランザクション開始エラー: %w", err)
+		return fmt.Errorf("トランザクション開始エラー (Oracle): %w", err)
 	}
 
 	defer func() {
 		if r := recover(); r != nil {
-			tx.Rollback()
+			if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+				log.Printf("ロールバックエラー: %v", err)
+			}
 			panic(r)
 		}
 	}()
 
 	if err := fn(tx); err != nil {
-		tx.Rollback()
+		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+			return errors.Join(err, fmt.Errorf("ロールバックエラー: %w", rbErr))
+		}
 		return err
 	}
 
@@ -260,15 +266,15 @@ func (o *OracleAdapter) CreateUser(ctx context.Context, user *models.User) (*mod
 	var existingID int64
 	checkQuery := `SELECT id FROM users WHERE email = :1`
 	err := o.db.QueryRowContext(ctx, checkQuery, user.Email).Scan(&existingID)
-	
-	if err != nil && err != sql.ErrNoRows {
+
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("存在チェックエラー: %w", err)
 	}
 
 	var id int64
 	var createdAt, updatedAt time.Time
 
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		// レコードが存在しない場合はINSERT
 		insertQuery := `
 			INSERT INTO users (name, email, age) 
@@ -278,7 +284,7 @@ func (o *OracleAdapter) CreateUser(ctx context.Context, user *models.User) (*mod
 		if err != nil {
 			return nil, fmt.Errorf("ユーザー作成エラー: %w", err)
 		}
-		
+
 		// 挿入したレコードのIDを取得
 		selectQuery := `SELECT id, created_at, updated_at FROM users WHERE email = :1`
 		err = o.db.QueryRowContext(ctx, selectQuery, user.Email).Scan(&id, &createdAt, &updatedAt)
@@ -296,7 +302,7 @@ func (o *OracleAdapter) CreateUser(ctx context.Context, user *models.User) (*mod
 		if err != nil {
 			return nil, fmt.Errorf("ユーザー更新エラー: %w", err)
 		}
-		
+
 		// 更新したレコードの情報を取得
 		selectQuery := `SELECT id, created_at, updated_at FROM users WHERE email = :1`
 		err = o.db.QueryRowContext(ctx, selectQuery, user.Email).Scan(&id, &createdAt, &updatedAt)
@@ -326,27 +332,31 @@ func (o *OracleAdapter) GetUsersByAgeRange(ctx context.Context, minAge, maxAge i
 	if err != nil {
 		return nil, fmt.Errorf("年齢範囲クエリエラー: %w", err)
 	}
+	if result.Error != nil {
+		return nil, fmt.Errorf("年齢範囲クエリエラー: %w", result.Error)
+	}
 
 	var users []*models.User
 	for _, row := range result.Data {
 		user := &models.User{}
-		if id, ok := row["ID"].(int64); ok { // Oracleは大文字でカラム名を返す
-			user.ID = id
-		}
+		user.ID = oracleInt64(row["ID"]) // Oracle のカラム名は大文字で返る
 		if name, ok := row["NAME"].(string); ok {
 			user.Name = name
 		}
 		if email, ok := row["EMAIL"].(string); ok {
 			user.Email = email
 		}
-		if age, ok := row["AGE"].(int64); ok {
-			user.Age = int(age)
+		user.Age = int(oracleInt64(row["AGE"]))
+		// Query が time.Time を文字列に変換して返すので、ここで戻す
+		if createdAt, ok := row["CREATED_AT"].(string); ok {
+			if t, err := time.Parse("2006-01-02 15:04:05", createdAt); err == nil {
+				user.CreatedAt = t
+			}
 		}
-		if createdAt, ok := row["CREATED_AT"].(time.Time); ok {
-			user.CreatedAt = createdAt
-		}
-		if updatedAt, ok := row["UPDATED_AT"].(time.Time); ok {
-			user.UpdatedAt = updatedAt
+		if updatedAt, ok := row["UPDATED_AT"].(string); ok {
+			if t, err := time.Parse("2006-01-02 15:04:05", updatedAt); err == nil {
+				user.UpdatedAt = t
+			}
 		}
 
 		users = append(users, user)
@@ -364,15 +374,12 @@ func (o *OracleAdapter) BulkInsertUsers(ctx context.Context, users []*models.Use
 	// Oracle最適化: BULK COLLECT/FORALL を使用
 	// ここでは簡易版として通常のバッチ挿入を実装
 	batchSize := 1000
-	for i := 0; i < len(users); i += batchSize {
-		end := i + batchSize
-		if end > len(users) {
-			end = len(users)
+	offset := 0
+	for batch := range slices.Chunk(users, batchSize) {
+		if err := o.insertBatch(ctx, batch); err != nil {
+			return fmt.Errorf("バッチ挿入エラー (batch %d-%d): %w", offset, offset+len(batch)-1, err)
 		}
-
-		if err := o.insertBatch(ctx, users[i:end]); err != nil {
-			return fmt.Errorf("バッチ挿入エラー (batch %d-%d): %w", i, end-1, err)
-		}
+		offset += len(batch)
 	}
 
 	return nil
@@ -385,7 +392,7 @@ func (o *OracleAdapter) insertBatch(ctx context.Context, users []*models.User) e
 
 	// Oracleの場合、複数行挿入を使用
 	var valueStrings []string
-	var valueArgs []interface{}
+	var valueArgs []any
 
 	for i, user := range users {
 		valueStrings = append(valueStrings, fmt.Sprintf("(:p%d, :p%d, :p%d)", i*3+1, i*3+2, i*3+3))
@@ -399,7 +406,7 @@ func (o *OracleAdapter) insertBatch(ctx context.Context, users []*models.User) e
 }
 
 // ExecuteStoredProcedure ストアドプロシージャ実行（Oracle特有）
-func (o *OracleAdapter) ExecuteStoredProcedure(ctx context.Context, procName string, args ...interface{}) (*QueryResult, error) {
+func (o *OracleAdapter) ExecuteStoredProcedure(ctx context.Context, procName string, args ...any) (*QueryResult, error) {
 	start := time.Now()
 
 	o.mutex.RLock()
@@ -433,7 +440,7 @@ func (o *OracleAdapter) ExecuteStoredProcedure(ctx context.Context, procName str
 }
 
 // ExecuteFunction ファンション実行（Oracle特有）
-func (o *OracleAdapter) ExecuteFunction(ctx context.Context, funcName string, returnType interface{}, args ...interface{}) (*QueryResult, error) {
+func (o *OracleAdapter) ExecuteFunction(ctx context.Context, funcName string, returnType any, args ...any) (*QueryResult, error) {
 	start := time.Now()
 
 	o.mutex.RLock()
@@ -451,7 +458,7 @@ func (o *OracleAdapter) ExecuteFunction(ctx context.Context, funcName string, re
 
 	query := fmt.Sprintf("BEGIN :p1 := %s(%s); END;", funcName, strings.Join(placeholders, ", "))
 
-	allArgs := append([]interface{}{sql.Out{Dest: returnType}}, args...)
+	allArgs := append([]any{sql.Out{Dest: returnType}}, args...)
 	_, err := o.db.ExecContext(ctx, query, allArgs...)
 	if err != nil {
 		return &QueryResult{
@@ -462,19 +469,19 @@ func (o *OracleAdapter) ExecuteFunction(ctx context.Context, funcName string, re
 	}
 
 	// 結果をマップに変換
-	result := map[string]interface{}{
+	result := map[string]any{
 		"return_value": returnType,
 	}
 
 	return &QueryResult{
-		Data:    []map[string]interface{}{result},
+		Data:    []map[string]any{result},
 		Elapsed: time.Since(start),
 		DBType:  "Oracle",
 	}, nil
 }
 
 // GetExplainPlan 実行計画取得（Oracle特有）
-func (o *OracleAdapter) GetExplainPlan(ctx context.Context, query string, args ...interface{}) (*QueryResult, error) {
+func (o *OracleAdapter) GetExplainPlan(ctx context.Context, query string, args ...any) (*QueryResult, error) {
 	start := time.Now()
 
 	// ユニークなステートメントID生成
@@ -512,8 +519,22 @@ func (o *OracleAdapter) GetExplainPlan(ctx context.Context, query string, args .
 
 	// 実行計画をクリーンアップ
 	cleanupQuery := "DELETE FROM PLAN_TABLE WHERE STATEMENT_ID = :1"
-	o.Execute(ctx, cleanupQuery, statementID)
+	if _, err := o.Execute(ctx, cleanupQuery, statementID); err != nil {
+		log.Printf("PLAN_TABLE の後始末エラー: %v", err)
+	}
 
 	result.Elapsed = time.Since(start)
 	return result, nil
+}
+
+// oracleInt64 Query の結果では NUMBER 列が文字列になるので、整数に直す。変換できない値は0にする
+func oracleInt64(v any) int64 {
+	switch x := v.(type) {
+	case int64:
+		return x
+	case string:
+		n, _ := strconv.ParseInt(x, 10, 64)
+		return n
+	}
+	return 0
 }

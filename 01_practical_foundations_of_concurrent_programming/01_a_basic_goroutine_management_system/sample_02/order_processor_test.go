@@ -1,83 +1,72 @@
 package main
 
 import (
-	"context"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
-func TestOrderProcessor_SubmitOrder(t *testing.T) {
-	processor := NewOrderProcessor(2, 10)
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-	defer cancel()
-
-	processor.Start(ctx)
-
-	// 正常系: 注文の送信
-	order := Order{
-		ID:         1,
+func newTestOrder(id int) Order {
+	return Order{
+		ID:         id,
 		CustomerID: "test-customer",
 		Amount:     100.0,
 		CreatedAt:  time.Now(),
 	}
+}
 
-	err := processor.SubmitOrder(order)
-	if err != nil {
-		t.Fatalf("Expected no error, got %v", err)
-	}
+func TestOrderProcessor_SubmitOrder(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		// ワーカーを起動する前に投入し、消費と競合しない状態でバッファ上限を確かめる
+		processor := NewOrderProcessor(2, 10)
 
-	// バッファが満杯になるまで注文を送信
-	for i := 2; i <= 11; i++ {
-		order.ID = i
-		if err := processor.SubmitOrder(order); err != nil {
-			t.Logf("Failed to submit order %d: %v", i, err)
+		for i := range 10 {
+			if err := processor.SubmitOrder(newTestOrder(i + 1)); err != nil {
+				t.Fatalf("order %d: expected no error, got %v", i+1, err)
+			}
 		}
-	}
 
-	// 異常系: バッファ満杯時の送信
-	order.ID = 12
-	err = processor.SubmitOrder(order)
-	if err == nil {
-		t.Error("Expected error for full buffer, got nil")
-	}
+		// 異常系: バッファ満杯時の送信は待たずにエラーを返す
+		if err := processor.SubmitOrder(newTestOrder(11)); err == nil {
+			t.Error("Expected error for full buffer, got nil")
+		}
 
-	processor.Shutdown()
+		// 正常系: 起動後はキューに溜まった注文がすべて処理される
+		processor.Start(t.Context())
+		processor.Shutdown()
+
+		processed, errors := processor.GetStats()
+		if processed+errors != 10 {
+			t.Errorf("Expected total processed+errors = 10, got %d", processed+errors)
+		}
+	})
 }
 
 func TestOrderProcessor_GetStats(t *testing.T) {
-	processor := NewOrderProcessor(1, 5)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
+	synctest.Test(t, func(t *testing.T) {
+		processor := NewOrderProcessor(1, 5)
+		processor.Start(t.Context())
 
-	processor.Start(ctx)
-
-	// 初期状態の確認
-	processed, errors := processor.GetStats()
-	if processed != 0 || errors != 0 {
-		t.Errorf("Expected initial stats (0, 0), got (%d, %d)", processed, errors)
-	}
-
-	// 注文を送信
-	for i := 1; i <= 5; i++ {
-		order := Order{
-			ID:         i,
-			CustomerID: "test-customer",
-			Amount:     100.0,
-			CreatedAt:  time.Now(),
+		// 初期状態の確認
+		processed, errors := processor.GetStats()
+		if processed != 0 || errors != 0 {
+			t.Errorf("Expected initial stats (0, 0), got (%d, %d)", processed, errors)
 		}
-		if err := processor.SubmitOrder(order); err != nil {
-			t.Logf("Failed to submit order: %v", err)
+
+		for i := range 5 {
+			if err := processor.SubmitOrder(newTestOrder(i + 1)); err != nil {
+				t.Fatalf("Failed to submit order: %v", err)
+			}
 		}
-	}
 
-	// 処理完了を待つ
-	time.Sleep(1 * time.Second)
+		// 仮想時計を1秒進め、全goroutineが待機状態に入るまで待つ（実時間は経過しない）
+		synctest.Sleep(time.Second)
 
-	// 統計の確認
-	processed, errors = processor.GetStats()
-	if processed+errors != 5 {
-		t.Errorf("Expected total processed+errors = 5, got %d", processed+errors)
-	}
+		processed, errors = processor.GetStats()
+		if processed+errors != 5 {
+			t.Errorf("Expected total processed+errors = 5, got %d", processed+errors)
+		}
 
-	processor.Shutdown()
+		processor.Shutdown()
+	})
 }

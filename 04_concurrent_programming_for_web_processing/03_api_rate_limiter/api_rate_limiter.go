@@ -1,14 +1,17 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"net/http"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -107,7 +110,7 @@ type APIRateLimiter struct {
 	stats *LimiterStats
 
 	// 制御フラグ
-	isRunning int32
+	isRunning atomic.Bool
 	startTime time.Time
 }
 
@@ -128,9 +131,9 @@ type RateLimitWorker struct {
 // LimiterStats リミッター統計です
 type LimiterStats struct {
 	mu                sync.RWMutex
-	totalRequests     int64
-	allowedRequests   int64
-	blockedRequests   int64
+	totalRequests     atomic.Int64
+	allowedRequests   atomic.Int64
+	blockedRequests   atomic.Int64
 	topBlockedClients map[string]int64
 	topAllowedClients map[string]int64
 	endpointStats     map[string]*EndpointStats
@@ -138,14 +141,43 @@ type LimiterStats struct {
 	startTime         time.Time
 }
 
-// WorkerStats ワーカー統計です
+// WorkerStats ワーカー統計です。goroutineをまたいで読み書きされるため型付きatomicで保持します。
 type WorkerStats struct {
+	WorkerID          int
+	ProcessedRequests atomic.Int64
+	AllowedRequests   atomic.Int64
+	BlockedRequests   atomic.Int64
+	TotalProcessTime  atomic.Int64 // ナノ秒
+}
+
+// WorkerStatsSnapshot ある時点のワーカー統計の値コピーです
+type WorkerStatsSnapshot struct {
 	WorkerID           int
 	ProcessedRequests  int64
 	AllowedRequests    int64
 	BlockedRequests    int64
 	TotalProcessTime   time.Duration
 	AverageProcessTime time.Duration
+}
+
+// Snapshot 現在の値をプレーンな構造体へコピーします
+func (s *WorkerStats) Snapshot() WorkerStatsSnapshot {
+	processed := s.ProcessedRequests.Load()
+	total := time.Duration(s.TotalProcessTime.Load())
+
+	var avg time.Duration
+	if processed > 0 {
+		avg = total / time.Duration(processed)
+	}
+
+	return WorkerStatsSnapshot{
+		WorkerID:           s.WorkerID,
+		ProcessedRequests:  processed,
+		AllowedRequests:    s.AllowedRequests.Load(),
+		BlockedRequests:    s.BlockedRequests.Load(),
+		TotalProcessTime:   total,
+		AverageProcessTime: avg,
+	}
 }
 
 // EndpointStats エンドポイント統計です
@@ -235,7 +267,7 @@ func getDefaultRateLimitRules() []*RateLimitRule {
 			Window:      1 * time.Hour,
 			BurstLimit:  20,
 			BurstWindow: 1 * time.Minute,
-			Methods:     []string{"POST", "PUT", "DELETE"},
+			Methods:     []string{http.MethodPost, http.MethodPut, http.MethodDelete},
 			Priority:    150,
 		},
 	}
@@ -269,7 +301,7 @@ func NewAPIRateLimiter(config *LimiterConfig) *APIRateLimiter {
 	}
 
 	// ワーカーを初期化
-	for i := 0; i < config.WorkerCount; i++ {
+	for i := range config.WorkerCount {
 		worker := &RateLimitWorker{
 			ID:      i,
 			limiter: limiter,
@@ -291,8 +323,8 @@ func (arl *APIRateLimiter) AddRule(rule *RateLimitRule) {
 	arl.rules = append(arl.rules, rule)
 
 	// 優先度でソート（高い優先度が先）
-	sort.Slice(arl.rules, func(i, j int) bool {
-		return arl.rules[i].Priority > arl.rules[j].Priority
+	slices.SortFunc(arl.rules, func(a, b *RateLimitRule) int {
+		return cmp.Compare(b.Priority, a.Priority)
 	})
 
 	log.Printf("Rate limit rule added: %s (Priority=%d, Limit=%d/%v)",
@@ -301,8 +333,8 @@ func (arl *APIRateLimiter) AddRule(rule *RateLimitRule) {
 
 // Start レート制限システムを開始します
 func (arl *APIRateLimiter) Start() error {
-	if !atomic.CompareAndSwapInt32(&arl.isRunning, 0, 1) {
-		return fmt.Errorf("limiter is already running")
+	if !arl.isRunning.CompareAndSwap(false, true) {
+		return errors.New("limiter is already running")
 	}
 
 	arl.startTime = time.Now()
@@ -312,22 +344,18 @@ func (arl *APIRateLimiter) Start() error {
 
 	// ワーカーを開始
 	for _, worker := range arl.workers {
-		arl.wg.Add(1)
-		go worker.run()
+		arl.wg.Go(worker.run)
 	}
 
 	// 結果処理を開始
-	arl.wg.Add(1)
-	go arl.handleResults()
+	arl.wg.Go(arl.handleResults)
 
 	// クリーンアップを開始
-	arl.wg.Add(1)
-	go arl.cleanupLoop()
+	arl.wg.Go(arl.cleanupLoop)
 
 	// メトリクス監視を開始
 	if arl.config.EnableMetrics {
-		arl.wg.Add(1)
-		go arl.monitorMetrics()
+		arl.wg.Go(arl.monitorMetrics)
 	}
 
 	log.Printf("API rate limiter started successfully")
@@ -336,8 +364,8 @@ func (arl *APIRateLimiter) Start() error {
 
 // CheckRateLimit レート制限をチェックします
 func (arl *APIRateLimiter) CheckRateLimit(request *RateLimitRequest) (*RateLimitResult, error) {
-	if atomic.LoadInt32(&arl.isRunning) == 0 {
-		return nil, fmt.Errorf("limiter is not running")
+	if arl.ctx.Err() != nil || !arl.isRunning.Load() {
+		return nil, errors.New("limiter is not running")
 	}
 
 	// レスポンスチャネルを作成
@@ -352,11 +380,11 @@ func (arl *APIRateLimiter) CheckRateLimit(request *RateLimitRequest) (*RateLimit
 	// リクエストキューに追加
 	select {
 	case arl.requestQueue <- rateLimitCtx:
-		atomic.AddInt64(&arl.stats.totalRequests, 1)
+		arl.stats.totalRequests.Add(1)
 	case <-arl.ctx.Done():
-		return nil, fmt.Errorf("limiter is shutting down")
+		return nil, errors.New("limiter is shutting down")
 	default:
-		return nil, fmt.Errorf("request queue is full")
+		return nil, errors.New("request queue is full")
 	}
 
 	// 結果を待機
@@ -364,16 +392,14 @@ func (arl *APIRateLimiter) CheckRateLimit(request *RateLimitRequest) (*RateLimit
 	case result := <-responseChan:
 		return result, nil
 	case <-time.After(5 * time.Second):
-		return nil, fmt.Errorf("rate limit check timeout")
+		return nil, errors.New("rate limit check timeout")
 	case <-arl.ctx.Done():
-		return nil, fmt.Errorf("limiter is shutting down")
+		return nil, errors.New("limiter is shutting down")
 	}
 }
 
 // run ワーカーのメインループです
 func (rlw *RateLimitWorker) run() {
-	defer rlw.limiter.wg.Done()
-
 	log.Printf("Rate limit worker %d started", rlw.ID)
 
 	for {
@@ -408,7 +434,7 @@ func (rlw *RateLimitWorker) processRateLimitCheck(rateLimitCtx *RateLimitContext
 	request := rateLimitCtx.Request
 
 	// 統計更新
-	atomic.AddInt64(&rlw.stats.ProcessedRequests, 1)
+	rlw.stats.ProcessedRequests.Add(1)
 
 	// 適用可能なルールを見つける
 	rule := rlw.findApplicableRule(request)
@@ -423,7 +449,7 @@ func (rlw *RateLimitWorker) processRateLimitCheck(rateLimitCtx *RateLimitContext
 			WindowEnd:   time.Now().Add(24 * time.Hour),
 		}
 
-		atomic.AddInt64(&rlw.stats.AllowedRequests, 1)
+		rlw.stats.AllowedRequests.Add(1)
 		rlw.updateProcessingTime(time.Since(start))
 		return result
 	}
@@ -436,10 +462,10 @@ func (rlw *RateLimitWorker) processRateLimitCheck(rateLimitCtx *RateLimitContext
 
 	// 統計更新
 	if result.Allowed {
-		atomic.AddInt64(&rlw.stats.AllowedRequests, 1)
+		rlw.stats.AllowedRequests.Add(1)
 		rlw.limiter.updateAllowedStats(request)
 	} else {
-		atomic.AddInt64(&rlw.stats.BlockedRequests, 1)
+		rlw.stats.BlockedRequests.Add(1)
 		rlw.limiter.updateBlockedStats(request)
 	}
 
@@ -464,45 +490,23 @@ func (rlw *RateLimitWorker) findApplicableRule(request *RateLimitRequest) *RateL
 // ruleMatches ルールがリクエストに適用可能かチェックします
 func (rlw *RateLimitWorker) ruleMatches(rule *RateLimitRule, request *RateLimitRequest) bool {
 	// ユーザーティアチェック
-	if len(rule.UserTiers) > 0 {
-		tierMatches := false
-		for _, tier := range rule.UserTiers {
-			if tier == request.UserTier {
-				tierMatches = true
-				break
-			}
-		}
-		if !tierMatches {
-			return false
-		}
+	if len(rule.UserTiers) > 0 && !slices.Contains(rule.UserTiers, request.UserTier) {
+		return false
 	}
 
 	// エンドポイントチェック
 	if len(rule.Endpoints) > 0 {
-		endpointMatches := false
-		for _, endpoint := range rule.Endpoints {
-			if rlw.endpointMatches(endpoint, request.Endpoint) {
-				endpointMatches = true
-				break
-			}
-		}
+		endpointMatches := slices.ContainsFunc(rule.Endpoints, func(endpoint string) bool {
+			return rlw.endpointMatches(endpoint, request.Endpoint)
+		})
 		if !endpointMatches {
 			return false
 		}
 	}
 
 	// メソッドチェック
-	if len(rule.Methods) > 0 {
-		methodMatches := false
-		for _, method := range rule.Methods {
-			if method == request.Method {
-				methodMatches = true
-				break
-			}
-		}
-		if !methodMatches {
-			return false
-		}
+	if len(rule.Methods) > 0 && !slices.Contains(rule.Methods, request.Method) {
+		return false
 	}
 
 	return true
@@ -631,11 +635,7 @@ func (rlw *RateLimitWorker) checkRateLimit(bucket *ClientBucket, rule *RateLimit
 
 // updateProcessingTime 処理時間を更新します
 func (rlw *RateLimitWorker) updateProcessingTime(duration time.Duration) {
-	rlw.stats.TotalProcessTime += duration
-
-	if rlw.stats.ProcessedRequests > 0 {
-		rlw.stats.AverageProcessTime = rlw.stats.TotalProcessTime / time.Duration(rlw.stats.ProcessedRequests)
-	}
+	rlw.stats.TotalProcessTime.Add(int64(duration))
 }
 
 // updateAllowedStats 許可統計を更新します
@@ -643,7 +643,7 @@ func (arl *APIRateLimiter) updateAllowedStats(request *RateLimitRequest) {
 	arl.stats.mu.Lock()
 	defer arl.stats.mu.Unlock()
 
-	atomic.AddInt64(&arl.stats.allowedRequests, 1)
+	arl.stats.allowedRequests.Add(1)
 
 	// クライアント統計
 	arl.stats.topAllowedClients[request.ClientID]++
@@ -674,7 +674,7 @@ func (arl *APIRateLimiter) updateBlockedStats(request *RateLimitRequest) {
 	arl.stats.mu.Lock()
 	defer arl.stats.mu.Unlock()
 
-	atomic.AddInt64(&arl.stats.blockedRequests, 1)
+	arl.stats.blockedRequests.Add(1)
 
 	// クライアント統計
 	arl.stats.topBlockedClients[request.ClientID]++
@@ -705,8 +705,6 @@ func (arl *APIRateLimiter) updateBlockedStats(request *RateLimitRequest) {
 
 // handleResults 結果を処理します
 func (arl *APIRateLimiter) handleResults() {
-	defer arl.wg.Done()
-
 	log.Println("Result handler started")
 
 	for {
@@ -728,8 +726,6 @@ func (arl *APIRateLimiter) handleResults() {
 
 // processResult 結果を処理します
 func (arl *APIRateLimiter) processResult(result *RateLimitResult) {
-	// 平均処理時間を更新
-	// 実際の実装では、より詳細な処理ログやアラート処理を行う
 	if !result.Allowed {
 		log.Printf("Rate limit exceeded: rule=%s, remaining=%d, retry_after=%v",
 			result.LimitRule, result.Remaining, result.RetryAfter)
@@ -738,10 +734,8 @@ func (arl *APIRateLimiter) processResult(result *RateLimitResult) {
 
 // cleanupLoop クリーンアップループを実行します
 func (arl *APIRateLimiter) cleanupLoop() {
-	defer arl.wg.Done()
-
-	ticker := time.NewTicker(arl.config.CleanupInterval)
-	defer ticker.Stop()
+	// フィールドに保持せずStop/Resetも使わないため、Go 1.23以降はGCが回収できるtime.Tickでよい
+	tick := time.Tick(arl.config.CleanupInterval)
 
 	log.Println("Cleanup loop started")
 
@@ -750,7 +744,7 @@ func (arl *APIRateLimiter) cleanupLoop() {
 		case <-arl.ctx.Done():
 			log.Println("Cleanup loop stopping")
 			return
-		case <-ticker.C:
+		case <-tick:
 			arl.cleanupBuckets()
 		}
 	}
@@ -785,10 +779,7 @@ func (arl *APIRateLimiter) cleanupBuckets() {
 
 // monitorMetrics メトリクスを監視します
 func (arl *APIRateLimiter) monitorMetrics() {
-	defer arl.wg.Done()
-
-	ticker := time.NewTicker(arl.config.MetricsInterval)
-	defer ticker.Stop()
+	tick := time.Tick(arl.config.MetricsInterval)
 
 	log.Println("Metrics monitor started")
 
@@ -797,7 +788,7 @@ func (arl *APIRateLimiter) monitorMetrics() {
 		case <-arl.ctx.Done():
 			log.Println("Metrics monitor stopping")
 			return
-		case <-ticker.C:
+		case <-tick:
 			arl.reportMetrics()
 		}
 	}
@@ -808,9 +799,9 @@ func (arl *APIRateLimiter) reportMetrics() {
 	arl.stats.mu.RLock()
 	defer arl.stats.mu.RUnlock()
 
-	totalRequests := atomic.LoadInt64(&arl.stats.totalRequests)
-	allowedRequests := atomic.LoadInt64(&arl.stats.allowedRequests)
-	blockedRequests := atomic.LoadInt64(&arl.stats.blockedRequests)
+	totalRequests := arl.stats.totalRequests.Load()
+	allowedRequests := arl.stats.allowedRequests.Load()
+	blockedRequests := arl.stats.blockedRequests.Load()
 
 	uptime := time.Since(arl.stats.startTime)
 	var rps float64
@@ -832,14 +823,12 @@ func (arl *APIRateLimiter) reportMetrics() {
 
 	// ワーカー別統計
 	for _, worker := range arl.workers {
-		processed := atomic.LoadInt64(&worker.stats.ProcessedRequests)
-		allowed := atomic.LoadInt64(&worker.stats.AllowedRequests)
-		blocked := atomic.LoadInt64(&worker.stats.BlockedRequests)
+		snap := worker.stats.Snapshot()
 
-		if processed > 0 {
-			allowRate := float64(allowed) / float64(processed) * 100
+		if snap.ProcessedRequests > 0 {
+			allowRate := float64(snap.AllowedRequests) / float64(snap.ProcessedRequests) * 100
 			log.Printf("Worker %d: Processed=%d, Allowed=%.1f%%, Blocked=%d, AvgTime=%v",
-				worker.ID, processed, allowRate, blocked, worker.stats.AverageProcessTime)
+				snap.WorkerID, snap.ProcessedRequests, allowRate, snap.BlockedRequests, snap.AverageProcessTime)
 		}
 	}
 
@@ -860,8 +849,8 @@ func (arl *APIRateLimiter) reportTopClients() {
 		topBlocked = append(topBlocked, clientStat{ClientID: clientID, Count: count})
 	}
 
-	sort.Slice(topBlocked, func(i, j int) bool {
-		return topBlocked[i].Count > topBlocked[j].Count
+	slices.SortFunc(topBlocked, func(a, b clientStat) int {
+		return cmp.Compare(b.Count, a.Count)
 	})
 
 	if len(topBlocked) > 0 {
@@ -906,7 +895,7 @@ func (arl *APIRateLimiter) HTTPMiddleware(next http.HandlerFunc) http.HandlerFun
 		if !result.Allowed {
 			w.Header().Set("Retry-After", fmt.Sprintf("%.0f", result.RetryAfter.Seconds()))
 
-			errorResponse := map[string]interface{}{
+			errorResponse := map[string]any{
 				"error":       "Rate limit exceeded",
 				"rule":        result.LimitRule,
 				"remaining":   result.Remaining,
@@ -934,9 +923,8 @@ func (arl *APIRateLimiter) extractClientID(r *http.Request) string {
 	// Authorization ヘッダーからクライアントIDを抽出
 	auth := r.Header.Get("Authorization")
 	if auth != "" {
-		parts := strings.Split(auth, " ")
-		if len(parts) == 2 {
-			return parts[1][:min(len(parts[1]), 10)] // 最初の10文字
+		if _, token, ok := strings.Cut(auth, " "); ok {
+			return token[:min(len(token), 10)] // 最初の10文字
 		}
 	}
 
@@ -968,9 +956,10 @@ func (arl *APIRateLimiter) extractUserTier(r *http.Request) string {
 
 	// APIキーからティアを推測（実際の実装では、データベースルックアップを行う）
 	apiKey := arl.extractAPIKey(r)
-	if strings.HasPrefix(apiKey, "ent_") {
+	switch {
+	case strings.HasPrefix(apiKey, "ent_"):
 		return "enterprise"
-	} else if strings.HasPrefix(apiKey, "pre_") {
+	case strings.HasPrefix(apiKey, "pre_"):
 		return "premium"
 	}
 
@@ -991,31 +980,25 @@ func (arl *APIRateLimiter) extractClientIP(r *http.Request) string {
 	}
 
 	// RemoteAddr を使用
-	if ip := strings.Split(r.RemoteAddr, ":")[0]; ip != "" {
+	if ip, _, _ := strings.Cut(r.RemoteAddr, ":"); ip != "" {
 		return ip
 	}
 
 	return "unknown"
 }
 
-// min 最小値を返します
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
 // Shutdown レート制限システムを停止します
 func (arl *APIRateLimiter) Shutdown(timeout time.Duration) error {
-	if !atomic.CompareAndSwapInt32(&arl.isRunning, 1, 0) {
-		return fmt.Errorf("limiter is not running")
+	if !arl.isRunning.CompareAndSwap(true, false) {
+		return errors.New("limiter is not running")
 	}
 
 	log.Println("Shutting down API rate limiter...")
 
-	// 1. リクエストキューを閉じる
-	close(arl.requestQueue)
+	// 1. ワーカー・監視ループを止める。requestQueue closeしない。
+	// CheckRateLimitからの投入とcloseが競合すると送信側がpanicするため、
+	// 停止はctx.Done()だけに頼り、投入側はCheckRateLimit冒頭のarl.ctx.Err()チェックで弾く。
+	arl.cancel()
 
 	// 2. ワーカーの終了を待機
 	done := make(chan struct{})
@@ -1028,19 +1011,17 @@ func (arl *APIRateLimiter) Shutdown(timeout time.Duration) error {
 	case <-done:
 		log.Println("All workers stopped gracefully")
 	case <-time.After(timeout):
-		log.Println("Timeout reached, forcing shutdown...")
-		arl.cancel()
-
-		// 追加の待機時間
+		log.Println("Timeout reached waiting for workers")
 		select {
 		case <-done:
-			log.Println("Workers stopped after cancellation")
+			log.Println("Workers stopped after extra wait")
 		case <-time.After(2 * time.Second):
-			log.Println("Some workers may not have stopped properly")
+			// ワーカーがまだresultQueueへ送信中かもしれないのでcloseしない
+			return errors.New("shutdown timed out waiting for workers to stop")
 		}
 	}
 
-	// 3. 結果キューを閉じる
+	// 3. すべてのワーカーが終わっているので結果キューを閉じる
 	close(arl.resultQueue)
 
 	log.Println("API rate limiter shutdown completed")
@@ -1048,13 +1029,13 @@ func (arl *APIRateLimiter) Shutdown(timeout time.Duration) error {
 }
 
 // GetStats 統計情報を取得します
-func (arl *APIRateLimiter) GetStats() map[string]interface{} {
+func (arl *APIRateLimiter) GetStats() map[string]any {
 	arl.stats.mu.RLock()
 	defer arl.stats.mu.RUnlock()
 
-	totalRequests := atomic.LoadInt64(&arl.stats.totalRequests)
-	allowedRequests := atomic.LoadInt64(&arl.stats.allowedRequests)
-	blockedRequests := atomic.LoadInt64(&arl.stats.blockedRequests)
+	totalRequests := arl.stats.totalRequests.Load()
+	allowedRequests := arl.stats.allowedRequests.Load()
+	blockedRequests := arl.stats.blockedRequests.Load()
 
 	uptime := time.Since(arl.stats.startTime)
 	var rps float64
@@ -1066,17 +1047,28 @@ func (arl *APIRateLimiter) GetStats() map[string]interface{} {
 	activeBuckets := len(arl.buckets)
 	arl.bucketsMu.RUnlock()
 
-	workerStats := make(map[string]interface{})
+	workerStats := make(map[string]any)
 	for i, worker := range arl.workers {
-		workerStats[fmt.Sprintf("worker_%d", i)] = map[string]interface{}{
-			"processed_requests":      atomic.LoadInt64(&worker.stats.ProcessedRequests),
-			"allowed_requests":        atomic.LoadInt64(&worker.stats.AllowedRequests),
-			"blocked_requests":        atomic.LoadInt64(&worker.stats.BlockedRequests),
-			"average_processing_time": worker.stats.AverageProcessTime,
+		snap := worker.stats.Snapshot()
+		workerStats[fmt.Sprintf("worker_%d", i)] = map[string]any{
+			"processed_requests":      snap.ProcessedRequests,
+			"allowed_requests":        snap.AllowedRequests,
+			"blocked_requests":        snap.BlockedRequests,
+			"average_processing_time": snap.AverageProcessTime,
 		}
 	}
 
-	return map[string]interface{}{
+	// 呼び出し元が内部マップを直接参照して書き換えられないよう値コピーを返す
+	endpointStats := make(map[string]EndpointStats, len(arl.stats.endpointStats))
+	for k, v := range arl.stats.endpointStats {
+		endpointStats[k] = *v
+	}
+	tierStats := make(map[string]TierStats, len(arl.stats.tierStats))
+	for k, v := range arl.stats.tierStats {
+		tierStats[k] = *v
+	}
+
+	return map[string]any{
 		"total_requests":      totalRequests,
 		"allowed_requests":    allowedRequests,
 		"blocked_requests":    blockedRequests,
@@ -1085,10 +1077,10 @@ func (arl *APIRateLimiter) GetStats() map[string]interface{} {
 		"active_buckets":      activeBuckets,
 		"worker_count":        len(arl.workers),
 		"worker_stats":        workerStats,
-		"endpoint_stats":      arl.stats.endpointStats,
-		"tier_stats":          arl.stats.tierStats,
-		"top_blocked_clients": arl.stats.topBlockedClients,
-		"top_allowed_clients": arl.stats.topAllowedClients,
+		"endpoint_stats":      endpointStats,
+		"tier_stats":          tierStats,
+		"top_blocked_clients": maps.Clone(arl.stats.topBlockedClients),
+		"top_allowed_clients": maps.Clone(arl.stats.topAllowedClients),
 	}
 }
 
@@ -1109,7 +1101,7 @@ func main() {
 
 	// レート制限付きAPIエンドポイント
 	mux.HandleFunc("/api/data", limiter.HTTPMiddleware(func(w http.ResponseWriter, r *http.Request) {
-		response := map[string]interface{}{
+		response := map[string]any{
 			"message":   "API response",
 			"timestamp": time.Now().Unix(),
 			"method":    r.Method,
@@ -1122,7 +1114,7 @@ func main() {
 	}))
 
 	mux.HandleFunc("/api/auth/login", limiter.HTTPMiddleware(func(w http.ResponseWriter, r *http.Request) {
-		response := map[string]interface{}{
+		response := map[string]any{
 			"message": "Login successful",
 			"token":   "test_token_" + strconv.FormatInt(time.Now().Unix(), 10),
 		}
@@ -1148,7 +1140,7 @@ func main() {
 
 	go func() {
 		log.Println("HTTP server starting on :8080")
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Printf("HTTP server error: %v", err)
 		}
 	}()
@@ -1159,9 +1151,9 @@ func main() {
 
 		userTiers := []string{"free", "premium", "enterprise"}
 		endpoints := []string{"/api/data", "/api/auth/login", "/api/users", "/api/orders"}
-		methods := []string{"GET", "POST", "PUT", "DELETE"}
+		methods := []string{http.MethodGet, http.MethodPost, http.MethodPut, http.MethodDelete}
 
-		for i := 0; i < 2000; i++ {
+		for i := range 2000 {
 			request := &RateLimitRequest{
 				ClientID:    fmt.Sprintf("client_%d", i%50),
 				APIKey:      fmt.Sprintf("key_%d", i%20),
@@ -1181,7 +1173,7 @@ func main() {
 					request.ClientID, result.LimitRule, result.RetryAfter)
 			}
 
-			time.Sleep(time.Duration(rand.Intn(100)+10) * time.Millisecond)
+			time.Sleep(10*time.Millisecond + rand.N(90*time.Millisecond))
 		}
 
 		log.Println("Test requests completed")

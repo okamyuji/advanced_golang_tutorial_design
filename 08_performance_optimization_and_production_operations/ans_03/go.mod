@@ -1,3 +1,3 @@
 module zero_downtime_config
 
-go 1.24
+go 1.27.0

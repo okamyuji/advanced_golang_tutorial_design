@@ -144,9 +144,7 @@ func TestTaskSubmissionAndProcessing(t *testing.T) {
 	// 処理監視用
 	var wg sync.WaitGroup
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		timeout := time.After(5 * time.Second)
 		for {
 			select {
@@ -162,11 +160,11 @@ func TestTaskSubmissionAndProcessing(t *testing.T) {
 				}
 			}
 		}
-	}()
+	})
 
 	// テストタスクを送信
 	taskCount := 5
-	for i := 0; i < taskCount; i++ {
+	for i := range taskCount {
 		task := Task{
 			ID:        int64(i),
 			Name:      fmt.Sprintf("test_task_%d", i),
@@ -174,7 +172,7 @@ func TestTaskSubmissionAndProcessing(t *testing.T) {
 			Priority:  1,
 			Timeout:   1 * time.Second,
 			CreatedAt: time.Now(),
-			Metadata:  map[string]interface{}{"test": true},
+			Metadata:  map[string]any{"test": true},
 		}
 
 		err := controller.SubmitTask(task)
@@ -594,9 +592,7 @@ func BenchmarkControllerTaskProcessing(b *testing.B) {
 		}
 	}()
 
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
+	for i := 0; b.Loop(); i++ {
 		task := Task{
 			ID:      int64(i),
 			Name:    fmt.Sprintf("bench_task_%d", i),
@@ -607,6 +603,60 @@ func BenchmarkControllerTaskProcessing(b *testing.B) {
 		err := controller.SubmitTask(task)
 		if err != nil {
 			b.Errorf("Failed to submit task %d: %v", i, err)
+		}
+	}
+}
+
+// TestShutdownConcurrentWithSubmit SubmitTaskとShutdownを並行させてもpanicせず、
+// 停止後の投入は必ずエラーになることを確かめる回帰テストです。
+func TestShutdownConcurrentWithSubmit(t *testing.T) {
+	for range 50 {
+		config := &TaskConfig{
+			DefaultTimeout:  1 * time.Second,
+			MaxTimeout:      2 * time.Second,
+			WorkerCount:     2,
+			QueueSize:       4,
+			EnableMetrics:   false,
+			MetricsInterval: 10 * time.Second,
+			RetryEnabled:    false,
+			MaxRetries:      0,
+		}
+
+		controller := NewContextControlController(config)
+		if err := controller.Start(); err != nil {
+			t.Fatalf("Failed to start controller: %v", err)
+		}
+
+		var submitWg sync.WaitGroup
+		stop := make(chan struct{})
+
+		const submitters = 8
+		for range submitters {
+			submitWg.Go(func() {
+				for {
+					select {
+					case <-stop:
+						return
+					default:
+						_ = controller.SubmitTask(Task{ID: 1, Name: "race_test"})
+					}
+				}
+			})
+		}
+
+		// Shutdownの直前まで投入を続けさせ、close(taskQueue)との衝突窓を広げる
+		time.Sleep(time.Millisecond)
+
+		if err := controller.Shutdown(1 * time.Second); err != nil {
+			t.Fatalf("Failed to shutdown controller: %v", err)
+		}
+
+		close(stop)
+		submitWg.Wait()
+
+		// 停止後の投入は必ずエラーになる
+		if err := controller.SubmitTask(Task{ID: 2, Name: "after_shutdown"}); err == nil {
+			t.Error("Expected error when submitting task after shutdown")
 		}
 	}
 }

@@ -10,14 +10,24 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"math"
+	"net"
 	"net/http"
+	"os"
+	"os/signal"
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
+)
+
+var (
+	errAlreadyRunning = errors.New("監視システムは実行中です")
+	errStopped        = errors.New("監視システムは停止済みです")
 )
 
 // ProductionMonitoringSystem 本番環境監視システム
@@ -29,11 +39,13 @@ type ProductionMonitoringSystem struct {
 	profileAnalyzer  *ProfileAnalyzer
 	dashboardServer  *DashboardServer
 
-	// システム状態
-	isRunning          bool
+	// システム状態。stateMu は Start/Stop の多重呼び出しを排他する
+	stateMu            sync.Mutex
+	running            bool
+	stopped            bool
 	startTime          time.Time
-	lastHealthCheck    time.Time
 	monitoringInterval time.Duration
+	lastNumGC          uint32 // 前回の計測時点の GC 回数（収集ループだけが読み書きする）
 
 	// 停止制御
 	stopChan chan struct{}
@@ -46,7 +58,7 @@ type MetricsCollector struct {
 	historicalData  []*SystemMetrics
 	maxHistorySize  int
 	mutex           sync.RWMutex
-	collectionCount int64
+	collectionCount atomic.Int64
 }
 
 // SystemMetrics システムメトリクス
@@ -88,15 +100,15 @@ type AlertThresholds struct {
 
 // AnomalyEvent 異常イベント
 type AnomalyEvent struct {
-	EventID    string                 `json:"event_id"`
-	Timestamp  time.Time              `json:"timestamp"`
-	Type       string                 `json:"type"`
-	Severity   string                 `json:"severity"`
-	Message    string                 `json:"message"`
-	Metrics    *SystemMetrics         `json:"metrics"`
-	Context    map[string]interface{} `json:"context"`
-	Resolved   bool                   `json:"resolved"`
-	ResolvedAt *time.Time             `json:"resolved_at,omitempty"`
+	EventID    string         `json:"event_id"`
+	Timestamp  time.Time      `json:"timestamp"`
+	Type       string         `json:"type"`
+	Severity   string         `json:"severity"`
+	Message    string         `json:"message"`
+	Metrics    *SystemMetrics `json:"metrics"`
+	Context    map[string]any `json:"context"`
+	Resolved   bool           `json:"resolved"`
+	ResolvedAt *time.Time     `json:"resolved_at,omitempty"`
 }
 
 // StatisticalModel 統計モデル
@@ -122,20 +134,20 @@ type AlertManager struct {
 
 // Alert アラート
 type Alert struct {
-	ID             string                 `json:"id"`
-	Timestamp      time.Time              `json:"timestamp"`
-	Type           string                 `json:"type"`
-	Severity       string                 `json:"severity"`
-	Title          string                 `json:"title"`
-	Description    string                 `json:"description"`
-	Source         string                 `json:"source"`
-	Tags           []string               `json:"tags"`
-	Metadata       map[string]interface{} `json:"metadata"`
-	Status         string                 `json:"status"`
-	Acknowledged   bool                   `json:"acknowledged"`
-	AcknowledgedBy string                 `json:"acknowledged_by,omitempty"`
-	AcknowledgedAt *time.Time             `json:"acknowledged_at,omitempty"`
-	ResolvedAt     *time.Time             `json:"resolved_at,omitempty"`
+	ID             string         `json:"id"`
+	Timestamp      time.Time      `json:"timestamp"`
+	Type           string         `json:"type"`
+	Severity       string         `json:"severity"`
+	Title          string         `json:"title"`
+	Description    string         `json:"description"`
+	Source         string         `json:"source"`
+	Tags           []string       `json:"tags"`
+	Metadata       map[string]any `json:"metadata"`
+	Status         string         `json:"status"`
+	Acknowledged   bool           `json:"acknowledged"`
+	AcknowledgedBy string         `json:"acknowledged_by,omitempty"`
+	AcknowledgedAt *time.Time     `json:"acknowledged_at,omitempty"`
+	ResolvedAt     *time.Time     `json:"resolved_at,omitempty"`
 }
 
 // EscalationRules エスカレーションルール
@@ -157,13 +169,13 @@ type ProfileAnalyzer struct {
 
 // AnalysisResult 分析結果
 type AnalysisResult struct {
-	Timestamp       time.Time              `json:"timestamp"`
-	AnalysisType    string                 `json:"analysis_type"`
-	Summary         string                 `json:"summary"`
-	Findings        []string               `json:"findings"`
-	Recommendations []string               `json:"recommendations"`
-	Severity        string                 `json:"severity"`
-	Data            map[string]interface{} `json:"data"`
+	Timestamp       time.Time      `json:"timestamp"`
+	AnalysisType    string         `json:"analysis_type"`
+	Summary         string         `json:"summary"`
+	Findings        []string       `json:"findings"`
+	Recommendations []string       `json:"recommendations"`
+	Severity        string         `json:"severity"`
+	Data            map[string]any `json:"data"`
 }
 
 // DashboardServer ダッシュボードサーバー
@@ -172,6 +184,7 @@ type DashboardServer struct {
 	wsConnections map[string]*WebSocketConnection
 	updateChannel chan *DashboardUpdate
 	mutex         sync.RWMutex
+	system        *ProductionMonitoringSystem // API が返す状態の取得元
 }
 
 // WebSocketConnection WebSocket接続
@@ -183,9 +196,9 @@ type WebSocketConnection struct {
 
 // DashboardUpdate ダッシュボード更新
 type DashboardUpdate struct {
-	Type      string      `json:"type"`
-	Timestamp time.Time   `json:"timestamp"`
-	Data      interface{} `json:"data"`
+	Type      string    `json:"type"`
+	Timestamp time.Time `json:"timestamp"`
+	Data      any       `json:"data"`
 }
 
 // NewProductionMonitoringSystem 新しい本番環境監視システムを作成
@@ -199,6 +212,7 @@ func NewProductionMonitoringSystem() *ProductionMonitoringSystem {
 		monitoringInterval: 5 * time.Second,
 		stopChan:           make(chan struct{}),
 	}
+	pms.dashboardServer.system = pms
 
 	return pms
 }
@@ -268,59 +282,76 @@ func NewDashboardServer(port int) *DashboardServer {
 	}
 
 	// HTTPエンドポイント設定
-	mux.HandleFunc("/", ds.dashboardHandler)
-	mux.HandleFunc("/api/metrics", ds.metricsAPIHandler)
-	mux.HandleFunc("/api/alerts", ds.alertsAPIHandler)
-	mux.HandleFunc("/api/health", ds.healthAPIHandler)
-	mux.HandleFunc("/api/analysis", ds.analysisAPIHandler)
+	mux.HandleFunc("GET /", ds.dashboardHandler)
+	mux.HandleFunc("GET /api/metrics", ds.metricsAPIHandler)
+	mux.HandleFunc("GET /api/alerts", ds.alertsAPIHandler)
+	mux.HandleFunc("GET /api/health", ds.healthAPIHandler)
+	mux.HandleFunc("GET /api/analysis", ds.analysisAPIHandler)
 
 	return ds
 }
 
 // Start 監視システム開始
 func (pms *ProductionMonitoringSystem) Start(ctx context.Context) error {
-	pms.isRunning = true
+	pms.stateMu.Lock()
+	defer pms.stateMu.Unlock()
+	// stopChan と http.Server は停止後に再利用できないので、停止後の再開は受け付けない
+	if pms.stopped {
+		return errStopped
+	}
+	if pms.running {
+		return errAlreadyRunning
+	}
+
+	// ポートの確保はここで行い、失敗を呼び出し側に返す
+	listener, err := net.Listen("tcp", pms.dashboardServer.httpServer.Addr)
+	if err != nil {
+		return fmt.Errorf("ダッシュボードサーバー起動エラー: %w", err)
+	}
+	pms.running = true
 	pms.startTime = time.Now()
-	pms.lastHealthCheck = time.Now()
+	// ポート0を指定した場合に確定したアドレスを残す
+	pms.dashboardServer.httpServer.Addr = listener.Addr().String()
 
 	fmt.Println("本番環境監視システム開始")
 
 	// メトリクス収集開始
-	pms.wg.Add(1)
-	go pms.metricsCollectionLoop(ctx)
+	pms.wg.Go(func() { pms.metricsCollectionLoop(ctx) })
 
 	// 異常検出開始
-	pms.wg.Add(1)
-	go pms.anomalyDetectionLoop(ctx)
+	pms.wg.Go(func() { pms.anomalyDetectionLoop(ctx) })
 
 	// アラート処理開始
-	pms.wg.Add(1)
-	go pms.alertProcessingLoop(ctx)
+	pms.wg.Go(func() { pms.alertProcessingLoop(ctx) })
 
 	// プロファイル分析開始
-	pms.wg.Add(1)
-	go pms.profileAnalysisLoop(ctx)
+	pms.wg.Go(func() { pms.profileAnalysisLoop(ctx) })
 
 	// ダッシュボードサーバー開始
-	go func() {
-		fmt.Printf("ダッシュボードサーバー開始: %s\n", pms.dashboardServer.httpServer.Addr)
-		if err := pms.dashboardServer.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	fmt.Printf("ダッシュボードサーバー開始: %s\n", listener.Addr())
+	pms.wg.Go(func() {
+		if err := pms.dashboardServer.httpServer.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			fmt.Printf("ダッシュボードサーバーエラー: %v\n", err)
 		}
-	}()
+	})
 
 	// ダッシュボード更新処理開始
-	pms.wg.Add(1)
-	go pms.dashboardUpdateLoop(ctx)
+	pms.wg.Go(func() { pms.dashboardUpdateLoop(ctx) })
 
 	return nil
 }
 
-// Stop 監視システム停止
+// Stop 監視システム停止。二度目以降の呼び出しや開始前の呼び出しは何もしない
 func (pms *ProductionMonitoringSystem) Stop() error {
-	fmt.Println("本番環境監視システム停止中...")
+	pms.stateMu.Lock()
+	defer pms.stateMu.Unlock()
+	if !pms.running {
+		return nil
+	}
+	pms.running = false
+	pms.stopped = true
 
-	pms.isRunning = false
+	fmt.Println("本番環境監視システム停止中...")
 	close(pms.stopChan)
 
 	// HTTPサーバー停止
@@ -339,14 +370,11 @@ func (pms *ProductionMonitoringSystem) Stop() error {
 
 // metricsCollectionLoop メトリクス収集ループ
 func (pms *ProductionMonitoringSystem) metricsCollectionLoop(ctx context.Context) {
-	defer pms.wg.Done()
-
-	ticker := time.NewTicker(pms.monitoringInterval)
-	defer ticker.Stop()
+	tick := time.Tick(pms.monitoringInterval)
 
 	for {
 		select {
-		case <-ticker.C:
+		case <-tick:
 			metrics := pms.collectSystemMetrics()
 			pms.metricsCollector.AddMetrics(metrics)
 
@@ -381,7 +409,7 @@ func (pms *ProductionMonitoringSystem) collectSystemMetrics() *SystemMetrics {
 		MemoryUsage:        memStats.Alloc,
 		MemoryPercent:      float64(memStats.Alloc) / float64(memStats.Sys) * 100,
 		GoroutineCount:     runtime.NumGoroutine(),
-		GCPauseTime:        memStats.PauseNs[(memStats.NumGC+255)%256],
+		GCPauseTime:        pms.newGCPauseMax(&memStats),
 		HeapAlloc:          memStats.HeapAlloc,
 		HeapSys:            memStats.HeapSys,
 		NumGC:              memStats.NumGC,
@@ -389,6 +417,19 @@ func (pms *ProductionMonitoringSystem) collectSystemMetrics() *SystemMetrics {
 		DiskIORate:         pms.getDiskIORate(),
 		LoadAverage:        pms.getLoadAverage(),
 	}
+}
+
+// newGCPauseMax 前回の計測以降に起きた GC の停止時間の最大値を返す。
+// PauseNs は直近256回分の履歴なので、新しい GC がなければ 0 を返し、同じ停止を数え直さない
+func (pms *ProductionMonitoringSystem) newGCPauseMax(memStats *runtime.MemStats) uint64 {
+	newGCs := min(memStats.NumGC-pms.lastNumGC, uint32(len(memStats.PauseNs)))
+	pms.lastNumGC = memStats.NumGC
+
+	var pause uint64
+	for i := range newGCs {
+		pause = max(pause, memStats.PauseNs[(memStats.NumGC-i+255)%256])
+	}
+	return pause
 }
 
 // calculateCPUUsage CPU使用率計算（簡略化）
@@ -429,7 +470,7 @@ func (mc *MetricsCollector) AddMetrics(metrics *SystemMetrics) {
 		mc.historicalData = mc.historicalData[1:]
 	}
 
-	atomic.AddInt64(&mc.collectionCount, 1)
+	mc.collectionCount.Add(1)
 }
 
 // GetCurrentMetrics 現在のメトリクス取得
@@ -457,14 +498,11 @@ func (mc *MetricsCollector) GetHistoricalData(count int) []*SystemMetrics {
 
 // anomalyDetectionLoop 異常検出ループ
 func (pms *ProductionMonitoringSystem) anomalyDetectionLoop(ctx context.Context) {
-	defer pms.wg.Done()
-
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
+	tick := time.Tick(10 * time.Second)
 
 	for {
 		select {
-		case <-ticker.C:
+		case <-tick:
 			metrics := pms.metricsCollector.GetCurrentMetrics()
 			if metrics != nil {
 				pms.detectAnomalies(metrics)
@@ -529,22 +567,28 @@ func (pms *ProductionMonitoringSystem) detectStatisticalAnomalies(metrics *Syste
 	model := pms.anomalyDetector.statisticalModel
 
 	// CPU使用率の統計的異常検出
-	cpuZScore := (metrics.CPUUsage - model.CPUMean) / model.CPUStdDev
-	if math.Abs(cpuZScore) > 3.0 {
+	if zScoreExceeds(metrics.CPUUsage, model.CPUMean, model.CPUStdDev) {
 		pms.createAlert("cpu_statistical", "WARNING", "CPU使用率に統計的異常を検出", metrics)
 	}
 
 	// メモリ使用率の統計的異常検出
-	memoryZScore := (metrics.MemoryPercent - model.MemoryMean) / model.MemoryStdDev
-	if math.Abs(memoryZScore) > 3.0 {
+	if zScoreExceeds(metrics.MemoryPercent, model.MemoryMean, model.MemoryStdDev) {
 		pms.createAlert("memory_statistical", "WARNING", "メモリ使用率に統計的異常を検出", metrics)
 	}
 
 	// Goroutine数の統計的異常検出
-	goroutineZScore := (float64(metrics.GoroutineCount) - model.GoroutineMean) / model.GoroutineStdDev
-	if math.Abs(goroutineZScore) > 3.0 {
+	if zScoreExceeds(float64(metrics.GoroutineCount), model.GoroutineMean, model.GoroutineStdDev) {
 		pms.createAlert("goroutine_statistical", "WARNING", "Goroutine数に統計的異常を検出", metrics)
 	}
+}
+
+// zScoreExceeds 平均から標準偏差の3倍を超えて離れているかを返します。
+// 学習期間中に値が変わらなかった指標は標準偏差が0で、わずかな変化でもz値が無限大になるので判定しない
+func zScoreExceeds(value, mean, stdDev float64) bool {
+	if stdDev == 0 {
+		return false
+	}
+	return math.Abs((value-mean)/stdDev) > 3.0
 }
 
 // updateStatisticalModel 統計モデル更新
@@ -599,7 +643,7 @@ func (pms *ProductionMonitoringSystem) createAlert(alertType, severity, descript
 		Description: description,
 		Source:      "monitoring_system",
 		Tags:        []string{"production", "monitoring", alertType},
-		Metadata: map[string]interface{}{
+		Metadata: map[string]any{
 			"cpu_usage":       metrics.CPUUsage,
 			"memory_percent":  metrics.MemoryPercent,
 			"goroutine_count": metrics.GoroutineCount,
@@ -617,8 +661,6 @@ func (pms *ProductionMonitoringSystem) createAlert(alertType, severity, descript
 
 // alertProcessingLoop アラート処理ループ
 func (pms *ProductionMonitoringSystem) alertProcessingLoop(ctx context.Context) {
-	defer pms.wg.Done()
-
 	for {
 		select {
 		case alert := <-pms.alertManager.notificationQueue:
@@ -637,7 +679,7 @@ func (pms *ProductionMonitoringSystem) processAlert(alert *Alert) {
 	pms.alertManager.mutex.Lock()
 	defer pms.alertManager.mutex.Unlock()
 
-	// 重複チェック
+	// 重複チェック（種類ごとに1件。登録と検索は同じキーを使う）
 	if existingAlert, exists := pms.alertManager.activeAlerts[alert.Type]; exists {
 		// 既存アラートの更新
 		existingAlert.Timestamp = alert.Timestamp
@@ -646,17 +688,18 @@ func (pms *ProductionMonitoringSystem) processAlert(alert *Alert) {
 	}
 
 	// 新しいアラートとして追加
-	pms.alertManager.activeAlerts[alert.ID] = alert
+	pms.alertManager.activeAlerts[alert.Type] = alert
 	pms.alertManager.alertHistory = append(pms.alertManager.alertHistory, alert)
 
 	// 通知送信
 	pms.sendNotification(alert)
 
-	// ダッシュボード更新
+	// ダッシュボード更新。登録したアラートは後で更新されるので、配信側には写しを渡す
+	sent := *alert
 	update := &DashboardUpdate{
 		Type:      "alert",
 		Timestamp: time.Now(),
-		Data:      alert,
+		Data:      &sent,
 	}
 
 	select {
@@ -676,14 +719,11 @@ func (pms *ProductionMonitoringSystem) sendNotification(alert *Alert) {
 
 // profileAnalysisLoop プロファイル分析ループ
 func (pms *ProductionMonitoringSystem) profileAnalysisLoop(ctx context.Context) {
-	defer pms.wg.Done()
-
-	ticker := time.NewTicker(pms.profileAnalyzer.analysisInterval)
-	defer ticker.Stop()
+	tick := time.Tick(pms.profileAnalyzer.analysisInterval)
 
 	for {
 		select {
-		case <-ticker.C:
+		case <-tick:
 			if pms.profileAnalyzer.autoAnalysisEnabled {
 				pms.performAutomaticAnalysis()
 			}
@@ -727,7 +767,7 @@ func (pms *ProductionMonitoringSystem) performAutomaticAnalysis() {
 		},
 		Recommendations: pms.generateRecommendations(historicalData),
 		Severity:        "INFO",
-		Data: map[string]interface{}{
+		Data: map[string]any{
 			"analysis_period": pms.profileAnalyzer.analysisInterval.String(),
 			"data_points":     len(historicalData),
 		},
@@ -771,14 +811,15 @@ func (pms *ProductionMonitoringSystem) analyzePerformance(data []*SystemMetrics)
 	for _, metrics := range data {
 		if metrics.GCPauseTime > 0 {
 			totalGCPause += metrics.GCPauseTime
-			if metrics.GCPauseTime > maxGCPause {
-				maxGCPause = metrics.GCPauseTime
-			}
+			maxGCPause = max(maxGCPause, metrics.GCPauseTime)
 			gcCount++
 		}
 	}
 
-	avgGCPause := float64(totalGCPause) / float64(gcCount) / 1000000 // convert to ms
+	var avgGCPause float64
+	if gcCount > 0 {
+		avgGCPause = float64(totalGCPause) / float64(gcCount) / 1000000 // convert to ms
+	}
 
 	return fmt.Sprintf("平均GC停止時間: %.2fms, 最大GC停止時間: %.2fms", avgGCPause, float64(maxGCPause)/1000000)
 }
@@ -793,12 +834,8 @@ func (pms *ProductionMonitoringSystem) analyzeCapacity(data []*SystemMetrics) st
 	var maxGoroutines int
 
 	for _, metrics := range data {
-		if metrics.MemoryUsage > maxMemory {
-			maxMemory = metrics.MemoryUsage
-		}
-		if metrics.GoroutineCount > maxGoroutines {
-			maxGoroutines = metrics.GoroutineCount
-		}
+		maxMemory = max(maxMemory, metrics.MemoryUsage)
+		maxGoroutines = max(maxGoroutines, metrics.GoroutineCount)
 	}
 
 	return fmt.Sprintf("最大メモリ使用量: %d MB, 最大Goroutine数: %d", maxMemory/(1024*1024), maxGoroutines)
@@ -835,8 +872,6 @@ func (pms *ProductionMonitoringSystem) generateRecommendations(data []*SystemMet
 
 // dashboardUpdateLoop ダッシュボード更新ループ
 func (pms *ProductionMonitoringSystem) dashboardUpdateLoop(ctx context.Context) {
-	defer pms.wg.Done()
-
 	for {
 		select {
 		case update := <-pms.dashboardServer.updateChannel:
@@ -869,6 +904,16 @@ func (pms *ProductionMonitoringSystem) broadcastUpdate(update *DashboardUpdate) 
 			// 送信チャンネルが満杯の場合はスキップ
 		}
 	}
+}
+
+// uptime 開始からの経過時間。開始前は0。
+// startTime は Start がサーバーを起動する前に書き込むので、ハンドラーからはロックなしで読める。
+// Stop は stateMu を持ったまま Shutdown で処理中のリクエストを待つため、ここで stateMu を取ってはいけない
+func (pms *ProductionMonitoringSystem) uptime() time.Duration {
+	if pms.startTime.IsZero() {
+		return 0
+	}
+	return time.Since(pms.startTime)
 }
 
 // HTTP ハンドラー関数群
@@ -916,10 +961,13 @@ func (ds *DashboardServer) dashboardHandler(w http.ResponseWriter, r *http.Reque
 
 // metricsAPIHandler メトリクスAPIハンドラー
 func (ds *DashboardServer) metricsAPIHandler(w http.ResponseWriter, r *http.Request) {
-	// グローバルなメトリクス収集器への参照が必要（簡略化のため省略）
-	response := map[string]interface{}{
-		"timestamp": time.Now(),
-		"status":    "active",
+	metrics := ds.system.metricsCollector.GetCurrentMetrics()
+	var response any = metrics
+	if metrics == nil {
+		response = map[string]any{
+			"timestamp": time.Now(),
+			"status":    "collecting",
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -930,8 +978,18 @@ func (ds *DashboardServer) metricsAPIHandler(w http.ResponseWriter, r *http.Requ
 
 // alertsAPIHandler アラートAPIハンドラー
 func (ds *DashboardServer) alertsAPIHandler(w http.ResponseWriter, r *http.Request) {
-	response := map[string]interface{}{
-		"active_alerts": 0,
+	// アラート処理ループが更新するので、ロックの中で値として写し取る
+	am := ds.system.alertManager
+	am.mutex.RLock()
+	alerts := make([]Alert, 0, len(am.activeAlerts))
+	for _, alert := range am.activeAlerts {
+		alerts = append(alerts, *alert)
+	}
+	am.mutex.RUnlock()
+
+	response := map[string]any{
+		"active_alerts": len(alerts),
+		"alerts":        alerts,
 		"timestamp":     time.Now(),
 	}
 
@@ -943,10 +1001,10 @@ func (ds *DashboardServer) alertsAPIHandler(w http.ResponseWriter, r *http.Reque
 
 // healthAPIHandler ヘルスAPIハンドラー
 func (ds *DashboardServer) healthAPIHandler(w http.ResponseWriter, r *http.Request) {
-	response := map[string]interface{}{
+	response := map[string]any{
 		"status":    "healthy",
 		"timestamp": time.Now(),
-		"uptime":    time.Since(time.Now()).String(), // 簡略化
+		"uptime":    ds.system.uptime().String(),
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -957,9 +1015,21 @@ func (ds *DashboardServer) healthAPIHandler(w http.ResponseWriter, r *http.Reque
 
 // analysisAPIHandler 分析APIハンドラー
 func (ds *DashboardServer) analysisAPIHandler(w http.ResponseWriter, r *http.Request) {
-	response := map[string]interface{}{
-		"latest_analysis": time.Now(),
-		"status":          "completed",
+	pa := ds.system.profileAnalyzer
+	pa.mutex.RLock()
+	var latest *AnalysisResult
+	if n := len(pa.analysisResults); n > 0 {
+		latest = pa.analysisResults[n-1]
+	}
+	pa.mutex.RUnlock()
+
+	status := "pending"
+	if latest != nil {
+		status = "completed"
+	}
+	response := map[string]any{
+		"latest_analysis": latest,
+		"status":          status,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -972,14 +1042,13 @@ func main() {
 	// 本番環境監視システムを作成
 	monitoringSystem := NewProductionMonitoringSystem()
 
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	// システム開始
-	go func() {
-		if err := monitoringSystem.Start(ctx); err != nil {
-			panic(err)
-		}
-	}()
+	if err := monitoringSystem.Start(ctx); err != nil {
+		panic(err)
+	}
 
 	fmt.Println("本番環境監視システム実行中")
 	fmt.Println("ダッシュボード: http://localhost:8080")
@@ -990,8 +1059,11 @@ func main() {
 	fmt.Println("- http://localhost:8080/api/analysis")
 	fmt.Println("\nCtrl+Cで停止")
 
-	// 30秒間実行
-	time.Sleep(30 * time.Second)
+	// 30秒間、または Ctrl+C を受けるまで実行
+	select {
+	case <-ctx.Done():
+	case <-time.After(30 * time.Second):
+	}
 
 	// システム停止
 	if err := monitoringSystem.Stop(); err != nil {

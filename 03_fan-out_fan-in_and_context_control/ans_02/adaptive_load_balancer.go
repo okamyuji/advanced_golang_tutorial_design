@@ -1,31 +1,32 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"log"
-	"math/rand"
-	"sort"
+	"math/rand/v2"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-// LoadBalancerNodeは負荷分散ノードです
+// LoadBalancerNode 負荷分散ノードです
 type LoadBalancerNode struct {
 	ID              string
 	Address         string
 	Weight          int
-	CurrentLoad     int64
+	CurrentLoad     atomic.Int64
 	MaxCapacity     int64
 	Health          NodeHealth
 	ResponseTime    time.Duration
 	SuccessRate     float64
 	LastHealthCheck time.Time
-	Metadata        map[string]interface{}
+	Metadata        map[string]any
 }
 
-// NodeHealthはノード健全性状態です
+// NodeHealth ノード健全性状態です
 type NodeHealth int
 
 const (
@@ -35,7 +36,7 @@ const (
 	HealthUnhealthy
 )
 
-// RequestTaskは処理要求タスクです
+// RequestTask 処理要求タスクです
 type RequestTask struct {
 	ID            int64
 	RequestType   string
@@ -43,23 +44,23 @@ type RequestTask struct {
 	Priority      int
 	Timeout       time.Duration
 	RequiredNodes int
-	Metadata      map[string]interface{}
+	Metadata      map[string]any
 	SubmittedAt   time.Time
 }
 
-// ProcessingResultは処理結果です
+// ProcessingResult 処理結果です
 type ProcessingResult struct {
 	TaskID      int64
 	NodeID      string
 	Success     bool
-	Result      interface{}
+	Result      any
 	Error       error
 	ProcessTime time.Duration
 	QueueTime   time.Duration
 	CompletedAt time.Time
 }
 
-// AdaptiveLoadBalancerは適応型負荷分散システムです
+// AdaptiveLoadBalancer 適応型負荷分散システムです
 type AdaptiveLoadBalancer struct {
 	// ノード管理
 	nodes      map[string]*LoadBalancerNode
@@ -90,11 +91,11 @@ type AdaptiveLoadBalancer struct {
 	healthChecker *HealthChecker
 
 	// 制御フラグ
-	isRunning int32
+	isRunning atomic.Bool
 	startTime time.Time
 }
 
-// LoadBalancingStrategyは負荷分散戦略です
+// LoadBalancingStrategy 負荷分散戦略です
 type LoadBalancingStrategy int
 
 const (
@@ -105,20 +106,20 @@ const (
 	StrategyAdaptive
 )
 
-// LoadBalancerStatsは負荷分散統計です
+// LoadBalancerStats 負荷分散統計です
 type LoadBalancerStats struct {
 	mu                  sync.RWMutex
-	totalRequests       int64
-	totalSuccessful     int64
-	totalErrors         int64
-	totalFanOutRequests int64
+	totalRequests       atomic.Int64
+	totalSuccessful     atomic.Int64
+	totalErrors         atomic.Int64
+	totalFanOutRequests atomic.Int64
 	averageResponseTime time.Duration
 	nodeStats           map[string]*NodeStats
 	strategyStats       map[LoadBalancingStrategy]*StrategyStats
 	startTime           time.Time
 }
 
-// NodeStatsはノード統計です
+// NodeStats ノード統計です
 type NodeStats struct {
 	NodeID            string
 	RequestsHandled   int64
@@ -130,7 +131,7 @@ type NodeStats struct {
 	HealthStatus      NodeHealth
 }
 
-// StrategyStatsは戦略統計です
+// StrategyStats 戦略統計です
 type StrategyStats struct {
 	Strategy        LoadBalancingStrategy
 	RequestsHandled int64
@@ -138,7 +139,7 @@ type StrategyStats struct {
 	AvgResponseTime time.Duration
 }
 
-// HealthCheckerはヘルスチェッカーです
+// HealthChecker ヘルスチェッカーです
 type HealthChecker struct {
 	balancer          *AdaptiveLoadBalancer
 	checkInterval     time.Duration
@@ -147,13 +148,13 @@ type HealthChecker struct {
 	recoveryThreshold int
 }
 
-// RequestProcessorは要求プロセッサーです
+// RequestProcessor 要求プロセッサーです
 type RequestProcessor struct {
 	ID       int
 	balancer *AdaptiveLoadBalancer
 }
 
-// LoadBalancerConfigは負荷分散設定です
+// LoadBalancerConfig 負荷分散設定です
 type LoadBalancerConfig struct {
 	FanOutFactor          int
 	MaxConcurrentRequests int
@@ -168,7 +169,7 @@ type LoadBalancerConfig struct {
 	MetricsInterval       time.Duration
 }
 
-// NewLoadBalancerConfigはデフォルト設定を作成します
+// NewLoadBalancerConfig デフォルト設定を作成します
 func NewLoadBalancerConfig() *LoadBalancerConfig {
 	return &LoadBalancerConfig{
 		FanOutFactor:          3,
@@ -185,7 +186,7 @@ func NewLoadBalancerConfig() *LoadBalancerConfig {
 	}
 }
 
-// NewAdaptiveLoadBalancerは新しい適応型負荷分散システムを作成します
+// NewAdaptiveLoadBalancer 新しい適応型負荷分散システムを作成します
 func NewAdaptiveLoadBalancer(config *LoadBalancerConfig) *AdaptiveLoadBalancer {
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -217,7 +218,7 @@ func NewAdaptiveLoadBalancer(config *LoadBalancerConfig) *AdaptiveLoadBalancer {
 	return balancer
 }
 
-// AddNodeはノードを追加します
+// AddNode ノードを追加します
 func (alb *AdaptiveLoadBalancer) AddNode(node *LoadBalancerNode) {
 	alb.nodesMutex.Lock()
 	defer alb.nodesMutex.Unlock()
@@ -232,7 +233,7 @@ func (alb *AdaptiveLoadBalancer) AddNode(node *LoadBalancerNode) {
 		node.ID, node.Address, node.Weight, node.MaxCapacity)
 }
 
-// RemoveNodeはノードを削除します
+// RemoveNode ノードを削除します
 func (alb *AdaptiveLoadBalancer) RemoveNode(nodeID string) {
 	alb.nodesMutex.Lock()
 	defer alb.nodesMutex.Unlock()
@@ -243,9 +244,9 @@ func (alb *AdaptiveLoadBalancer) RemoveNode(nodeID string) {
 	log.Printf("Node removed: %s", nodeID)
 }
 
-// Startは負荷分散システムを開始します
+// Start 負荷分散システムを開始します
 func (alb *AdaptiveLoadBalancer) Start() error {
-	if !atomic.CompareAndSwapInt32(&alb.isRunning, 0, 1) {
+	if !alb.isRunning.CompareAndSwap(false, true) {
 		return fmt.Errorf("load balancer is already running")
 	}
 
@@ -255,40 +256,33 @@ func (alb *AdaptiveLoadBalancer) Start() error {
 	log.Printf("Starting adaptive load balancer with %d nodes", len(alb.nodes))
 
 	// 要求プロセッサーを開始
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		processor := &RequestProcessor{
 			ID:       i,
 			balancer: alb,
 		}
 
-		alb.wg.Add(1)
-		go processor.run()
+		alb.wg.Go(processor.run)
 	}
 
 	// 結果処理を開始
-	alb.wg.Add(1)
-	go alb.handleResults()
+	alb.wg.Go(alb.handleResults)
 
 	// ヘルスチェックを開始
-	alb.wg.Add(1)
-	go alb.healthChecker.run()
+	alb.wg.Go(alb.healthChecker.run)
 
 	// 適応制御を開始
-	alb.wg.Add(1)
-	go alb.adaptiveControl()
+	alb.wg.Go(alb.adaptiveControl)
 
 	// メトリクス監視を開始
-	alb.wg.Add(1)
-	go alb.monitorMetrics()
+	alb.wg.Go(alb.monitorMetrics)
 
 	log.Printf("Adaptive load balancer started successfully")
 	return nil
 }
 
-// runはプロセッサーのメインループです
+// run プロセッサーのメインループです
 func (rp *RequestProcessor) run() {
-	defer rp.balancer.wg.Done()
-
 	log.Printf("Request processor %d started", rp.ID)
 
 	for {
@@ -296,19 +290,14 @@ func (rp *RequestProcessor) run() {
 		case <-rp.balancer.ctx.Done():
 			log.Printf("Processor %d stopping due to context cancellation", rp.ID)
 			return
-		case request, ok := <-rp.balancer.requestQueue:
-			if !ok {
-				log.Printf("Processor %d stopping due to request queue closure", rp.ID)
-				return
-			}
-
+		case request := <-rp.balancer.requestQueue:
 			// 要求を処理
 			rp.processRequest(request)
 		}
 	}
 }
 
-// processRequestは要求を処理します
+// processRequest 要求を処理します
 func (rp *RequestProcessor) processRequest(request RequestTask) {
 	start := time.Now()
 
@@ -340,16 +329,14 @@ func (rp *RequestProcessor) processRequest(request RequestTask) {
 
 	var wg sync.WaitGroup
 	for _, node := range selectedNodes {
-		wg.Add(1)
-		go func(n *LoadBalancerNode) {
-			defer wg.Done()
-			result := rp.processOnNode(ctx, request, n, start)
+		wg.Go(func() {
+			result := rp.processOnNode(ctx, request, node, start)
 
 			select {
 			case resultChan <- result:
 			case <-ctx.Done():
 			}
-		}(node)
+		})
 	}
 
 	// 全ての結果を待機
@@ -386,14 +373,14 @@ func (rp *RequestProcessor) processRequest(request RequestTask) {
 	}
 }
 
-// processOnNodeはノードで要求を処理します
+// processOnNode ノードで要求を処理します
 func (rp *RequestProcessor) processOnNode(ctx context.Context, request RequestTask, node *LoadBalancerNode, startTime time.Time) ProcessingResult {
 	queueTime := time.Since(request.SubmittedAt)
 	processStart := time.Now()
 
 	// ノードの負荷を増加
-	atomic.AddInt64(&node.CurrentLoad, 1)
-	defer atomic.AddInt64(&node.CurrentLoad, -1)
+	node.CurrentLoad.Add(1)
+	defer node.CurrentLoad.Add(-1)
 
 	// 実際の処理をシミュレート
 	result := rp.simulateNodeProcessing(ctx, request, node)
@@ -413,16 +400,15 @@ func (rp *RequestProcessor) processOnNode(ctx context.Context, request RequestTa
 	return result
 }
 
-// simulateNodeProcessingはノード処理をシミュレートします
+// simulateNodeProcessing ノード処理をシミュレートします
 func (rp *RequestProcessor) simulateNodeProcessing(ctx context.Context, request RequestTask, node *LoadBalancerNode) ProcessingResult {
 	// 処理時間をシミュレート（ノードの負荷に基づいて調整）
-	baseProcessTime := time.Duration(rand.Intn(200)+50) * time.Millisecond
-	loadFactor := float64(atomic.LoadInt64(&node.CurrentLoad)) / float64(node.MaxCapacity)
+	baseProcessTime := time.Duration(rand.IntN(200)+50) * time.Millisecond
+	loadFactor := float64(node.CurrentLoad.Load()) / float64(node.MaxCapacity)
 	adjustedProcessTime := time.Duration(float64(baseProcessTime) * (1 + loadFactor))
 
 	// 段階的に処理をシミュレート（コンテキストキャンセレーションをチェック）
-	ticker := time.NewTicker(10 * time.Millisecond)
-	defer ticker.Stop()
+	tick := time.Tick(10 * time.Millisecond)
 
 	processStart := time.Now()
 
@@ -433,7 +419,7 @@ func (rp *RequestProcessor) simulateNodeProcessing(ctx context.Context, request 
 				Success: false,
 				Error:   ctx.Err(),
 			}
-		case <-ticker.C:
+		case <-tick:
 			if time.Since(processStart) >= adjustedProcessTime {
 				// 処理完了
 
@@ -455,7 +441,7 @@ func (rp *RequestProcessor) simulateNodeProcessing(ctx context.Context, request 
 	}
 }
 
-// calculateErrorRateはノードのエラー率を計算します
+// calculateErrorRate ノードのエラー率を計算します
 func (rp *RequestProcessor) calculateErrorRate(node *LoadBalancerNode) float64 {
 	switch node.Health {
 	case HealthHealthy:
@@ -469,7 +455,7 @@ func (rp *RequestProcessor) calculateErrorRate(node *LoadBalancerNode) float64 {
 	}
 }
 
-// selectNodesは要求に適したノードを選択します
+// selectNodes 要求に適したノードを選択します
 func (alb *AdaptiveLoadBalancer) selectNodes(request RequestTask) []*LoadBalancerNode {
 	alb.nodesMutex.RLock()
 	defer alb.nodesMutex.RUnlock()
@@ -478,7 +464,7 @@ func (alb *AdaptiveLoadBalancer) selectNodes(request RequestTask) []*LoadBalance
 	var availableNodes []*LoadBalancerNode
 	for _, node := range alb.nodes {
 		if node.Health == HealthHealthy || node.Health == HealthDegraded {
-			if atomic.LoadInt64(&node.CurrentLoad) < node.MaxCapacity {
+			if node.CurrentLoad.Load() < node.MaxCapacity {
 				availableNodes = append(availableNodes, node)
 			}
 		}
@@ -500,12 +486,12 @@ func (alb *AdaptiveLoadBalancer) selectNodes(request RequestTask) []*LoadBalance
 		selectedNodes = selectedNodes[:fanOutCount]
 	}
 
-	atomic.AddInt64(&alb.stats.totalFanOutRequests, int64(len(selectedNodes)))
+	alb.stats.totalFanOutRequests.Add(int64(len(selectedNodes)))
 
 	return selectedNodes
 }
 
-// selectByStrategyは戦略に基づいてノードを選択します
+// selectByStrategy 戦略に基づいてノードを選択します
 func (alb *AdaptiveLoadBalancer) selectByStrategy(nodes []*LoadBalancerNode, request RequestTask) []*LoadBalancerNode {
 	switch alb.strategy {
 	case StrategyRoundRobin:
@@ -523,18 +509,18 @@ func (alb *AdaptiveLoadBalancer) selectByStrategy(nodes []*LoadBalancerNode, req
 	}
 }
 
-// selectRoundRobinはラウンドロビン選択を実行します
+// selectRoundRobin ラウンドロビン選択を実行します
 func (alb *AdaptiveLoadBalancer) selectRoundRobin(nodes []*LoadBalancerNode) []*LoadBalancerNode {
 	if len(nodes) == 0 {
 		return nil
 	}
 
 	// 簡単なラウンドロビン実装
-	index := int(atomic.AddInt64(&alb.stats.totalRequests, 1)) % len(nodes)
+	index := int(alb.stats.totalRequests.Add(1)) % len(nodes)
 	return []*LoadBalancerNode{nodes[index]}
 }
 
-// selectWeightedRoundRobinは重み付きラウンドロビン選択を実行します
+// selectWeightedRoundRobin 重み付きラウンドロビン選択を実行します
 func (alb *AdaptiveLoadBalancer) selectWeightedRoundRobin(nodes []*LoadBalancerNode) []*LoadBalancerNode {
 	if len(nodes) == 0 {
 		return nil
@@ -551,7 +537,7 @@ func (alb *AdaptiveLoadBalancer) selectWeightedRoundRobin(nodes []*LoadBalancerN
 	}
 
 	// ランダムに重み付き選択
-	target := rand.Intn(totalWeight)
+	target := rand.IntN(totalWeight)
 	cumulative := 0
 
 	for _, node := range nodes {
@@ -564,35 +550,35 @@ func (alb *AdaptiveLoadBalancer) selectWeightedRoundRobin(nodes []*LoadBalancerN
 	return []*LoadBalancerNode{nodes[0]}
 }
 
-// selectLeastConnectionsは最少接続数選択を実行します
+// selectLeastConnections 最少接続数選択を実行します
 func (alb *AdaptiveLoadBalancer) selectLeastConnections(nodes []*LoadBalancerNode) []*LoadBalancerNode {
 	if len(nodes) == 0 {
 		return nil
 	}
 
 	// 負荷でソート
-	sort.Slice(nodes, func(i, j int) bool {
-		return atomic.LoadInt64(&nodes[i].CurrentLoad) < atomic.LoadInt64(&nodes[j].CurrentLoad)
+	slices.SortFunc(nodes, func(a, b *LoadBalancerNode) int {
+		return cmp.Compare(a.CurrentLoad.Load(), b.CurrentLoad.Load())
 	})
 
 	return []*LoadBalancerNode{nodes[0]}
 }
 
-// selectLeastResponseTimeは最短応答時間選択を実行します
+// selectLeastResponseTime 最短応答時間選択を実行します
 func (alb *AdaptiveLoadBalancer) selectLeastResponseTime(nodes []*LoadBalancerNode) []*LoadBalancerNode {
 	if len(nodes) == 0 {
 		return nil
 	}
 
 	// 応答時間でソート
-	sort.Slice(nodes, func(i, j int) bool {
-		return nodes[i].ResponseTime < nodes[j].ResponseTime
+	slices.SortFunc(nodes, func(a, b *LoadBalancerNode) int {
+		return cmp.Compare(a.ResponseTime, b.ResponseTime)
 	})
 
 	return []*LoadBalancerNode{nodes[0]}
 }
 
-// selectAdaptiveは適応的選択を実行します
+// selectAdaptive 適応的選択を実行します
 func (alb *AdaptiveLoadBalancer) selectAdaptive(nodes []*LoadBalancerNode, request RequestTask) []*LoadBalancerNode {
 	if len(nodes) == 0 {
 		return nil
@@ -611,23 +597,24 @@ func (alb *AdaptiveLoadBalancer) selectAdaptive(nodes []*LoadBalancerNode, reque
 	}
 
 	// スコアでソート（高い方が良い）
-	sort.Slice(scores, func(i, j int) bool {
-		return scores[i].score > scores[j].score
+	slices.SortFunc(scores, func(a, b nodeScore) int {
+		return cmp.Compare(b.score, a.score)
 	})
 
 	// 上位ノードを返す
-	result := make([]*LoadBalancerNode, 0, alb.fanOutFactor)
-	for i := 0; i < len(scores) && i < alb.fanOutFactor; i++ {
+	topCount := min(len(scores), alb.fanOutFactor)
+	result := make([]*LoadBalancerNode, 0, topCount)
+	for i := range topCount {
 		result = append(result, scores[i].node)
 	}
 
 	return result
 }
 
-// calculateAdaptiveScoreは適応的スコアを計算します
+// calculateAdaptiveScore 適応的スコアを計算します
 func (alb *AdaptiveLoadBalancer) calculateAdaptiveScore(node *LoadBalancerNode, request RequestTask) float64 {
 	// 負荷率（低い方が良い）
-	loadRate := float64(atomic.LoadInt64(&node.CurrentLoad)) / float64(node.MaxCapacity)
+	loadRate := float64(node.CurrentLoad.Load()) / float64(node.MaxCapacity)
 	loadScore := 1.0 - loadRate
 
 	// 応答時間（短い方が良い）
@@ -661,20 +648,28 @@ func (alb *AdaptiveLoadBalancer) calculateAdaptiveScore(node *LoadBalancerNode, 
 	return totalScore
 }
 
-// updateNodeStatsはノード統計を更新します
+// updateNodeStats ノード統計を更新します
 func (alb *AdaptiveLoadBalancer) updateNodeStats(nodeID string, success bool, responseTime time.Duration) {
-	alb.stats.mu.Lock()
-	defer alb.stats.mu.Unlock()
+	// LoadBalancerNodeのフィールドはnodesMutexで守られている
+	// （selectNodes/calculateAdaptiveScore等がRLockで読む）。
+	// alb.stats.muとは別のロックなので、node自体はここで先に取得する。
+	alb.nodesMutex.RLock()
+	node, nodeExists := alb.nodes[nodeID]
+	alb.nodesMutex.RUnlock()
 
+	alb.stats.mu.Lock()
 	stats, exists := alb.stats.nodeStats[nodeID]
 	if !exists {
+		alb.stats.mu.Unlock()
 		return
 	}
 
 	stats.RequestsHandled++
 	stats.TotalResponseTime += responseTime
 	stats.AvgResponseTime = stats.TotalResponseTime / time.Duration(stats.RequestsHandled)
-	stats.CurrentLoad = atomic.LoadInt64(&alb.nodes[nodeID].CurrentLoad)
+	if nodeExists {
+		stats.CurrentLoad = node.CurrentLoad.Load()
+	}
 
 	if success {
 		stats.SuccessfulReqs++
@@ -682,17 +677,28 @@ func (alb *AdaptiveLoadBalancer) updateNodeStats(nodeID string, success bool, re
 		stats.ErrorReqs++
 	}
 
-	// ノードの成功率を更新
-	if node, exists := alb.nodes[nodeID]; exists {
-		node.SuccessRate = float64(stats.SuccessfulReqs) / float64(stats.RequestsHandled)
-		node.ResponseTime = stats.AvgResponseTime
+	successRate := float64(stats.SuccessfulReqs) / float64(stats.RequestsHandled)
+	avgResponseTime := stats.AvgResponseTime
+	alb.stats.mu.Unlock()
+
+	// ノードの成功率を更新（nodesMutexで守る）
+	if nodeExists {
+		alb.nodesMutex.Lock()
+		node.SuccessRate = successRate
+		node.ResponseTime = avgResponseTime
+		alb.nodesMutex.Unlock()
 	}
 }
 
-// SubmitRequestは要求をキューに追加します
+// SubmitRequest 要求をキューに追加します
 func (alb *AdaptiveLoadBalancer) SubmitRequest(request RequestTask) error {
-	if atomic.LoadInt32(&alb.isRunning) == 0 {
+	if !alb.isRunning.Load() {
 		return fmt.Errorf("load balancer is not running")
+	}
+	// requestQueue closeしないので送信自体はpanicしないが、停止後の投入は
+	// 処理されずに残ってしまうため、ctx側でも早期に拒否する。
+	if alb.ctx.Err() != nil {
+		return fmt.Errorf("load balancer is shutting down")
 	}
 
 	// タイムスタンプを設定
@@ -701,13 +707,11 @@ func (alb *AdaptiveLoadBalancer) SubmitRequest(request RequestTask) error {
 	}
 
 	// デフォルトタイムアウトを設定
-	if request.Timeout == 0 {
-		request.Timeout = 30 * time.Second
-	}
+	request.Timeout = cmp.Or(request.Timeout, 30*time.Second)
 
 	select {
 	case alb.requestQueue <- request:
-		atomic.AddInt64(&alb.stats.totalRequests, 1)
+		alb.stats.totalRequests.Add(1)
 		return nil
 	case <-alb.ctx.Done():
 		return fmt.Errorf("load balancer is shutting down")
@@ -716,15 +720,13 @@ func (alb *AdaptiveLoadBalancer) SubmitRequest(request RequestTask) error {
 	}
 }
 
-// GetResultChannelは結果チャネルを取得します
+// GetResultChannel 結果チャネルを取得します
 func (alb *AdaptiveLoadBalancer) GetResultChannel() <-chan ProcessingResult {
 	return alb.resultQueue
 }
 
-// handleResultsは結果を処理します
+// handleResults 結果を処理します
 func (alb *AdaptiveLoadBalancer) handleResults() {
-	defer alb.wg.Done()
-
 	log.Println("Result handler started")
 
 	for {
@@ -740,13 +742,13 @@ func (alb *AdaptiveLoadBalancer) handleResults() {
 
 			// 統計更新
 			if result.Success {
-				atomic.AddInt64(&alb.stats.totalSuccessful, 1)
+				alb.stats.totalSuccessful.Add(1)
 			} else {
-				atomic.AddInt64(&alb.stats.totalErrors, 1)
+				alb.stats.totalErrors.Add(1)
 			}
 
 			// 平均応答時間を更新
-			completed := atomic.LoadInt64(&alb.stats.totalSuccessful) + atomic.LoadInt64(&alb.stats.totalErrors)
+			completed := alb.stats.totalSuccessful.Load() + alb.stats.totalErrors.Load()
 			if completed > 0 {
 				alb.stats.mu.Lock()
 				alb.stats.averageResponseTime = time.Duration(
@@ -766,12 +768,9 @@ func (alb *AdaptiveLoadBalancer) handleResults() {
 	}
 }
 
-// runはヘルスチェッカーのメインループです
+// run ヘルスチェッカーのメインループです
 func (hc *HealthChecker) run() {
-	defer hc.balancer.wg.Done()
-
-	ticker := time.NewTicker(hc.checkInterval)
-	defer ticker.Stop()
+	tick := time.Tick(hc.checkInterval)
 
 	log.Println("Health checker started")
 
@@ -780,13 +779,13 @@ func (hc *HealthChecker) run() {
 		case <-hc.balancer.ctx.Done():
 			log.Println("Health checker stopping due to context cancellation")
 			return
-		case <-ticker.C:
+		case <-tick:
 			hc.performHealthChecks()
 		}
 	}
 }
 
-// performHealthChecksはヘルスチェックを実行します
+// performHealthChecks ヘルスチェックを実行します
 func (hc *HealthChecker) performHealthChecks() {
 	hc.balancer.nodesMutex.RLock()
 	nodes := make([]*LoadBalancerNode, 0, len(hc.balancer.nodes))
@@ -795,12 +794,15 @@ func (hc *HealthChecker) performHealthChecks() {
 	}
 	hc.balancer.nodesMutex.RUnlock()
 
+	// balancer.wgで追跡し、Shutdown時に確実に完了を待てるようにする
 	for _, node := range nodes {
-		go hc.checkNodeHealth(node)
+		hc.balancer.wg.Go(func() {
+			hc.checkNodeHealth(node)
+		})
 	}
 }
 
-// checkNodeHealthはノードのヘルスチェックを実行します
+// checkNodeHealth ノードのヘルスチェックを実行します
 func (hc *HealthChecker) checkNodeHealth(node *LoadBalancerNode) {
 	// ヘルスチェックをシミュレート
 	ctx, cancel := context.WithTimeout(hc.balancer.ctx, hc.timeoutDuration)
@@ -815,10 +817,10 @@ func (hc *HealthChecker) checkNodeHealth(node *LoadBalancerNode) {
 	node.LastHealthCheck = time.Now()
 }
 
-// simulateHealthCheckはヘルスチェックをシミュレートします
+// simulateHealthCheck ヘルスチェックをシミュレートします
 func (hc *HealthChecker) simulateHealthCheck(ctx context.Context, node *LoadBalancerNode) bool {
 	// ノードの負荷と現在の健全性に基づいてヘルスチェック結果を調整
-	loadRate := float64(atomic.LoadInt64(&node.CurrentLoad)) / float64(node.MaxCapacity)
+	loadRate := float64(node.CurrentLoad.Load()) / float64(node.MaxCapacity)
 
 	// 負荷率に基づいて成功率を調整
 	var successRate float64
@@ -834,14 +836,14 @@ func (hc *HealthChecker) simulateHealthCheck(ctx context.Context, node *LoadBala
 	}
 
 	select {
-	case <-time.After(time.Duration(rand.Intn(int(hc.timeoutDuration.Milliseconds()))) * time.Millisecond):
+	case <-time.After(time.Duration(rand.IntN(int(hc.timeoutDuration.Milliseconds()))) * time.Millisecond):
 		return rand.Float64() < successRate
 	case <-ctx.Done():
 		return false // タイムアウト
 	}
 }
 
-// updateNodeHealthはノードヘルス状態を更新します
+// updateNodeHealth ノードヘルス状態を更新します
 func (hc *HealthChecker) updateNodeHealth(node *LoadBalancerNode, healthy bool) {
 	hc.balancer.nodesMutex.Lock()
 	defer hc.balancer.nodesMutex.Unlock()
@@ -876,12 +878,9 @@ func (hc *HealthChecker) updateNodeHealth(node *LoadBalancerNode, healthy bool) 
 	}
 }
 
-// adaptiveControlは適応制御を実行します
+// adaptiveControl 適応制御を実行します
 func (alb *AdaptiveLoadBalancer) adaptiveControl() {
-	defer alb.wg.Done()
-
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
+	tick := time.Tick(30 * time.Second)
 
 	log.Println("Adaptive control started")
 
@@ -890,18 +889,18 @@ func (alb *AdaptiveLoadBalancer) adaptiveControl() {
 		case <-alb.ctx.Done():
 			log.Println("Adaptive control stopping due to context cancellation")
 			return
-		case <-ticker.C:
+		case <-tick:
 			alb.evaluateAndAdaptStrategy()
 		}
 	}
 }
 
-// evaluateAndAdaptStrategyは戦略を評価・適応します
+// evaluateAndAdaptStrategy 戦略を評価・適応します
 func (alb *AdaptiveLoadBalancer) evaluateAndAdaptStrategy() {
 	alb.stats.mu.RLock()
-	totalRequests := atomic.LoadInt64(&alb.stats.totalRequests)
-	totalSuccessful := atomic.LoadInt64(&alb.stats.totalSuccessful)
-	totalErrors := atomic.LoadInt64(&alb.stats.totalErrors)
+	totalRequests := alb.stats.totalRequests.Load()
+	totalSuccessful := alb.stats.totalSuccessful.Load()
+	totalErrors := alb.stats.totalErrors.Load()
 	alb.stats.mu.RUnlock()
 
 	if totalRequests < 100 {
@@ -930,7 +929,7 @@ func (alb *AdaptiveLoadBalancer) evaluateAndAdaptStrategy() {
 	alb.adaptToSystemLoad()
 }
 
-// selectBetterStrategyはより良い戦略を選択します
+// selectBetterStrategy より良い戦略を選択します
 func (alb *AdaptiveLoadBalancer) selectBetterStrategy() LoadBalancingStrategy {
 	// 現在の状況に基づいて最適な戦略を選択
 
@@ -967,7 +966,7 @@ func (alb *AdaptiveLoadBalancer) selectBetterStrategy() LoadBalancingStrategy {
 	}
 }
 
-// adaptToSystemLoadはシステム負荷に適応します
+// adaptToSystemLoad システム負荷に適応します
 func (alb *AdaptiveLoadBalancer) adaptToSystemLoad() {
 	// 現在のシステム負荷を計算
 	totalCapacity := int64(0)
@@ -976,7 +975,7 @@ func (alb *AdaptiveLoadBalancer) adaptToSystemLoad() {
 	alb.nodesMutex.RLock()
 	for _, node := range alb.nodes {
 		totalCapacity += node.MaxCapacity
-		totalCurrentLoad += atomic.LoadInt64(&node.CurrentLoad)
+		totalCurrentLoad += node.CurrentLoad.Load()
 	}
 	alb.nodesMutex.RUnlock()
 
@@ -1002,12 +1001,9 @@ func (alb *AdaptiveLoadBalancer) adaptToSystemLoad() {
 	}
 }
 
-// monitorMetricsはメトリクスを監視します
+// monitorMetrics メトリクスを監視します
 func (alb *AdaptiveLoadBalancer) monitorMetrics() {
-	defer alb.wg.Done()
-
-	ticker := time.NewTicker(20 * time.Second)
-	defer ticker.Stop()
+	tick := time.Tick(20 * time.Second)
 
 	log.Println("Metrics monitor started")
 
@@ -1016,21 +1012,21 @@ func (alb *AdaptiveLoadBalancer) monitorMetrics() {
 		case <-alb.ctx.Done():
 			log.Println("Metrics monitor stopping")
 			return
-		case <-ticker.C:
+		case <-tick:
 			alb.reportMetrics()
 		}
 	}
 }
 
-// reportMetricsはメトリクスを報告します
+// reportMetrics メトリクスを報告します
 func (alb *AdaptiveLoadBalancer) reportMetrics() {
 	alb.stats.mu.RLock()
 	defer alb.stats.mu.RUnlock()
 
-	totalRequests := atomic.LoadInt64(&alb.stats.totalRequests)
-	totalSuccessful := atomic.LoadInt64(&alb.stats.totalSuccessful)
-	totalErrors := atomic.LoadInt64(&alb.stats.totalErrors)
-	totalFanOut := atomic.LoadInt64(&alb.stats.totalFanOutRequests)
+	totalRequests := alb.stats.totalRequests.Load()
+	totalSuccessful := alb.stats.totalSuccessful.Load()
+	totalErrors := alb.stats.totalErrors.Load()
+	totalFanOut := alb.stats.totalFanOutRequests.Load()
 
 	uptime := time.Since(alb.stats.startTime)
 	var throughput float64
@@ -1060,18 +1056,19 @@ func (alb *AdaptiveLoadBalancer) reportMetrics() {
 	alb.nodesMutex.RUnlock()
 }
 
-// Shutdownは負荷分散システムを停止します
+// Shutdown 負荷分散システムを停止します
 func (alb *AdaptiveLoadBalancer) Shutdown(timeout time.Duration) error {
-	if !atomic.CompareAndSwapInt32(&alb.isRunning, 1, 0) {
+	if !alb.isRunning.CompareAndSwap(true, false) {
 		return fmt.Errorf("load balancer is not running")
 	}
 
 	log.Println("Shutting down adaptive load balancer...")
 
-	// 1. 新しい要求の受付を停止
-	close(alb.requestQueue)
+	// ワーカーに停止を指示する。requestQueueはcloseしない
+	// （SubmitRequestとの競合でpanic: send on closed channelになるため）。
+	alb.cancel()
 
-	// 2. ワーカーの終了を待機
+	// ワーカーの終了を待機
 	done := make(chan struct{})
 	go func() {
 		alb.wg.Wait()
@@ -1082,34 +1079,26 @@ func (alb *AdaptiveLoadBalancer) Shutdown(timeout time.Duration) error {
 	case <-done:
 		log.Println("All workers stopped gracefully")
 	case <-time.After(timeout):
-		log.Println("Timeout reached, forcing shutdown...")
-		alb.cancel()
-
-		// 追加の待機時間
-		select {
-		case <-done:
-			log.Println("Workers stopped after cancellation")
-		case <-time.After(2 * time.Second):
-			log.Println("Some workers may not have stopped properly")
-		}
+		// 送信側のgoroutineが残っている可能性があるので、チャネルは閉じずにエラーを返す
+		return fmt.Errorf("shutdown timeout: some workers may not have stopped")
 	}
 
-	// 3. チャネルを閉じる
+	// resultQueueへの送信元はwg.Waitの完了で全て止まっているのでcloseしてよい
 	close(alb.resultQueue)
 
 	log.Println("Adaptive load balancer shutdown completed")
 	return nil
 }
 
-// GetStatsは統計情報を取得します
-func (alb *AdaptiveLoadBalancer) GetStats() map[string]interface{} {
+// GetStats 統計情報を取得します
+func (alb *AdaptiveLoadBalancer) GetStats() map[string]any {
 	alb.stats.mu.RLock()
 	defer alb.stats.mu.RUnlock()
 
-	totalRequests := atomic.LoadInt64(&alb.stats.totalRequests)
-	totalSuccessful := atomic.LoadInt64(&alb.stats.totalSuccessful)
-	totalErrors := atomic.LoadInt64(&alb.stats.totalErrors)
-	totalFanOut := atomic.LoadInt64(&alb.stats.totalFanOutRequests)
+	totalRequests := alb.stats.totalRequests.Load()
+	totalSuccessful := alb.stats.totalSuccessful.Load()
+	totalErrors := alb.stats.totalErrors.Load()
+	totalFanOut := alb.stats.totalFanOutRequests.Load()
 
 	uptime := time.Since(alb.stats.startTime)
 	var throughput float64
@@ -1117,9 +1106,9 @@ func (alb *AdaptiveLoadBalancer) GetStats() map[string]interface{} {
 		throughput = float64(totalRequests) / uptime.Seconds()
 	}
 
-	nodeStats := make(map[string]interface{})
+	nodeStats := make(map[string]any)
 	for nodeID, stats := range alb.stats.nodeStats {
-		nodeStats[nodeID] = map[string]interface{}{
+		nodeStats[nodeID] = map[string]any{
 			"requests_handled":      stats.RequestsHandled,
 			"successful_requests":   stats.SuccessfulReqs,
 			"error_requests":        stats.ErrorReqs,
@@ -1129,7 +1118,7 @@ func (alb *AdaptiveLoadBalancer) GetStats() map[string]interface{} {
 		}
 	}
 
-	return map[string]interface{}{
+	return map[string]any{
 		"total_requests":         totalRequests,
 		"total_successful":       totalSuccessful,
 		"total_errors":           totalErrors,
@@ -1186,17 +1175,17 @@ func main() {
 	go func() {
 		requestTypes := []string{"query", "update", "delete", "create", "search"}
 
-		for i := 0; i < 2000; i++ {
+		for i := range 2000 {
 			request := RequestTask{
 				ID:            int64(i),
-				RequestType:   requestTypes[rand.Intn(len(requestTypes))],
+				RequestType:   requestTypes[rand.IntN(len(requestTypes))],
 				Payload:       []byte(fmt.Sprintf("request_data_%d", i)),
-				Priority:      rand.Intn(5),
-				Timeout:       time.Duration(rand.Intn(10)+5) * time.Second,
-				RequiredNodes: rand.Intn(3) + 1,
-				Metadata: map[string]interface{}{
-					"client_id": fmt.Sprintf("client_%d", rand.Intn(10)),
-					"region":    []string{"us-east", "us-west", "eu-west", "ap-south"}[rand.Intn(4)],
+				Priority:      rand.IntN(5),
+				Timeout:       time.Duration(rand.IntN(10)+5) * time.Second,
+				RequiredNodes: rand.IntN(3) + 1,
+				Metadata: map[string]any{
+					"client_id": fmt.Sprintf("client_%d", rand.IntN(10)),
+					"region":    []string{"us-east", "us-west", "eu-west", "ap-south"}[rand.IntN(4)],
 				},
 			}
 
@@ -1206,7 +1195,7 @@ func main() {
 			}
 
 			// 送信頻度を制御
-			time.Sleep(time.Duration(rand.Intn(100)+20) * time.Millisecond)
+			time.Sleep(time.Duration(rand.IntN(100)+20) * time.Millisecond)
 		}
 
 		log.Println("All test requests submitted")
