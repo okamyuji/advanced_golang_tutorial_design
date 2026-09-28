@@ -724,7 +724,14 @@ func TestServer_RejectsCrossSiteBrowserRequest(t *testing.T) {
 	for _, tt := range []struct {
 		site string
 		want int
-	}{{"cross-site", http.StatusForbidden}, {"none", http.StatusOK}, {"", http.StatusOK}} {
+	}{
+		{"cross-site", http.StatusForbidden},
+		// ブラウザはポートを区別しないので、同じマシンの別ポートのアプリも same-site になる
+		{"same-site", http.StatusForbidden},
+		{"same-origin", http.StatusOK},
+		{"none", http.StatusOK},
+		{"", http.StatusOK},
+	} {
 		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://"+profiler.listenAddr()+"/debug/pprof/cmdline", nil)
 		if err != nil {
 			t.Fatalf("NewRequest failed: %v", err)

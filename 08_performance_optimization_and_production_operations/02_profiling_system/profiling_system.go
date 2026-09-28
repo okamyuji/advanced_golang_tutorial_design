@@ -141,10 +141,11 @@ func limitSeconds(next http.Handler) http.Handler {
 
 // localRequestsOnly 同じマシンの人が直接送った要求だけを通す。
 // ループバックで待ち受けても、DNS rebinding ではブラウザが攻撃者のドメイン名のまま接続してくる。
-// Host がループバックでも、別サイトのページは <img> などでブラウザに要求を送らせられる
+// Host がループバックでも、別のページは <img> などでブラウザに要求を送らせられる。
+// ブラウザはサイトの判定でポートを区別しないので、同じマシンの別ポートのアプリから来る same-site も断る
 func localRequestsOnly(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Sec-Fetch-Site") == "cross-site" {
+		if site := r.Header.Get("Sec-Fetch-Site"); site == "cross-site" || site == "same-site" {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
