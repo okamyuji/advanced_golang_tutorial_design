@@ -387,7 +387,8 @@ func (d *DatabaseConfig) GetDSN(dbType string) string {
 		return fmt.Sprintf("server=%s;port=%d;database=%s;user id=%s;password=%s;encrypt=disable",
 			d.Host, d.Port, d.Database, d.Username, d.Password)
 	case "oracle":
-		return fmt.Sprintf("oracle://%s:%s@%s:%d/%s",
+		// go-ora v3.0.1 の FastLogin は、2 本目以降の接続で Oracle 23c に EOF で切られる（sijms/go-ora#732）
+		return fmt.Sprintf("oracle://%s:%s@%s:%d/%s?FAST+LOGIN=false",
 			d.Username, d.Password, d.Host, d.Port, d.Database)
 	default:
 		return ""

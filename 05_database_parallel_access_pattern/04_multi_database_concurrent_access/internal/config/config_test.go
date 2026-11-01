@@ -1,6 +1,10 @@
 package config
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/sijms/go-ora/v3/configurations"
+)
 
 func TestExpandEnvVars_UsesEnvThenDefault(t *testing.T) {
 	t.Setenv("MULTIDB_TEST_HOST", "db.example")
@@ -19,5 +23,18 @@ func TestExpandEnvVars_UsesEnvThenDefault(t *testing.T) {
 		if got := expandEnvVars(tt.in); got != tt.want {
 			t.Errorf("expandEnvVars(%q) = %q, 期待値 %q", tt.in, got, tt.want)
 		}
+	}
+}
+
+// go-ora v3.0.1 の FastLogin は、2 本目以降の接続で Oracle 23c に EOF で切られる（sijms/go-ora#732）
+func TestGetDSN_OracleDisablesFastLogin(t *testing.T) {
+	d := &DatabaseConfig{Host: "localhost", Port: 1521, Database: "FREEPDB1", Username: "u", Password: "p"}
+
+	cfg, err := configurations.ParseConfig(d.GetDSN("oracle"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.FastLogin {
+		t.Fatal("FastLogin must be disabled for go-ora v3.0.1")
 	}
 }
