@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -332,63 +334,36 @@ func TestSubmitTaskWithTimeout(t *testing.T) {
 		DefaultTimeout:  5 * time.Second,
 		MaxTimeout:      10 * time.Second,
 		WorkerCount:     1,
-		QueueSize:       1, // 非常に小さなキューサイズ
+		QueueSize:       1,
 		EnableMetrics:   false,
 		MetricsInterval: 10 * time.Second,
 		RetryEnabled:    false,
 		MaxRetries:      0,
 	}
 
+	// ワーカーを起動しない。起動すると処理時間が乱数で短い回にキューが空き、満杯の前提が崩れる
 	controller := NewContextControlController(config)
+	defer controller.cancel()
 
-	err := controller.Start()
-	if err != nil {
-		t.Fatalf("Failed to start controller: %v", err)
+	for range cap(controller.taskQueue) {
+		controller.taskQueue <- Task{ID: 2, Name: "queue_fill_task"}
 	}
-	defer func() {
-		if err := controller.Shutdown(2 * time.Second); err != nil {
-			t.Logf("Failed to shutdown controller: %v", err)
-		}
-	}()
 
-	// 長時間のタスクでワーカーをブロック
-	longTask := Task{
-		ID:      1,
-		Name:    "long_running_task",
-		Timeout: 3 * time.Second, // 長いタスク
-	}
-	if err := controller.SubmitTask(longTask); err != nil {
-		t.Logf("Failed to submit long task: %v", err)
-	} // ワーカーをブロック
-
-	// 少し待ってワーカーがブロックされることを確認
-	time.Sleep(50 * time.Millisecond)
-
-	// キューを満杯にする
-	fillTask := Task{
-		ID:   2,
-		Name: "queue_fill_task",
-	}
-	if err := controller.SubmitTask(fillTask); err != nil {
-		t.Logf("Failed to submit fill task: %v", err)
-	} // キューを満杯にする
-
-	// タイムアウト付きで送信を試行
 	task := Task{
 		ID:   999,
 		Name: "timeout_submit_test",
 	}
 
 	start := time.Now()
-	err = controller.SubmitTaskWithTimeout(task, 100*time.Millisecond)
+	err := controller.SubmitTaskWithTimeout(task, 100*time.Millisecond)
 	elapsed := time.Since(start)
 
-	// タイムアウトが発生することを期待
-	if err == nil {
-		t.Error("Expected timeout error when submitting to full queue")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Expected submit timeout (context.DeadlineExceeded) on a full queue, got %v", err)
 	}
-
-	// タイムアウト時間が適切であることを確認
+	if elapsed < 100*time.Millisecond {
+		t.Errorf("Returned before the submit timeout: %v", elapsed)
+	}
 	if elapsed > 200*time.Millisecond {
 		t.Errorf("Timeout took too long: %v", elapsed)
 	}
