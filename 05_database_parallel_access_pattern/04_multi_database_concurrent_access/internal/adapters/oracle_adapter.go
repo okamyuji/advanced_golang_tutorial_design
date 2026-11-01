@@ -15,7 +15,7 @@ import (
 	"multi-db/internal/config"
 	"multi-db/internal/models"
 
-	_ "github.com/sijms/go-ora/v2"
+	_ "github.com/sijms/go-ora/v3"
 )
 
 // OracleAdapter Oracle専用のデータベースアダプター
@@ -36,8 +36,7 @@ func (o *OracleAdapter) Connect(ctx context.Context, cfg config.DatabaseConfig) 
 	defer o.mutex.Unlock()
 
 	// Oracle接続文字列構築
-	dsn := fmt.Sprintf("oracle://%s:%s@%s:%d/%s",
-		cfg.Username, cfg.Password, cfg.Host, cfg.Port, cfg.Database)
+	dsn := cfg.GetDSN("oracle")
 
 	db, err := sql.Open("oracle", dsn)
 	if err != nil {

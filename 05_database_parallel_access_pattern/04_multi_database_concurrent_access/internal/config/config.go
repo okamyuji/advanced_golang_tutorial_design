@@ -3,7 +3,10 @@ package config
 import (
 	"cmp"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -387,8 +390,15 @@ func (d *DatabaseConfig) GetDSN(dbType string) string {
 		return fmt.Sprintf("server=%s;port=%d;database=%s;user id=%s;password=%s;encrypt=disable",
 			d.Host, d.Port, d.Database, d.Username, d.Password)
 	case "oracle":
-		return fmt.Sprintf("oracle://%s:%s@%s:%d/%s",
-			d.Username, d.Password, d.Host, d.Port, d.Database)
+		// go-ora v3.0.1 の FastLogin は、2 本目以降の接続で Oracle 23c に EOF で切られる（sijms/go-ora#732）
+		u := url.URL{
+			Scheme:   "oracle",
+			User:     url.UserPassword(d.Username, d.Password),
+			Host:     net.JoinHostPort(d.Host, strconv.Itoa(d.Port)),
+			Path:     "/" + d.Database,
+			RawQuery: url.Values{"FAST LOGIN": {"false"}}.Encode(),
+		}
+		return u.String()
 	default:
 		return ""
 	}
