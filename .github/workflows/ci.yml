@@ -1,0 +1,59 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  ci:
+    strategy:
+      fail-fast: false
+      matrix:
+        dir:
+          - 01_practical_foundations_of_concurrent_programming/01_a_basic_goroutine_management_system/sample_01
+          - 01_practical_foundations_of_concurrent_programming/01_a_basic_goroutine_management_system/sample_02
+          - 01_practical_foundations_of_concurrent_programming/ans_01
+          - 01_practical_foundations_of_concurrent_programming/ans_02
+          - 01_practical_foundations_of_concurrent_programming/ans_03
+          - 02_practical_application_of_the_worker_pool_pattern/01_web_scraper
+          - 02_practical_application_of_the_worker_pool_pattern/02_worker_pool
+          - 02_practical_application_of_the_worker_pool_pattern/03_image_processor
+          - 02_practical_application_of_the_worker_pool_pattern/ans_01
+          - 02_practical_application_of_the_worker_pool_pattern/ans_02
+          - 02_practical_application_of_the_worker_pool_pattern/ans_03
+          - 03_fan-out_fan-in_and_context_control/01_fan_out_fan_in_pipeline
+          - 03_fan-out_fan-in_and_context_control/02_context_control_system
+          - 03_fan-out_fan-in_and_context_control/03_stream_aggregation
+          - 03_fan-out_fan-in_and_context_control/ans_01
+          - 03_fan-out_fan-in_and_context_control/ans_02
+          - 03_fan-out_fan-in_and_context_control/ans_03
+          - 04_concurrent_programming_for_web_processing/01_concurrent_http_server
+          - 04_concurrent_programming_for_web_processing/02_websocket_handler
+          - 04_concurrent_programming_for_web_processing/03_api_rate_limiter
+          - 04_concurrent_programming_for_web_processing/ans_01
+          - 04_concurrent_programming_for_web_processing/ans_02
+          - 04_concurrent_programming_for_web_processing/ans_03
+          - 05_database_parallel_access_pattern/01_connection_pool
+          - 05_database_parallel_access_pattern/02_transaction_control
+          - 05_database_parallel_access_pattern/03_batch_processing
+          - 05_database_parallel_access_pattern/04_multi_database_concurrent_access
+          - 05_database_parallel_access_pattern/ans_01
+          - 05_database_parallel_access_pattern/ans_02
+          - 05_database_parallel_access_pattern/ans_03
+          - 06_grpc_concurrent_programming
+          - 07_error_handling_and_monitoring/01_circuit_breaker
+          - 07_error_handling_and_monitoring/02_auto_healing
+          - 07_error_handling_and_monitoring/03_monitoring_dashboard
+          - 07_error_handling_and_monitoring/ans_01
+          - 07_error_handling_and_monitoring/ans_02
+          - 07_error_handling_and_monitoring/ans_03
+          - 08_performance_optimization_and_production_operations/01_performance_optimizer
+          - 08_performance_optimization_and_production_operations/02_profiling_system
+          - 08_performance_optimization_and_production_operations/03_production_manager
+          - 08_performance_optimization_and_production_operations/ans_01
+          - 08_performance_optimization_and_production_operations/ans_02
+          - 08_performance_optimization_and_production_operations/ans_03
+    uses: okamyuji/reusable-workflows/.github/workflows/go-ci.yml@v1
+    with:
+      working-directory: ${{ matrix.dir }}
+  security:
+    uses: okamyuji/reusable-workflows/.github/workflows/security-scan.yml@v1

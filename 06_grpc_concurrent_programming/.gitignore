@@ -19,9 +19,6 @@ go.work
 # Dependency directories
 vendor/
 
-# Generated protobuf files
-*.pb.go
-*_grpc.pb.go
 
 # Build and temporary files
 build/
