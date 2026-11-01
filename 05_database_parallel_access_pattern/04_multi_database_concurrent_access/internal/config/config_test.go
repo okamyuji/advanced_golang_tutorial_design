@@ -38,3 +38,16 @@ func TestGetDSN_OracleDisablesFastLogin(t *testing.T) {
 		t.Fatal("FastLogin must be disabled for go-ora v3.0.1")
 	}
 }
+
+// パスワードに URL の区切り文字があっても、ホストやサービス名が変わらない
+func TestGetDSN_OracleEscapesCredentials(t *testing.T) {
+	d := &DatabaseConfig{Host: "db.local", Port: 1521, Database: "FREEPDB1", Username: "u", Password: "p@ss/w?rd#1"}
+
+	cfg, err := configurations.ParseConfig(d.GetDSN("oracle"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Password != "p@ss/w?rd#1" || cfg.Servers[0].Addr != "db.local" || cfg.ServiceName != "FREEPDB1" {
+		t.Fatalf("got password=%q host=%q service=%q", cfg.Password, cfg.Servers[0].Addr, cfg.ServiceName)
+	}
+}
