@@ -15,7 +15,7 @@ import (
 	"multi-db/internal/config"
 	"multi-db/internal/models"
 
-	_ "github.com/sijms/go-ora/v2"
+	_ "github.com/sijms/go-ora/v3"
 )
 
 // OracleAdapter Oracle専用のデータベースアダプター
