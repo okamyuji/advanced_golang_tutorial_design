@@ -6,7 +6,7 @@ require (
 	github.com/denisenkom/go-mssqldb v0.12.3
 	github.com/go-sql-driver/mysql v1.10.1
 	github.com/lib/pq v1.12.3
-	github.com/prometheus/client_golang v1.24.1
+	github.com/prometheus/client_golang v1.25.0
 	github.com/sijms/go-ora/v2 v2.9.0
 	gopkg.in/yaml.v3 v3.0.1
 )
