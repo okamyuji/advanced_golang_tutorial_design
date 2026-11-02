@@ -17,8 +17,7 @@ CREATE TABLE users (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- インデックス作成
-CREATE INDEX idx_users_email ON users(email);
+-- インデックス作成（email は UNIQUE 制約の索引を使う。同じ列に重ねると ORA-01408 になる）
 CREATE INDEX idx_users_name ON users(name);
 CREATE INDEX idx_users_created_at ON users(created_at);
 
