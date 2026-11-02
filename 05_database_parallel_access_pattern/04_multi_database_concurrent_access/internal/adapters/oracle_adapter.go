@@ -193,9 +193,8 @@ func (o *OracleAdapter) Transaction(ctx context.Context, fn func(*sql.Tx) error)
 		return fmt.Errorf("データベース未接続")
 	}
 
-	tx, err := o.db.BeginTx(ctx, &sql.TxOptions{
-		Isolation: sql.LevelReadCommitted,
-	})
+	// go-ora v3 は既定以外の分離レベルを拒む。Oracle の既定は READ COMMITTED なので既定のまま開始する。
+	tx, err := o.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("トランザクション開始エラー (Oracle): %w", err)
 	}
